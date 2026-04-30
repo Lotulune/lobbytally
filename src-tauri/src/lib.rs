@@ -3,6 +3,7 @@ pub mod commands;
 pub mod db;
 pub mod discovery;
 pub mod discovery_task;
+pub mod game_analysis;
 pub mod llm;
 pub mod models;
 pub mod recommendation;

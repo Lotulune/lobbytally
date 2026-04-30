@@ -1,4 +1,4 @@
-use crate::models::{AiAssessment, GameCard};
+use crate::models::{AiAssessment, AnalysisPoint, GameAnalysisReport, GameCard};
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,15 @@ pub struct LlmRuntimeConfig {
     pub api_key: Option<String>,
     pub base_url: String,
     pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisNarrative {
+    pub overview: String,
+    pub strengths: Vec<AnalysisPoint>,
+    pub risks: Vec<AnalysisPoint>,
+    pub dimension_reasons: Vec<(String, String)>,
 }
 
 pub async fn assess_game(
@@ -24,40 +33,45 @@ pub async fn assess_game(
     let model = config.model.clone();
     let prompt = build_prompt(game);
 
-    let response = client
-        .post(format!("{base_url}/v1/chat/completions"))
-        .bearer_auth(api_key)
-        .json(&ChatRequest {
-            model,
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content:
-                        "You are a concise Steam multiplayer game curator. Return strict JSON only."
-                            .to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: prompt,
-                },
-            ],
-            temperature: 0.2,
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<ChatResponse>()
-        .await
-        .context("decode LLM response")?;
+    let content = request_chat_completion_content(
+        client,
+        &api_key,
+        &base_url,
+        &model,
+        "You are a concise Steam multiplayer game curator. Return strict JSON only.",
+        prompt,
+        0.2,
+    )
+    .await?;
 
-    let content = response
-        .choices
-        .first()
-        .map(|choice| choice.message.content.trim())
-        .filter(|content| !content.is_empty())
-        .unwrap_or("{}");
+    parse_assessment(game.appid, &content).or_else(|_| Ok(heuristic_assessment(game)))
+}
 
-    parse_assessment(game.appid, content).or_else(|_| Ok(heuristic_assessment(game)))
+pub async fn generate_analysis_narrative(
+    client: &Client,
+    config: &LlmRuntimeConfig,
+    game: &GameCard,
+    rule_report: &GameAnalysisReport,
+) -> Result<AnalysisNarrative> {
+    let api_key = config
+        .api_key
+        .clone()
+        .context("LLM API key is required for narrative generation")?;
+    let base_url = config.base_url.trim_end_matches('/').to_string();
+    let model = config.model.clone();
+    let prompt = build_analysis_narrative_prompt(game, rule_report);
+    let content = request_chat_completion_content(
+        client,
+        &api_key,
+        &base_url,
+        &model,
+        "You refine rule-based Steam multiplayer analyses. Return strict JSON only.",
+        prompt,
+        0.1,
+    )
+    .await?;
+
+    Ok(serde_json::from_str(trim_json_content(&content)?)?)
 }
 
 fn heuristic_assessment(game: &GameCard) -> AiAssessment {
@@ -157,12 +171,7 @@ fn parse_assessment(appid: u32, content: &str) -> Result<AiAssessment> {
         risks: Vec<String>,
     }
 
-    let trimmed = content
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
+    let trimmed = trim_json_content(content)?;
     let raw: Raw = serde_json::from_str(trimmed)?;
     Ok(AiAssessment {
         appid,
@@ -171,6 +180,92 @@ fn parse_assessment(appid: u32, content: &str) -> Result<AiAssessment> {
         best_for: raw.best_for,
         risks: raw.risks,
     })
+}
+
+fn build_analysis_narrative_prompt(game: &GameCard, rule_report: &GameAnalysisReport) -> String {
+    serde_json::json!({
+        "task": "Polish a rule-based multiplayer game analysis in Simplified Chinese without changing factual evidence.",
+        "rules": [
+            "Return strict JSON only.",
+            "Do not invent facts outside the provided game metadata and rule report.",
+            "Keep strengths and risks concise.",
+            "dimensionReasons must only update reason text for existing dimension keys."
+        ],
+        "output_schema": {
+            "overview": "one concise Chinese paragraph",
+            "strengths": [{"title": "short Chinese title", "reason": "short Chinese reason"}],
+            "risks": [{"title": "short Chinese title", "reason": "short Chinese reason"}],
+            "dimensionReasons": [["dimension_key", "short Chinese reason"]]
+        },
+        "game": {
+            "appid": game.appid,
+            "name": game.name,
+            "short_description": game.short_description,
+            "tags": game.tags,
+            "multiplayer_modes": game.multiplayer_modes,
+            "positive_review_pct": game.positive_review_pct,
+            "total_reviews": game.total_reviews,
+            "current_players": game.current_players,
+            "review_snippets": game.review_snippets,
+        },
+        "rule_report": rule_report,
+    })
+    .to_string()
+}
+
+async fn request_chat_completion_content(
+    client: &Client,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: String,
+    temperature: f32,
+) -> Result<String> {
+    let response = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .bearer_auth(api_key)
+        .json(&ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: system_prompt.to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: user_prompt,
+                },
+            ],
+            temperature,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ChatResponse>()
+        .await
+        .context("decode LLM response")?;
+
+    let content = response
+        .choices
+        .first()
+        .map(|choice| choice.message.content.trim().to_string())
+        .filter(|content| !content.is_empty())
+        .unwrap_or_else(|| "{}".to_string());
+    Ok(content)
+}
+
+fn trim_json_content(content: &str) -> Result<&str> {
+    let trimmed = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty LLM JSON content");
+    }
+    Ok(trimmed)
 }
 
 #[derive(Debug, Serialize)]
