@@ -180,6 +180,90 @@ pub struct AiAssessment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum AnalysisSource {
+    Hybrid,
+    Rule,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisEvidenceKind {
+    PositiveReviewPct,
+    TotalReviews,
+    CurrentPlayers,
+    Tags,
+    MultiplayerModes,
+    ShortDescription,
+    ReviewSnippet,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisReviewStance {
+    Strength,
+    Risk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisDimensionScore {
+    pub key: String,
+    pub label: String,
+    pub score: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisPoint {
+    pub title: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisEvidenceItem {
+    pub kind: AnalysisEvidenceKind,
+    pub label: String,
+    pub value: String,
+    pub interpretation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisReviewEvidenceItem {
+    pub stance: AnalysisReviewStance,
+    pub quote: String,
+    pub playtime_text: String,
+    pub interpretation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameAnalysisReport {
+    pub appid: u32,
+    pub generated_at: String,
+    pub source: AnalysisSource,
+    pub confidence: AnalysisConfidence,
+    pub overall_score: f64,
+    pub overview: String,
+    pub dimension_scores: Vec<AnalysisDimensionScore>,
+    pub strengths: Vec<AnalysisPoint>,
+    pub risks: Vec<AnalysisPoint>,
+    pub evidence: Vec<AnalysisEvidenceItem>,
+    pub review_evidence: Vec<AnalysisReviewEvidenceItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DiscoveryRunStatus {
     Running,
     Paused,

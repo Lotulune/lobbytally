@@ -2,8 +2,9 @@ use crate::backfill_task::BACKFILL_MAX_ATTEMPTS;
 use crate::discovery::{parse_saved_cursor, DISCOVERY_CURSOR_CONFIG_KEY};
 use crate::models::{
     DashboardPayload, DashboardStats, DiscoveryFailureItem, DiscoveryRunSnapshot,
-    DiscoveryRunStatus, DiscoveryTaskRequest, GameCard, PublicConfig, ReviewSnippet,
-    StoreReleaseState, SyncMode, UserCollections, UserGameState, UserGameStatePatch,
+    DiscoveryRunStatus, DiscoveryTaskRequest, GameAnalysisReport, GameCard, PublicConfig,
+    ReviewSnippet, StoreReleaseState, SyncMode, UserCollections, UserGameState,
+    UserGameStatePatch,
 };
 use crate::recommendation::{
     bucket_game, compute_recommendation_score, today_iso_utc, DemoStatus, GameFacts, ReleaseBucket,
@@ -123,6 +124,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             recommendation_score REAL NOT NULL,
             ai_score REAL,
             ai_summary TEXT NOT NULL,
+            ai_analysis_report_json TEXT,
+            ai_analysis_generated_at TEXT,
             capsule_url TEXT NOT NULL,
             store_screenshot_urls_json TEXT NOT NULL DEFAULT '[]',
             tags_json TEXT NOT NULL,
@@ -588,6 +591,35 @@ pub fn load_game(conn: &Connection, appid: u32) -> Result<Option<GameCard>> {
     games.append(&mut dashboard.classics);
     games.append(&mut dashboard.upcoming);
     Ok(games.into_iter().find(|game| game.appid == appid))
+}
+
+pub fn load_game_analysis(conn: &Connection, appid: u32) -> Result<Option<GameAnalysisReport>> {
+    let report_json = conn
+        .query_row(
+            "SELECT ai_analysis_report_json FROM games WHERE appid = ?1",
+            params![appid],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+
+    match report_json {
+        Some(report_json) => Ok(Some(serde_json::from_str(&report_json)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn save_game_analysis(conn: &Connection, appid: u32, report: &GameAnalysisReport) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE games
+        SET ai_analysis_report_json = ?2,
+            ai_analysis_generated_at = ?3
+        WHERE appid = ?1
+        "#,
+        params![appid, serde_json::to_string(report)?, report.generated_at],
+    )?;
+    Ok(())
 }
 
 pub fn list_game_appids(conn: &Connection) -> Result<Vec<u32>> {
@@ -1309,6 +1341,16 @@ fn ensure_games_metadata_columns(conn: &Connection) -> Result<()> {
         conn,
         "discount_percent",
         "ALTER TABLE games ADD COLUMN discount_percent INTEGER",
+    )?;
+    add_games_column_if_missing(
+        conn,
+        "ai_analysis_report_json",
+        "ALTER TABLE games ADD COLUMN ai_analysis_report_json TEXT",
+    )?;
+    add_games_column_if_missing(
+        conn,
+        "ai_analysis_generated_at",
+        "ALTER TABLE games ADD COLUMN ai_analysis_generated_at TEXT",
     )?;
     add_games_column_if_missing(
         conn,
