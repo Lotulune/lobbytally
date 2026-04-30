@@ -14,6 +14,15 @@ fn empty_db() -> Connection {
 }
 
 #[test]
+fn migrate_sets_deepseek_as_the_default_llm_provider() {
+    let conn = empty_db();
+    let config = db::public_config(&conn).expect("load public config");
+
+    assert_eq!(config.llm_base_url, "https://api.deepseek.com");
+    assert_eq!(config.llm_model, "deepseek-v4-flash");
+}
+
+#[test]
 fn sqlite_round_trips_extended_store_metadata() {
     let conn = empty_db();
     let card = GameCard {

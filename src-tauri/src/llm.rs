@@ -3,6 +3,9 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 1_200;
+
 #[derive(Debug, Clone)]
 pub struct LlmRuntimeConfig {
     pub api_key: Option<String>,
@@ -222,37 +225,34 @@ async fn request_chat_completion_content(
     user_prompt: String,
     temperature: f32,
 ) -> Result<String> {
-    let response = client
-        .post(format!("{base_url}/v1/chat/completions"))
-        .bearer_auth(api_key)
-        .json(&ChatRequest {
-            model: model.to_string(),
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: system_prompt.to_string(),
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: user_prompt,
-                },
-            ],
-            temperature,
-        })
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<ChatResponse>()
-        .await
-        .context("decode LLM response")?;
+    let endpoint = resolve_llm_endpoint(base_url);
 
-    let content = response
-        .choices
-        .first()
-        .map(|choice| choice.message.content.trim().to_string())
-        .filter(|content| !content.is_empty())
-        .unwrap_or_else(|| "{}".to_string());
-    Ok(content)
+    match endpoint.api_format {
+        LlmApiFormat::OpenAiChatCompletions => {
+            request_openai_compatible_content(
+                client,
+                api_key,
+                &endpoint.url,
+                model,
+                system_prompt,
+                user_prompt,
+                temperature,
+            )
+            .await
+        }
+        LlmApiFormat::AnthropicMessages => {
+            request_anthropic_compatible_content(
+                client,
+                api_key,
+                &endpoint.url,
+                model,
+                system_prompt,
+                user_prompt,
+                temperature,
+            )
+            .await
+        }
+    }
 }
 
 fn trim_json_content(content: &str) -> Result<&str> {
@@ -294,4 +294,179 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatChoiceMessage {
     content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlmApiFormat {
+    OpenAiChatCompletions,
+    AnthropicMessages,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedLlmEndpoint {
+    api_format: LlmApiFormat,
+    url: String,
+}
+
+fn resolve_llm_endpoint(base_url: &str) -> ResolvedLlmEndpoint {
+    let normalized_base_url = base_url.trim().trim_end_matches('/').to_string();
+    let lower = normalized_base_url.to_ascii_lowercase();
+    let api_format = if lower.contains("api.anthropic.com")
+        || lower.contains("/anthropic")
+        || lower.ends_with("/messages")
+        || lower.ends_with("/v1/messages")
+    {
+        LlmApiFormat::AnthropicMessages
+    } else {
+        LlmApiFormat::OpenAiChatCompletions
+    };
+
+    let url = match api_format {
+        LlmApiFormat::OpenAiChatCompletions => {
+            if lower.ends_with("/v1/chat/completions") || lower.ends_with("/chat/completions") {
+                normalized_base_url.clone()
+            } else if lower.ends_with("/v1") {
+                format!("{normalized_base_url}/chat/completions")
+            } else {
+                format!("{normalized_base_url}/v1/chat/completions")
+            }
+        }
+        LlmApiFormat::AnthropicMessages => {
+            if lower.ends_with("/v1/messages") || lower.ends_with("/messages") {
+                normalized_base_url.clone()
+            } else if lower.ends_with("/v1") {
+                format!("{normalized_base_url}/messages")
+            } else {
+                format!("{normalized_base_url}/v1/messages")
+            }
+        }
+    };
+
+    ResolvedLlmEndpoint { api_format, url }
+}
+
+async fn request_openai_compatible_content(
+    client: &Client,
+    api_key: &str,
+    endpoint_url: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: String,
+    temperature: f32,
+) -> Result<String> {
+    let response = client
+        .post(endpoint_url)
+        .bearer_auth(api_key)
+        .json(&ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: system_prompt.to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: user_prompt,
+                },
+            ],
+            temperature,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<ChatResponse>()
+        .await
+        .context("decode LLM response")?;
+
+    let content = response
+        .choices
+        .first()
+        .map(|choice| choice.message.content.trim().to_string())
+        .filter(|content| !content.is_empty())
+        .unwrap_or_else(|| "{}".to_string());
+    Ok(content)
+}
+
+async fn request_anthropic_compatible_content(
+    client: &Client,
+    api_key: &str,
+    endpoint_url: &str,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: String,
+    temperature: f32,
+) -> Result<String> {
+    let response = client
+        .post(endpoint_url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION)
+        .json(&AnthropicRequest {
+            model: model.to_string(),
+            system: system_prompt.to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: vec![AnthropicMessageContentBlock {
+                    kind: "text".to_string(),
+                    text: user_prompt,
+                }],
+            }],
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            temperature,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<AnthropicResponse>()
+        .await
+        .context("decode LLM response")?;
+
+    let content = response
+        .content
+        .iter()
+        .filter(|block| block.kind == "text")
+        .filter_map(|block| block.text.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if content.is_empty() {
+        return Ok("{}".to_string());
+    }
+
+    Ok(content)
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicRequest {
+    model: String,
+    system: String,
+    messages: Vec<AnthropicMessage>,
+    max_tokens: u32,
+    temperature: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicMessage {
+    role: String,
+    content: Vec<AnthropicMessageContentBlock>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicMessageContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicResponse {
+    content: Vec<AnthropicResponseContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicResponseContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
 }

@@ -317,8 +317,8 @@ export const mockDashboard: DashboardPayload = {
   config: {
     steamApiKeyConfigured: false,
     llmApiKeyConfigured: false,
-    llmBaseUrl: "https://api.openai.com",
-    llmModel: "gpt-4.1-mini",
+    llmBaseUrl: "https://api.deepseek.com",
+    llmModel: "deepseek-v4-flash",
     country: "US",
     language: "schinese",
   },

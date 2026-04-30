@@ -1,13 +1,13 @@
 use reqwest::Client;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::mpsc;
 use std::thread;
 use tauri_app_lib::game_analysis::{
     apply_narrative_patch, build_rule_report, generate_game_analysis,
     summarize_report_as_assessment,
 };
-use tauri_app_lib::llm::AnalysisNarrative;
-use tauri_app_lib::llm::LlmRuntimeConfig;
+use tauri_app_lib::llm::{generate_analysis_narrative, AnalysisNarrative, LlmRuntimeConfig};
 use tauri_app_lib::models::{
     AnalysisConfidence, AnalysisPoint, AnalysisReviewStance, AnalysisSource, GameCard,
     ReviewSnippet, StoreReleaseState, UserGameState,
@@ -133,6 +133,36 @@ fn spawn_chat_completion_server(status_line: &str, body: &str) -> String {
     });
 
     format!("http://{}", address)
+}
+
+fn spawn_recording_server(status_line: &str, body: &str) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+    let address = listener
+        .local_addr()
+        .expect("read local test server address");
+    let status_line = status_line.to_string();
+    let body = body.to_string();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buffer = [0_u8; 16_384];
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            tx.send(request).expect("send recorded request");
+
+            let response = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write test response");
+            let _ = stream.flush();
+        }
+    });
+
+    (format!("http://{}", address), rx)
 }
 
 #[test]
@@ -383,4 +413,70 @@ async fn generate_game_analysis_keeps_rule_report_when_narrative_is_unusable() {
             .collect::<Vec<_>>(),
         EXPECTED_DIMENSION_KEYS
     );
+}
+
+#[tokio::test]
+async fn generate_analysis_narrative_uses_single_v1_suffix_for_openai_compatible_base_urls() {
+    let client = local_test_client();
+    let (base_url, request_rx) = spawn_recording_server(
+        "HTTP/1.1 200 OK",
+        r#"{"choices":[{"message":{"content":"{\"overview\":\"兼容 /v1 基地址。\",\"strengths\":[{\"title\":\"请求成功\",\"reason\":\"不应重复拼接 /v1。\"}],\"risks\":[{\"title\":\"无\",\"reason\":\"测试夹具。\"}],\"dimensionReasons\":[[\"approachability\",\"路径归一化正确。\"]]}"}}]}"#,
+    );
+    let config = LlmRuntimeConfig {
+        api_key: Some("test-key".to_string()),
+        base_url: format!("{base_url}/v1"),
+        model: "deepseek-v4-flash".to_string(),
+    };
+
+    let narrative = generate_analysis_narrative(
+        &client,
+        &config,
+        &rich_fixture_game(),
+        &build_rule_report(&rich_fixture_game(), "2026-04-30T12:00:00Z".to_string())
+            .expect("rule report"),
+    )
+    .await
+    .expect("decode narrative");
+    let request = request_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("recorded request");
+
+    assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+    assert!(!request.contains("/v1/v1/chat/completions"));
+    assert_eq!(narrative.overview, "兼容 /v1 基地址。");
+}
+
+#[tokio::test]
+async fn generate_analysis_narrative_supports_anthropic_messages_format() {
+    let client = local_test_client();
+    let (base_url, request_rx) = spawn_recording_server(
+        "HTTP/1.1 200 OK",
+        r#"{"id":"msg_123","type":"message","role":"assistant","content":[{"type":"text","text":"{\"overview\":\"Anthropic 兼容路径可用。\",\"strengths\":[{\"title\":\"协议兼容\",\"reason\":\"messages 响应已成功解析。\"}],\"risks\":[{\"title\":\"无\",\"reason\":\"测试夹具。\"}],\"dimensionReasons\":[[\"approachability\",\"Anthropic content text 已正确提取。\"]]}"}]}"#,
+    );
+    let config = LlmRuntimeConfig {
+        api_key: Some("test-key".to_string()),
+        base_url: format!("{base_url}/anthropic"),
+        model: "claude-3-5-sonnet-20241022".to_string(),
+    };
+
+    let narrative = generate_analysis_narrative(
+        &client,
+        &config,
+        &rich_fixture_game(),
+        &build_rule_report(&rich_fixture_game(), "2026-04-30T12:00:00Z".to_string())
+            .expect("rule report"),
+    )
+    .await
+    .expect("decode anthropic narrative");
+    let request = request_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("recorded request");
+    let request_lower = request.to_lowercase();
+
+    assert!(request.starts_with("POST /anthropic/v1/messages HTTP/1.1\r\n"));
+    assert!(request_lower.contains("x-api-key: test-key"));
+    assert!(request_lower.contains("anthropic-version: 2023-06-01"));
+    assert!(request.contains("\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\""));
+    assert!(request.contains("\"system\":\"You refine rule-based Steam multiplayer analyses. Return strict JSON only.\""));
+    assert_eq!(narrative.overview, "Anthropic 兼容路径可用。");
 }

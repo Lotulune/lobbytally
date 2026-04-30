@@ -713,8 +713,9 @@ fn load_llm_runtime_config(conn: &rusqlite::Connection) -> anyhow::Result<LlmRun
     Ok(LlmRuntimeConfig {
         api_key: db::get_secret(conn, "llm_api_key")?,
         base_url: db::get_config(conn, "llm_base_url")?
-            .unwrap_or_else(|| "https://api.openai.com".to_string()),
-        model: db::get_config(conn, "llm_model")?.unwrap_or_else(|| "gpt-4.1-mini".to_string()),
+            .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
+        model: db::get_config(conn, "llm_model")?
+            .unwrap_or_else(|| "deepseek-v4-flash".to_string()),
     })
 }
 

@@ -61,7 +61,10 @@ export function SettingsPage({
   return (
     <section className="settings-page">
       <h2>设置</h2>
-      <p>Steam Key 用于同步应用列表与数据；LLM Key 用于 AI 推荐短评。密钥只保存在本机。</p>
+      <p>
+        Steam Key 用于同步应用列表与数据；LLM Key 用于 AI 分析文案增强。默认使用
+        DeepSeek，也兼容 OpenAI `chat/completions` 与 Anthropic `messages` 格式。
+      </p>
       <label>
         Steam Web API Key
         <input
@@ -79,7 +82,7 @@ export function SettingsPage({
           placeholder={
             config.llmApiKeyConfigured
               ? "已配置，输入新值可覆盖"
-              : "输入 OpenAI-compatible API Key"
+              : "输入 DeepSeek / OpenAI / Anthropic API Key"
           }
           type="password"
         />
@@ -122,6 +125,12 @@ export function SettingsPage({
           />
         </label>
       </div>
+      <p className="settings-hint">
+        常见示例：DeepSeek OpenAI 兼容可填 `https://api.deepseek.com` 或
+        `https://api.deepseek.com/v1`；DeepSeek Anthropic 兼容可填
+        `https://api.deepseek.com/anthropic`；官方 Anthropic 可填
+        `https://api.anthropic.com`。
+      </p>
       <p className="settings-hint">
         当前库：{formatNumber(stats.totalGames)} 个游戏；最近同步：
         {formatDateTime(stats.lastSyncAt)}；Steam Key 与 LLM Key 仅保存在本机 SQLite。

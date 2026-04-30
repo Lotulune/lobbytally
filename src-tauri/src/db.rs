@@ -3,8 +3,7 @@ use crate::discovery::{parse_saved_cursor, DISCOVERY_CURSOR_CONFIG_KEY};
 use crate::models::{
     DashboardPayload, DashboardStats, DiscoveryFailureItem, DiscoveryRunSnapshot,
     DiscoveryRunStatus, DiscoveryTaskRequest, GameAnalysisReport, GameCard, PublicConfig,
-    ReviewSnippet, StoreReleaseState, SyncMode, UserCollections, UserGameState,
-    UserGameStatePatch,
+    ReviewSnippet, StoreReleaseState, SyncMode, UserCollections, UserGameState, UserGameStatePatch,
 };
 use crate::recommendation::{
     bucket_game, compute_recommendation_score, today_iso_utc, DemoStatus, GameFacts, ReleaseBucket,
@@ -15,8 +14,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-const DEFAULT_LLM_BASE_URL: &str = "https://api.openai.com";
-const DEFAULT_LLM_MODEL: &str = "gpt-4.1-mini";
+const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com";
+const DEFAULT_LLM_MODEL: &str = "deepseek-v4-flash";
 const MAX_SQLITE_U32: i64 = u32::MAX as i64;
 
 #[derive(Debug, Clone)]
@@ -609,7 +608,11 @@ pub fn load_game_analysis(conn: &Connection, appid: u32) -> Result<Option<GameAn
     }
 }
 
-pub fn save_game_analysis(conn: &Connection, appid: u32, report: &GameAnalysisReport) -> Result<()> {
+pub fn save_game_analysis(
+    conn: &Connection,
+    appid: u32,
+    report: &GameAnalysisReport,
+) -> Result<()> {
     ensure!(
         appid == report.appid,
         "report appid does not match target appid: target={appid}, report={}",

@@ -11,6 +11,27 @@ afterEach(() => {
 });
 
 describe("Settings and About pages", () => {
+  it("shows DeepSeek defaults while advertising OpenAI and Anthropic compatibility", () => {
+    render(
+      <SettingsPage
+        config={mockDashboard.config}
+        isBusy={false}
+        stats={mockDashboard.stats}
+        onRefreshDashboard={vi.fn(async () => undefined)}
+        onSave={vi.fn(async () => undefined)}
+        onStatus={vi.fn()}
+        onSync={vi.fn()}
+        status="当前库已就绪。"
+      />,
+    );
+
+    expect(
+      screen.getByPlaceholderText("输入 DeepSeek / OpenAI / Anthropic API Key"),
+    ).toBeInTheDocument();
+    expect(screen.getByDisplayValue("https://api.deepseek.com")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("deepseek-v4-flash")).toBeInTheDocument();
+  });
+
   it("shows both sync and discovery operations in settings", () => {
     const onSync = vi.fn();
 
