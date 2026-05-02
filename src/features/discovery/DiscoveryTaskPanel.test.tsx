@@ -12,6 +12,10 @@ vi.mock("./useDiscoveryTask", () => ({
   useDiscoveryTask: () => useDiscoveryTaskMock(),
 }));
 
+function openDiscoverySubPanel(title: string) {
+  fireEvent.click(screen.getByRole("button", { name: new RegExp(title) }));
+}
+
 function createSnapshot(
   overrides: Partial<DiscoveryRunSnapshot> = {},
 ): DiscoveryRunSnapshot {
@@ -142,6 +146,7 @@ describe("DiscoveryTaskPanel", () => {
 
     expect(screen.getByText("已暂停")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "继续任务" })).toBeInTheDocument();
+    openDiscoverySubPanel("失败记录");
     expect(screen.getByText("temporary fetch failure")).toBeInTheDocument();
     expect(screen.getByText("fetch_snapshot")).toBeInTheDocument();
 
@@ -333,6 +338,7 @@ describe("DiscoveryTaskPanel", () => {
       />,
     );
 
+    openDiscoverySubPanel("失败记录");
     expect(screen.getByText("第 2 页 · AppID 730123")).toBeInTheDocument();
     expect(screen.queryByText("第 3 页 · AppID 730123")).not.toBeInTheDocument();
   });
@@ -359,6 +365,7 @@ describe("DiscoveryTaskPanel", () => {
       />,
     );
 
+    openDiscoverySubPanel("元数据补全");
     expect(screen.getByText("元数据补全")).toBeInTheDocument();
     expect(screen.getByText("补录中")).toBeInTheDocument();
     expect(screen.getAllByText("2/5").length).toBeGreaterThan(0);

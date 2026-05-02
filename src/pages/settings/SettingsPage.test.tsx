@@ -6,6 +6,10 @@ import { mockDashboard } from "../../data/mockDashboard";
 import { AboutPage } from "../about/AboutPage";
 import { SettingsPage } from "./SettingsPage";
 
+function openSettingsSection(title: string) {
+  fireEvent.click(screen.getByRole("button", { name: new RegExp(title) }));
+}
+
 afterEach(() => {
   cleanup();
 });
@@ -25,6 +29,8 @@ describe("Settings and About pages", () => {
         status="当前库已就绪。"
       />,
     );
+
+    openSettingsSection("API 密钥");
 
     expect(
       screen.getByPlaceholderText("输入 DeepSeek / OpenAI / Anthropic API Key"),
@@ -50,6 +56,10 @@ describe("Settings and About pages", () => {
         status="当前库已就绪。"
       />,
     );
+
+    openSettingsSection("数据同步");
+    openSettingsSection("AI 批量重算");
+    openSettingsSection("发现任务");
 
     fireEvent.click(screen.getByRole("button", { name: "完整同步" }));
     fireEvent.click(screen.getByRole("button", { name: "快速同步" }));
@@ -82,6 +92,8 @@ describe("Settings and About pages", () => {
         status="当前库已就绪。"
       />,
     );
+
+    openSettingsSection("AI 批量重算");
 
     fireEvent.change(screen.getByLabelText("AI 批量重算并发数"), {
       target: { value: "10" },
@@ -120,7 +132,9 @@ describe("Settings and About pages", () => {
       />,
     );
 
-    expect(screen.getByText("AI 批量重算")).toBeInTheDocument();
+    openSettingsSection("AI 批量重算");
+
+    expect(screen.getAllByText("AI 批量重算").length).toBeGreaterThan(0);
     expect(screen.getByText("进度 40%")).toBeInTheDocument();
     expect(screen.getByText("8/20")).toBeInTheDocument();
     expect(screen.getByText("7301: upstream timeout")).toBeInTheDocument();

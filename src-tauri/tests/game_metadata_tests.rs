@@ -6,11 +6,21 @@ use tauri_app_lib::models::{
     GameAnalysisReport, GameCard, ReviewSnippet, StoreReleaseState, UserGameState,
 };
 use tauri_app_lib::recommendation::DemoStatus;
+use time::{format_description::FormatItem, macros::format_description, Duration, OffsetDateTime};
+
+const ISO_DATE: &[FormatItem<'_>] = format_description!("[year]-[month]-[day]");
 
 fn empty_db() -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory db");
     db::migrate(&conn).expect("migrate");
     conn
+}
+
+fn iso_date_from_today(day_offset: i64) -> String {
+    (OffsetDateTime::now_utc() + Duration::days(day_offset))
+        .date()
+        .format(ISO_DATE)
+        .expect("format relative date")
 }
 
 #[test]
@@ -94,8 +104,8 @@ fn dashboard_separates_upcoming_games_and_load_game_includes_them() {
         name: "Released Squad".to_string(),
         section: "new".to_string(),
         short_description: Some("A co-op release metadata fixture.".to_string()),
-        release_date: Some("2026-04-01".to_string()),
-        release_date_text: "Apr 1, 2026".to_string(),
+        release_date: Some(iso_date_from_today(-7)),
+        release_date_text: "Recent release".to_string(),
         release_state: StoreReleaseState::Released,
         demo_status: DemoStatus::Released,
         supported_languages: vec!["english".to_string()],
@@ -119,8 +129,8 @@ fn dashboard_separates_upcoming_games_and_load_game_includes_them() {
     upcoming.appid = 3_990_011;
     upcoming.name = "Launch Watch".to_string();
     upcoming.section = "classic".to_string();
-    upcoming.release_date = Some("2026-12-01".to_string());
-    upcoming.release_date_text = "Dec 1, 2026".to_string();
+    upcoming.release_date = Some(iso_date_from_today(30));
+    upcoming.release_date_text = "Upcoming release".to_string();
     upcoming.release_state = StoreReleaseState::Upcoming;
     upcoming.price_text = None;
 
