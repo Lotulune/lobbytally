@@ -16,6 +16,7 @@ function buildGame(appid: number, name: string, updatedAt: string | null): GameC
     demoStatus: "released",
     supportedLanguages: ["English"],
     isAdultContent: false,
+    isFree: false,
     priceText: "",
     discountPercent: null,
     positiveReviewPct: 93,

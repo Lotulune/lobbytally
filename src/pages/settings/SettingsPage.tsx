@@ -2,6 +2,7 @@ import { useState } from "react";
 import { previewSteamAppList } from "../../api/client";
 import { DiscoveryTaskPanel } from "../../features/discovery/DiscoveryTaskPanel";
 import type {
+  AiAnalysisQueueFailureItem,
   DashboardPayload,
   SaveConfigRequest,
   SyncMode,
@@ -9,6 +10,7 @@ import type {
 } from "../../types";
 
 type SectionKey = "apiKeys" | "llmConfig" | "sync" | "aiBatch" | "discovery";
+const DEFAULT_CLASSIC_DISCOVERY_MAX_PAGES = 3;
 
 function SettingsSection({
   title,
@@ -46,8 +48,11 @@ export function SettingsPage({
   config,
   isBusy,
   onRefreshAllAnalyses,
+  onRetryAiAnalysisJob,
+  onStartClassicDiscovery,
   status,
   stats,
+  aiAnalysisQueueFailures,
   onRefreshDashboard,
   onStatus,
   onSave,
@@ -56,8 +61,11 @@ export function SettingsPage({
   config: DashboardPayload["config"];
   isBusy: boolean;
   onRefreshAllAnalyses: (concurrency: number) => Promise<void>;
+  onRetryAiAnalysisJob: (appid: number) => Promise<void>;
+  onStartClassicDiscovery: (maxPages: number) => Promise<void>;
   status: string;
   stats: DashboardPayload["stats"];
+  aiAnalysisQueueFailures: AiAnalysisQueueFailureItem[];
   onRefreshDashboard: () => Promise<unknown>;
   onStatus: (message: string) => void;
   onSave: (request: SaveConfigRequest) => Promise<void>;
@@ -73,6 +81,9 @@ export function SettingsPage({
   const [preview, setPreview] = useState<SteamAppListPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [isPreviewing, setIsPreviewing] = useState(false);
+  const [classicDiscoveryMaxPages, setClassicDiscoveryMaxPages] = useState(
+    DEFAULT_CLASSIC_DISCOVERY_MAX_PAGES,
+  );
   const [expanded, setExpanded] = useState<Record<SectionKey, boolean>>({
     apiKeys: false,
     llmConfig: true,
@@ -92,7 +103,9 @@ export function SettingsPage({
       ? Math.round((stats.syncProcessedCount / stats.syncTotalCount) * 100)
       : 0;
   const hasAiBatchRefreshActivity =
-    stats.aiBatchRefreshRunning || stats.aiBatchRefreshTotalCount > 0;
+    stats.aiBatchRefreshRunning ||
+    stats.aiBatchRefreshTotalCount > 0 ||
+    stats.aiBatchRefreshFailedPendingReviewCount > 0;
   const aiBatchRefreshProgressPercent =
     stats.aiBatchRefreshTotalCount > 0
       ? Math.round(
@@ -101,9 +114,13 @@ export function SettingsPage({
       : 0;
   const syncStatusLabel = describeSyncStatus(stats);
   const aiBatchRefreshStatusLabel = describeAiBatchRefreshStatus(stats);
+  const classicDiscoveryStatusLabel = describeClassicDiscoveryStatus(stats);
   const { fullLabel, quickLabel } = syncActionLabels(stats);
   const batchRefreshConcurrency = clampBatchRefreshConcurrency(
     form.aiBatchRefreshConcurrency ?? config.aiBatchRefreshConcurrency,
+  );
+  const classicDiscoveryActionMaxPages = clampClassicDiscoveryMaxPages(
+    classicDiscoveryMaxPages,
   );
 
   async function handlePreviewSteamApps() {
@@ -447,6 +464,33 @@ export function SettingsPage({
               {stats.aiBatchRefreshLastError ? (
                 <p className="settings-error">{stats.aiBatchRefreshLastError}</p>
               ) : null}
+              {stats.aiBatchRefreshFailedPendingReviewCount > 0 ? (
+                <div className="settings-copy-block settings-copy-block-muted">
+                  <p className="settings-hint">
+                    待人工处理失败项：{formatNumber(stats.aiBatchRefreshFailedPendingReviewCount)}
+                  </p>
+                  <div className="settings-provider-list">
+                    {aiAnalysisQueueFailures.map((item) => (
+                      <div key={item.appid} className="backfill-status-head">
+                        <span>
+                          AppID {item.appid} · 已失败 {item.attempt} 次 · {formatDateTime(item.updatedAt)}
+                        </span>
+                        <button
+                          className="muted-button"
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => void onRetryAiAnalysisJob(item.appid)}
+                        >
+                          重试
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  {aiAnalysisQueueFailures[0] ? (
+                    <p className="mini-status">{aiAnalysisQueueFailures[0].lastError}</p>
+                  ) : null}
+                </div>
+              ) : null}
             </>
           ) : (
             <p className="mini-status">点击上方按钮开始批量重算所有游戏的 AI 评分。</p>
@@ -457,10 +501,76 @@ export function SettingsPage({
       {/* 发现任务 */}
       <SettingsSection
         title="发现任务"
-        status={stats.backfillRunning ? "补录中" : "空闲"}
+        status={stats.backfillRunning ? "新游补全中" : classicDiscoveryStatusLabel}
         expanded={expanded.discovery}
         onToggle={() => toggle("discovery")}
       >
+        <div className="backfill-status-block compact">
+          <div className="backfill-status-head">
+            <strong>精品老游补库</strong>
+            <span>{classicDiscoveryStatusLabel}</span>
+          </div>
+          <label>
+            老游补库页数
+            <input
+              aria-label="老游补库页数"
+              inputMode="numeric"
+              max={DEFAULT_CLASSIC_DISCOVERY_MAX_PAGES}
+              min={1}
+              type="number"
+              value={classicDiscoveryActionMaxPages}
+              onChange={(event) =>
+                setClassicDiscoveryMaxPages(
+                  clampClassicDiscoveryMaxPages(event.currentTarget.valueAsNumber),
+                )
+              }
+            />
+          </label>
+          <p className="settings-hint">
+            手动补库支持 1-3 页，默认 3；每页固定 100 个评论榜候选，连续 2 页无新增会提前停止。
+          </p>
+          <div className="settings-card-actions">
+            <button
+              className="ghost-button"
+              disabled={isBusy || stats.classicDiscoveryRunning}
+              type="button"
+              onClick={() => void onStartClassicDiscovery(classicDiscoveryActionMaxPages)}
+            >
+              {stats.classicDiscoveryRunning ? "老游补库中…" : "启动老游补库"}
+            </button>
+          </div>
+          <div className="backfill-status-grid">
+            <div>
+              <span>已扫描</span>
+              <strong>{formatNumber(stats.classicDiscoveryScannedApps)}</strong>
+            </div>
+            <div>
+              <span>已新增</span>
+              <strong>{formatNumber(stats.classicDiscoveryAddedGames)}</strong>
+            </div>
+            <div>
+              <span>已拒绝</span>
+              <strong>{formatNumber(stats.classicDiscoveryRejectedGames)}</strong>
+            </div>
+            <div>
+              <span>跳过已存在</span>
+              <strong>{formatNumber(stats.classicDiscoverySkippedExisting)}</strong>
+            </div>
+            <div>
+              <span>跳过拒绝缓存</span>
+              <strong>{formatNumber(stats.classicDiscoverySkippedRejectedCache)}</strong>
+            </div>
+            <div>
+              <span>最近完成</span>
+              <strong>{formatDateTime(stats.classicDiscoveryLastCompletedAt)}</strong>
+            </div>
+          </div>
+          <p className="mini-status">
+            {stats.classicDiscoveryRunning
+              ? `正在扫描 AppID ${stats.classicDiscoveryCurrentAppid ?? "未知"}；当前评论榜页进度 ${stats.classicDiscoveryScannedApps} 个候选。`
+              : "老游补库会在新游发现结束且新游补全清空后启动；不必等待新游 AI 清空，但老游 AI 仍会排在新游 AI 后面。"}
+          </p>
+        </div>
         <DiscoveryTaskPanel
           stats={stats}
           onRefreshDashboard={onRefreshDashboard}
@@ -518,6 +628,22 @@ function describeAiBatchRefreshStatus(stats: DashboardPayload["stats"]) {
   return "空闲";
 }
 
+function describeClassicDiscoveryStatus(stats: DashboardPayload["stats"]) {
+  if (stats.classicDiscoveryRunning) {
+    return "进行中";
+  }
+  if (stats.classicDiscoveryStatus === "interrupted") {
+    return "待续跑";
+  }
+  if (stats.classicDiscoveryStatus === "failed") {
+    return "已失败";
+  }
+  if (stats.classicDiscoveryStatus === "completed") {
+    return "已完成";
+  }
+  return "空闲";
+}
+
 function syncModeLabel(mode?: SyncMode | null) {
   return mode === "quick" ? "快速同步" : "完整同步";
 }
@@ -556,4 +682,12 @@ function clampBatchRefreshConcurrency(value: number | undefined) {
   }
 
   return Math.min(10, Math.max(1, Math.round(value)));
+}
+
+function clampClassicDiscoveryMaxPages(value: number | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_CLASSIC_DISCOVERY_MAX_PAGES;
+  }
+
+  return Math.min(DEFAULT_CLASSIC_DISCOVERY_MAX_PAGES, Math.max(1, Math.round(value)));
 }

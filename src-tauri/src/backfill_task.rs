@@ -1,5 +1,6 @@
 use crate::commands;
 use crate::db;
+use crate::models::AiAnalysisQueueSource;
 use crate::state::AppState;
 use crate::steam::{self, SteamGameSnapshotEnrichment};
 use anyhow::{Context, Result};
@@ -223,16 +224,12 @@ pub fn spawn_backfill_worker(app: AppHandle) {
             eprintln!("metadata backfill worker failed: {error:#}");
             let _ = clear_worker_active(&app);
         }
+        crate::auto_scheduler::kick(app);
     });
 }
 
 async fn run_backfill_worker(app: AppHandle) -> Result<()> {
     loop {
-        if discovery_task_is_active(&app)? {
-            tokio::time::sleep(BACKFILL_DELAY_BETWEEN_GAMES).await;
-            continue;
-        }
-
         let job = {
             let state = app.state::<AppState>();
             let mut runtime = state
@@ -325,16 +322,8 @@ async fn backfill_one_game(app: &AppHandle, appid: u32) -> Result<()> {
     let merged = commands::merge_snapshot(existing, snapshot);
     db::upsert_game(&conn, &merged)?;
     db::mark_sync_complete(&conn)?;
+    db::enqueue_ai_analysis_jobs(&conn, AiAnalysisQueueSource::NewRelease, [appid])?;
     Ok(())
-}
-
-fn discovery_task_is_active(app: &AppHandle) -> Result<bool> {
-    let state = app.state::<AppState>();
-    let runtime = state
-        .discovery
-        .lock()
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    Ok(runtime.active_run_id.is_some())
 }
 
 fn clear_worker_active(app: &AppHandle) -> Result<()> {

@@ -27,6 +27,7 @@ impl DemoStatus {
 pub enum ReleaseBucket {
     New,
     Classic,
+    ClassicHidden,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +73,18 @@ pub fn compute_recommendation_score(facts: &GameFacts, today_iso: &str) -> f64 {
 pub fn bucket_game(facts: &GameFacts, today_iso: &str) -> ReleaseBucket {
     match days_since_release(facts.release_date.as_deref(), today_iso) {
         Some(days) if (0..=30).contains(&days) => ReleaseBucket::New,
-        _ => ReleaseBucket::Classic,
+        Some(days) if days > 30 => {
+            let review_pct = facts.positive_review_pct.unwrap_or_default();
+            let total_reviews = facts.total_reviews.unwrap_or_default();
+            if review_pct >= 80.0 && total_reviews >= 1_000 {
+                ReleaseBucket::Classic
+            } else if review_pct >= 60.0 && total_reviews >= 300 {
+                ReleaseBucket::ClassicHidden
+            } else {
+                ReleaseBucket::ClassicHidden
+            }
+        }
+        _ => ReleaseBucket::ClassicHidden,
     }
 }
 

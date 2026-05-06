@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ScrollDock } from "./components/ScrollDock";
+import {
+  TaskToastLayer,
+  type TaskToastItem,
+  type TaskToastTone,
+} from "./components/TaskToastLayer";
 import {
   applyGameAnalysisSnapshotToDashboard,
   applyGameAnalysisSnapshotToGame,
@@ -10,9 +16,13 @@ import {
 import {
   assessGameWithAi,
   getDashboard,
+  getDiscoveryTaskSnapshot,
+  isTauriRuntime,
   refreshAllGameAnalyses,
+  retryAiAnalysisJob,
   saveConfig,
   setGameUserState,
+  startClassicDiscoveryTask,
   syncSeedGames,
 } from "./api/client";
 import { buildDashboardSections, filterGames } from "./features/library/gameFilters";
@@ -32,18 +42,24 @@ import { UpcomingPage } from "./pages/upcoming/UpcomingPage";
 import type { LibraryFilters, ViewId, LibrarySortMode } from "./pages/types";
 import type {
   AiAssessment,
+  DashboardStats,
   DashboardPayload,
+  DiscoveryRunSnapshot,
+  DiscoveryRunStatus,
   GameCard,
   SaveConfigRequest,
   SyncMode,
   UserGameStatePatch,
 } from "./types";
 import "./App.css";
+import { listen } from "@tauri-apps/api/event";
 
 const defaultTagOptions = ["合作", "独立", "像素风格", "解谜", "轻松"];
 const DEFAULT_MIN_PLAYERS = 0;
 const DEFAULT_MIN_REVIEW_PCT = 0;
 const DASHBOARD_POLL_INTERVAL_MS = 2_000;
+const DISCOVERY_TASK_EVENT = "discovery-task-updated";
+const MAX_VISIBLE_TASK_TOASTS = 4;
 
 const navPrimary: Array<{ id: ViewId; label: string; icon: string; badge?: string }> = [
   { id: "home", label: "首页", icon: "⌂" },
@@ -78,6 +94,34 @@ const DEFAULT_SECTION_PAGES: DashboardSectionPageState = {
   recent: 1,
 };
 
+function hasIndependentScrollContainer(container: HTMLElement | null) {
+  if (container == null) {
+    return false;
+  }
+
+  const overflowY = window.getComputedStyle(container).overflowY;
+  return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+}
+
+function getPageScrollTop(container: HTMLElement | null) {
+  if (container != null && hasIndependentScrollContainer(container)) {
+    return container.scrollTop;
+  }
+
+  return window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
+}
+
+function setPageScrollTop(container: HTMLElement | null, top: number) {
+  const safeTop = Math.max(0, top);
+
+  if (container != null && hasIndependentScrollContainer(container)) {
+    container.scrollTop = safeTop;
+    return;
+  }
+
+  window.scrollTo({ top: safeTop, behavior: "auto" });
+}
+
 function App() {
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
   const [activeView, setActiveView] = useState<ViewId>("home");
@@ -88,15 +132,34 @@ function App() {
   const [status, setStatus] = useState("正在打开 Co-Play 多人游戏雷达……");
   const [isBusy, setIsBusy] = useState(false);
   const [assessment, setAssessment] = useState<AiAssessment | null>(null);
+  const [taskToasts, setTaskToasts] = useState<TaskToastItem[]>([]);
   const [sectionPages, setSectionPages] =
     useState<DashboardSectionPageState>(DEFAULT_SECTION_PAGES);
+  const [discoveryTaskRunning, setDiscoveryTaskRunning] = useState(false);
   const mountedRef = useRef(true);
   const dashboardRequestIdRef = useRef(0);
   const detailReturnViewRef = useRef<ViewId>("home");
+  const pageSurfaceRef = useRef<HTMLElement | null>(null);
+  const viewScrollPositionsRef = useRef<Partial<Record<ViewId, number>>>({});
+  const pendingScrollRestoreRef = useRef<{ view: ViewId; top: number } | null>(null);
   const pendingAnalysisSnapshotsRef = useRef(new Map<number, GameAnalysisSnapshot>());
+  const latestDiscoverySnapshotRef = useRef<DiscoveryRunSnapshot | null>(null);
+  const latestStatsRef = useRef<DashboardStats | null>(null);
+  const taskToastIdRef = useRef(0);
 
   useEffect(() => {
     void loadDashboard();
+  }, []);
+
+  useEffect(() => {
+    void getDiscoveryTaskSnapshot()
+      .then((snapshot) => {
+        latestDiscoverySnapshotRef.current = snapshot;
+        setDiscoveryTaskRunning(snapshot?.status === "running");
+      })
+      .catch(() => {
+        setDiscoveryTaskRunning(false);
+      });
   }, []);
 
   useEffect(() => {
@@ -109,11 +172,29 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const pendingRestore = pendingScrollRestoreRef.current;
+    if (!pendingRestore || pendingRestore.view !== activeView) {
+      return;
+    }
+
+    pendingScrollRestoreRef.current = null;
+    const rafId = window.requestAnimationFrame(() => {
+      setPageScrollTop(pageSurfaceRef.current, pendingRestore.top);
+    });
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+    };
+  }, [activeView, dashboard, sectionPages]);
+
+  useEffect(() => {
     if (!dashboard) {
       return;
     }
 
     if (
+      !discoveryTaskRunning &&
+      !dashboard.stats.classicDiscoveryRunning &&
       !dashboard.stats.syncRunning &&
       !dashboard.stats.backfillRunning &&
       dashboard.stats.backfillPendingCount === 0 &&
@@ -147,7 +228,44 @@ function App() {
         window.clearTimeout(timer);
       }
     };
-  }, [dashboard, refreshDashboard]);
+  }, [dashboard, discoveryTaskRunning, refreshDashboard]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return;
+    }
+
+    let isDisposed = false;
+    let unlisten: (() => void) | null = null;
+
+    void listen<DiscoveryRunSnapshot>(DISCOVERY_TASK_EVENT, ({ payload }) => {
+      if (isDisposed) {
+        return;
+      }
+
+      const previousSnapshot = latestDiscoverySnapshotRef.current;
+      latestDiscoverySnapshotRef.current = payload;
+      const running = payload.status === "running";
+      setDiscoveryTaskRunning(running);
+      maybeNotifyDiscoveryCompletion(previousSnapshot, payload, enqueueTaskToast);
+      if (!running) {
+        void refreshDashboard().catch((error) => {
+          setStatus(error instanceof Error ? error.message : String(error));
+        });
+      }
+    }).then((cleanup) => {
+      if (isDisposed) {
+        cleanup();
+        return;
+      }
+      unlisten = cleanup;
+    });
+
+    return () => {
+      isDisposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   async function refreshDashboard(requestId = beginDashboardRequest()) {
     const payload = await getDashboard();
@@ -155,6 +273,8 @@ function App() {
       return null;
     }
 
+    maybeNotifyStatsTransitions(latestStatsRef.current, payload.stats, enqueueTaskToast);
+    latestStatsRef.current = payload.stats;
     const nextPayload = applyPendingGameAnalysisSnapshots(payload);
     const latestGames = [
       ...nextPayload.upcoming,
@@ -244,6 +364,36 @@ function App() {
     }
   }
 
+  async function handleRetryAiAnalysisJob(appid: number) {
+    setIsBusy(true);
+    setStatus(`正在重试 AppID ${appid} 的 AI 分析任务……`);
+    try {
+      const report = await retryAiAnalysisJob(appid);
+      await refreshDashboard();
+      setStatus(report.message);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function handleStartClassicDiscovery(maxPages: number) {
+    setIsBusy(true);
+    setStatus(`正在启动精品老游补库，按评论榜最多扫描 ${maxPages} 页……`);
+    try {
+      const snapshot = await startClassicDiscoveryTask(maxPages);
+      await refreshDashboard();
+      setStatus(
+        `已启动精品老游补库：任务 #${snapshot.id}，本轮最多扫描 ${snapshot.maxPages} 页，每页 ${snapshot.pageSize} 个候选。`,
+      );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
   async function handleUserState(
     appid: number,
     patch: UserGameStatePatch,
@@ -323,6 +473,25 @@ function App() {
     return requestId;
   }
 
+  function enqueueTaskToast(
+    tone: TaskToastTone,
+    title: string,
+    message: string,
+  ) {
+    taskToastIdRef.current += 1;
+    const toast: TaskToastItem = {
+      id: taskToastIdRef.current,
+      tone,
+      title,
+      message,
+    };
+    setTaskToasts((current) => [toast, ...current].slice(0, MAX_VISIBLE_TASK_TOASTS));
+  }
+
+  function dismissTaskToast(id: number) {
+    setTaskToasts((current) => current.filter((toast) => toast.id !== id));
+  }
+
   function isDashboardRequestCurrent(requestId: number) {
     return mountedRef.current && dashboardRequestIdRef.current === requestId;
   }
@@ -334,6 +503,7 @@ function App() {
     const matchingGames = [
       ...payload.newGames,
       ...payload.classics,
+      ...payload.hiddenGames,
       ...payload.upcoming,
       ...payload.recentDiscoveries,
       ...payload.collections.favorites,
@@ -352,20 +522,38 @@ function App() {
     );
   }
 
+  function rememberCurrentViewScroll(view: ViewId) {
+    viewScrollPositionsRef.current[view] = getPageScrollTop(pageSurfaceRef.current);
+  }
+
+  function scrollCurrentViewToTop() {
+    setPageScrollTop(pageSurfaceRef.current, 0);
+  }
+
   function openDetail(game: GameCard) {
+    rememberCurrentViewScroll(activeView);
     detailReturnViewRef.current = activeView;
     setSelectedGame(game);
     setActiveView("detail");
+    scrollCurrentViewToTop();
     void handleUserState(game.appid, { viewed: true }, `已打开《${game.name}》详情。`);
   }
 
   function openSelectedGameDetail() {
+    rememberCurrentViewScroll(activeView);
     detailReturnViewRef.current = activeView;
     setActiveView("detail");
+    scrollCurrentViewToTop();
   }
 
   function returnFromDetail() {
-    setActiveView(detailReturnViewRef.current === "detail" ? "home" : detailReturnViewRef.current);
+    const nextView =
+      detailReturnViewRef.current === "detail" ? "home" : detailReturnViewRef.current;
+    pendingScrollRestoreRef.current = {
+      view: nextView,
+      top: viewScrollPositionsRef.current[nextView] ?? 0,
+    };
+    setActiveView(nextView);
   }
 
   function resetFilters() {
@@ -424,6 +612,7 @@ function App() {
       ...(dashboard?.upcoming ?? []),
       ...(dashboard?.newGames ?? []),
       ...(dashboard?.classics ?? []),
+      ...(dashboard?.hiddenGames ?? []),
     ],
     [dashboard],
   );
@@ -500,7 +689,12 @@ function App() {
       <main className="coplay-shell">
         <Sidebar activeView={activeView} onNavigate={setActiveView} />
 
-        <section className="page-surface">
+        <section
+          className="page-surface"
+          ref={(node) => {
+            pageSurfaceRef.current = node;
+          }}
+        >
         <TopBar
           activeView={activeView}
           query={query}
@@ -602,12 +796,15 @@ function App() {
             config={dashboard.config}
             isBusy={isBusy}
             onRefreshAllAnalyses={handleRefreshAllAnalyses}
+            onRetryAiAnalysisJob={handleRetryAiAnalysisJob}
+            onStartClassicDiscovery={handleStartClassicDiscovery}
             onRefreshDashboard={refreshDashboard}
             onSave={handleSaveConfig}
             onStatus={setStatus}
             onSync={handleSync}
             status={status}
             stats={dashboard.stats}
+            aiAnalysisQueueFailures={dashboard.aiAnalysisQueueFailures}
           />
         )}
 
@@ -647,8 +844,128 @@ function App() {
           />
         )}
       </section>
+      <ScrollDock scrollContainer={pageSurfaceRef.current} />
+      <TaskToastLayer toasts={taskToasts} onDismiss={dismissTaskToast} />
     </main>
     </ErrorBoundary>
+  );
+}
+
+function maybeNotifyDiscoveryCompletion(
+  previousSnapshot: DiscoveryRunSnapshot | null,
+  nextSnapshot: DiscoveryRunSnapshot,
+  notify: (tone: TaskToastTone, title: string, message: string) => void,
+) {
+  if (!previousSnapshot || previousSnapshot.id !== nextSnapshot.id) {
+    return;
+  }
+
+  if (previousSnapshot.status === nextSnapshot.status) {
+    return;
+  }
+
+  if (!isRunningStatus(previousSnapshot.status) || !isTerminalDiscoveryStatus(nextSnapshot.status)) {
+    return;
+  }
+
+  switch (nextSnapshot.status) {
+    case "completed":
+      notify(
+        "success",
+        "新游入库已完成",
+        `任务 #${nextSnapshot.id} 已结束，新增 ${nextSnapshot.addedGames} 个新游戏，已检查 ${nextSnapshot.scannedApps} 个候选。`,
+      );
+      break;
+    case "failed":
+      notify(
+        "danger",
+        "新游入库失败",
+        nextSnapshot.lastError ?? `任务 #${nextSnapshot.id} 失败，请查看发现任务记录。`,
+      );
+      break;
+    case "cancelled":
+      notify("warning", "新游入库已取消", `任务 #${nextSnapshot.id} 已取消。`);
+      break;
+    case "interrupted":
+      notify("warning", "新游入库已中断", `任务 #${nextSnapshot.id} 已中断，可继续恢复。`);
+      break;
+    case "paused":
+      notify("warning", "新游入库已暂停", `任务 #${nextSnapshot.id} 已暂停。`);
+      break;
+    default:
+      break;
+  }
+}
+
+function maybeNotifyStatsTransitions(
+  previousStats: DashboardStats | null,
+  nextStats: DashboardStats,
+  notify: (tone: TaskToastTone, title: string, message: string) => void,
+) {
+  if (!previousStats) {
+    return;
+  }
+
+  if (previousStats.backfillRunning && !nextStats.backfillRunning && nextStats.backfillPendingCount === 0) {
+    notify(
+      nextStats.backfillFailedCount > previousStats.backfillFailedCount ? "warning" : "success",
+      nextStats.backfillFailedCount > previousStats.backfillFailedCount ? "新游补全结束（含失败）" : "新游补全已完成",
+      `已处理 ${nextStats.backfillProcessedCount}/${nextStats.backfillTotalCount}，失败 ${nextStats.backfillFailedCount}。`,
+    );
+  }
+
+  if (previousStats.syncRunning && !nextStats.syncRunning && nextStats.syncPendingCount === 0) {
+    notify(
+      nextStats.syncFailedCount > previousStats.syncFailedCount ? "warning" : "success",
+      nextStats.syncFailedCount > previousStats.syncFailedCount ? "Steam 同步结束（含失败）" : "Steam 同步已完成",
+      `已更新 ${nextStats.syncUpdatedCount} 个游戏，失败 ${nextStats.syncFailedCount}。`,
+    );
+  }
+
+  if (previousStats.classicDiscoveryRunning && !nextStats.classicDiscoveryRunning) {
+    const tone =
+      nextStats.classicDiscoveryStatus === "failed"
+        ? "danger"
+        : nextStats.classicDiscoveryStatus === "completed"
+          ? "success"
+          : "warning";
+    const title =
+      nextStats.classicDiscoveryStatus === "failed"
+        ? "老游补库失败"
+        : nextStats.classicDiscoveryStatus === "completed"
+          ? "老游补库已完成"
+          : "老游补库已停止";
+    notify(
+      tone,
+      title,
+      `已新增 ${nextStats.classicDiscoveryAddedGames} 个老游戏，扫描 ${nextStats.classicDiscoveryScannedApps} 个候选。`,
+    );
+  }
+
+  if (previousStats.aiBatchRefreshRunning && !nextStats.aiBatchRefreshRunning) {
+    notify(
+      nextStats.aiBatchRefreshFailedCount > previousStats.aiBatchRefreshFailedCount
+        ? "warning"
+        : "success",
+      nextStats.aiBatchRefreshFailedCount > previousStats.aiBatchRefreshFailedCount
+        ? "AI 批量重算结束（含失败）"
+        : "AI 批量重算已完成",
+      `已处理 ${nextStats.aiBatchRefreshProcessedCount}/${nextStats.aiBatchRefreshTotalCount}，失败 ${nextStats.aiBatchRefreshFailedCount}。`,
+    );
+  }
+}
+
+function isRunningStatus(status: DiscoveryRunStatus) {
+  return status === "running";
+}
+
+function isTerminalDiscoveryStatus(status: DiscoveryRunStatus) {
+  return (
+    status === "completed" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "interrupted" ||
+    status === "paused"
   );
 }
 

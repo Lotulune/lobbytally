@@ -30,9 +30,11 @@ pub struct SaveConfigRequest {
 pub struct DashboardPayload {
     pub new_games: Vec<GameCard>,
     pub classics: Vec<GameCard>,
+    pub hidden_games: Vec<GameCard>,
     pub upcoming: Vec<GameCard>,
     pub recent_discoveries: Vec<GameCard>,
     pub collections: UserCollections,
+    pub ai_analysis_queue_failures: Vec<AiAnalysisQueueFailureItem>,
     pub stats: DashboardStats,
     pub config: PublicConfig,
 }
@@ -46,6 +48,17 @@ pub struct DashboardStats {
     pub new_games_count: usize,
     pub classic_games_count: usize,
     pub last_discovery_appid: Option<u32>,
+    pub classic_discovery_running: bool,
+    pub classic_discovery_status: Option<DiscoveryRunStatus>,
+    pub classic_discovery_current_appid: Option<u32>,
+    pub classic_discovery_last_appid: Option<u32>,
+    pub classic_discovery_scanned_apps: usize,
+    pub classic_discovery_added_games: usize,
+    pub classic_discovery_rejected_games: usize,
+    pub classic_discovery_failed_games: usize,
+    pub classic_discovery_skipped_existing: usize,
+    pub classic_discovery_skipped_rejected_cache: usize,
+    pub classic_discovery_last_completed_at: Option<String>,
     pub sync_running: bool,
     pub sync_mode: Option<SyncMode>,
     pub sync_pending_count: usize,
@@ -74,6 +87,7 @@ pub struct DashboardStats {
     pub ai_batch_refresh_processed_count: usize,
     pub ai_batch_refresh_updated_count: usize,
     pub ai_batch_refresh_failed_count: usize,
+    pub ai_batch_refresh_failed_pending_review_count: usize,
     pub ai_batch_refresh_last_error: Option<String>,
     pub ai_batch_refresh_last_error_appid: Option<u32>,
     pub data_source: String,
@@ -92,6 +106,7 @@ pub struct GameCard {
     pub demo_status: DemoStatus,
     pub supported_languages: Vec<String>,
     pub is_adult_content: bool,
+    pub is_free: bool,
     pub price_text: Option<String>,
     pub discount_percent: Option<u32>,
     pub positive_review_pct: Option<f64>,
@@ -174,6 +189,13 @@ pub struct AiBatchRefreshReport {
     pub updated_games: usize,
     pub failed_games: usize,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiAnalysisQueueSource {
+    NewRelease,
+    Classic,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,12 +357,30 @@ pub enum DiscoveryRunStatus {
     Interrupted,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryCompletionReason {
+    TargetReached,
+    PageBudgetReached,
+    NoMoreResults,
+    Paused,
+    Cancelled,
+    Failed,
+    Interrupted,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryTaskRequest {
     pub sync_mode: SyncMode,
     pub target_added_games: u32,
     pub page_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassicDiscoveryTaskRequest {
+    pub max_pages: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +398,7 @@ pub struct DiscoveryFailureItem {
 pub struct DiscoveryRunSnapshot {
     pub id: i64,
     pub status: DiscoveryRunStatus,
+    pub completion_reason: Option<DiscoveryCompletionReason>,
     pub sync_mode: SyncMode,
     pub target_added_games: u32,
     pub page_size: u32,
@@ -384,9 +425,10 @@ impl Serialize for DiscoveryRunSnapshot {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("DiscoveryRunSnapshot", 22)?;
+        let mut state = serializer.serialize_struct("DiscoveryRunSnapshot", 23)?;
         state.serialize_field("id", &self.id)?;
         state.serialize_field("status", &self.status)?;
+        state.serialize_field("completionReason", &self.completion_reason)?;
         state.serialize_field("syncMode", &self.sync_mode)?;
         state.serialize_field("targetAddedGames", &self.target_added_games)?;
         state.serialize_field("pageSize", &self.page_size)?;
@@ -427,4 +469,72 @@ impl DiscoveryRunSnapshot {
             DiscoveryRunStatus::Paused | DiscoveryRunStatus::Interrupted
         )
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassicRejectReasonCode {
+    NonMultiplayer,
+    NotReleased,
+    TooNew,
+    LowReviewCount,
+    LowPositiveReviewPct,
+    LowCurrentPlayers,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassicDiscoveryRejectCacheEntry {
+    pub appid: u32,
+    pub reason_code: ClassicRejectReasonCode,
+    pub positive_review_pct: Option<f64>,
+    pub total_reviews: Option<u32>,
+    pub current_players: Option<u32>,
+    pub release_state: StoreReleaseState,
+    pub release_date: Option<String>,
+    pub checked_at: String,
+    pub rule_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassicDiscoveryRunSnapshot {
+    pub id: i64,
+    pub status: DiscoveryRunStatus,
+    pub max_pages: u32,
+    pub page_size: u32,
+    pub pages_processed: u32,
+    pub scanned_apps: usize,
+    pub considered_apps: usize,
+    pub added_games: usize,
+    pub rejected_games: usize,
+    pub skipped_existing: usize,
+    pub skipped_rejected_cache: usize,
+    pub failed_games: usize,
+    pub current_appid: Option<u32>,
+    pub last_appid: Option<u32>,
+    pub consecutive_empty_pages: u32,
+    pub rule_version: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl ClassicDiscoveryRunSnapshot {
+    pub fn can_resume(&self) -> bool {
+        matches!(
+            self.status,
+            DiscoveryRunStatus::Paused | DiscoveryRunStatus::Interrupted
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiAnalysisQueueFailureItem {
+    pub appid: u32,
+    pub attempt: u8,
+    pub last_error: String,
+    pub updated_at: String,
 }

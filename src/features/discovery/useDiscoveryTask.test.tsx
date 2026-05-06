@@ -54,6 +54,7 @@ function buildSnapshot(
   return {
     id: 1,
     status: "running",
+    completionReason: null,
     syncMode: "full",
     targetAddedGames: 10,
     pageSize: 25,

@@ -125,6 +125,32 @@ describe("DashboardPage", () => {
     expect(screen.getByRole("heading", { name: "最近发现" })).toBeInTheDocument();
   });
 
+  it("renders a free badge alongside demo badge on dashboard cards", () => {
+    const freeGame = {
+      ...mockDashboard.newGames[0],
+      appid: 9_990_101,
+      name: "Free Squad Tactics",
+      isFree: true,
+      userState: { ...mockDashboard.newGames[0].userState },
+    };
+
+    renderDashboardPage({
+      activeView: "new",
+      sectionsOverride: [
+        {
+          id: "new",
+          title: "新游区",
+          subtitle: "近一个月发布的多人游戏",
+          games: [freeGame],
+        },
+      ],
+    });
+
+    const card = screen.getByRole("button", { name: /Free Squad Tactics/ });
+    expect(within(card).getByText("Free")).toBeInTheDocument();
+    expect(within(card).getByText("Demo")).toBeInTheDocument();
+  });
+
   it("routes quick-tag clicks through the page callback", () => {
     const onToggleQuickTag = vi.fn<ToggleQuickTag>();
     renderDashboardPage({ activeView: "home", onToggleQuickTag });
@@ -166,6 +192,62 @@ describe("DashboardPage", () => {
     expect(screen.getByText("第 2 / 2 页")).toBeInTheDocument();
     expect(screen.getByText("测试新游 13")).toBeInTheDocument();
     expect(screen.queryByText("测试新游 1")).not.toBeInTheDocument();
+  });
+
+  it("paginates the recent discoveries section with the full imported list", () => {
+    renderDashboardPage({
+      activeView: "browse",
+      sectionsOverride: [
+        {
+          id: "recent",
+          title: "最近发现",
+          subtitle: "刚导入到本地库的多人游戏",
+          games: createGames(15, "最近发现游戏"),
+        },
+      ],
+    });
+
+    expect(screen.getByText("共 15 款")).toBeInTheDocument();
+    expect(screen.getByText("第 1 / 2 页")).toBeInTheDocument();
+    expect(screen.getByText("最近发现游戏 8")).toBeInTheDocument();
+    expect(screen.queryByText("最近发现游戏 9")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+
+    expect(screen.getByText("第 2 / 2 页")).toBeInTheDocument();
+    expect(screen.getByText("最近发现游戏 9")).toBeInTheDocument();
+    expect(screen.getByText("最近发现游戏 15")).toBeInTheDocument();
+  });
+
+  it("keeps recent discoveries visible even when quality filters would hide ordinary sections", () => {
+    const lowSignalRecent = createGames(9, "低门槛导入").map((game, index) => ({
+      ...game,
+      appid: 8_880_000 + index,
+      totalReviews: 5,
+      positiveReviewPct: 12,
+      currentPlayers: 0,
+      userState: { ...game.userState },
+    }));
+
+    const sections = buildDashboardSections({
+      activeView: "browse",
+      dashboard: {
+        ...mockDashboard,
+        recentDiscoveries: lowSignalRecent,
+      },
+      filters: {
+        ...filters,
+        minPlayers: 100,
+        minReviewPct: 90,
+        selectedTags: ["根本不存在的标签"],
+      },
+      query: "",
+      sortMode: "recommended",
+    });
+
+    const recentSection = sections.find((section) => section.id === "recent");
+    expect(recentSection?.games).toHaveLength(9);
+    expect(recentSection?.games[0].name).toBe("低门槛导入 1");
   });
 
   it("reports section page changes through the page callback", () => {
@@ -244,9 +326,12 @@ describe("DashboardPage", () => {
     expect(screen.getByText("3/6")).toBeInTheDocument();
     expect(screen.getByText("440123")).toBeInTheDocument();
     expect(screen.getByText("元数据补录")).toBeInTheDocument();
-    expect(screen.getByText("补录中")).toBeInTheDocument();
+    expect(screen.getByText("新游补全中")).toBeInTheDocument();
     expect(screen.getByText("2/5")).toBeInTheDocument();
     expect(screen.getByText("730123")).toBeInTheDocument();
+    expect(
+      screen.getByText("当前正在补录 AppID 730123（第 1/2 次尝试）。"),
+    ).toBeInTheDocument();
   });
 
   it("offers both full and quick sync actions in the right rail", () => {

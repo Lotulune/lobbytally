@@ -49,6 +49,9 @@ export function applyGameAnalysisSnapshotToDashboard(
     classics: dashboard.classics.map((game) =>
       applyGameAnalysisSnapshotToGame(game, snapshot),
     ),
+    hiddenGames: dashboard.hiddenGames.map((game) =>
+      applyGameAnalysisSnapshotToGame(game, snapshot),
+    ),
     upcoming: dashboard.upcoming.map((game) =>
       applyGameAnalysisSnapshotToGame(game, snapshot),
     ),

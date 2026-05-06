@@ -10,7 +10,15 @@ const assessGameWithAiMock = vi.fn();
 const getDashboardMock = vi.fn();
 const getGameAnalysisMock = vi.fn();
 const generateGameAnalysisMock = vi.fn();
+const retryAiAnalysisJobMock = vi.fn();
+const startClassicDiscoveryTaskMock = vi.fn();
 const syncSeedGamesMock = vi.fn();
+const isTauriRuntimeMock = vi.fn(() => false);
+const listenMock = vi.fn();
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (...args: unknown[]) => listenMock(...args),
+}));
 
 vi.mock("./api/client", async () => {
   const actual = await vi.importActual<typeof import("./api/client")>("./api/client");
@@ -21,9 +29,12 @@ vi.mock("./api/client", async () => {
     getDashboard: () => getDashboardMock(),
     getGameAnalysis: (...args: unknown[]) => getGameAnalysisMock(...args),
     generateGameAnalysis: (...args: unknown[]) => generateGameAnalysisMock(...args),
+    isTauriRuntime: () => isTauriRuntimeMock(),
     previewSteamAppList: vi.fn(),
+    retryAiAnalysisJob: (...args: unknown[]) => retryAiAnalysisJobMock(...args),
     saveConfig: vi.fn(),
     setGameUserState: vi.fn(),
+    startClassicDiscoveryTask: (...args: unknown[]) => startClassicDiscoveryTaskMock(...args),
     syncSeedGames: (...args: unknown[]) => syncSeedGamesMock(...args),
   };
 });
@@ -61,11 +72,12 @@ function buildPagedDashboard() {
 
 function buildLowActivityDiscoveryDashboard() {
   const dashboard = structuredClone(mockDashboard);
-  const lowActivityGame = {
-    ...dashboard.newGames[0],
-    appid: 4999001,
-    name: "Quiet Co-op Debut",
-    positiveReviewPct: 0,
+    const lowActivityGame = {
+      ...dashboard.newGames[0],
+      appid: 4999001,
+      name: "Quiet Co-op Debut",
+      isFree: false,
+      positiveReviewPct: 0,
     totalReviews: 0,
     currentPlayers: 0,
     recommendationScore: 12,
@@ -89,6 +101,7 @@ function buildLowActivityDiscoveryDashboard() {
     followed: [],
     history: [],
   };
+  dashboard.hiddenGames = [];
   dashboard.stats = {
     ...dashboard.stats,
     seedCount: 1,
@@ -130,6 +143,53 @@ function buildAiBatchRefreshDashboard() {
   };
 
   return dashboard;
+}
+
+function buildClassicDiscoveryDashboard() {
+  const dashboard = structuredClone(mockDashboard);
+  dashboard.stats = {
+    ...dashboard.stats,
+    classicDiscoveryRunning: true,
+    classicDiscoveryStatus: "running",
+    classicDiscoveryCurrentAppid: 730456,
+    classicDiscoveryLastAppid: 730450,
+    classicDiscoveryScannedApps: 12,
+    classicDiscoveryAddedGames: 1,
+    classicDiscoveryRejectedGames: 10,
+    classicDiscoveryFailedGames: 0,
+  };
+
+  return dashboard;
+}
+
+function buildDashboardWithClassicHidden() {
+  const dashboard = structuredClone(mockDashboard);
+  const hiddenGame = {
+    ...dashboard.classics[0],
+    appid: 8_888_001,
+    name: "Hidden Signal Ops",
+    section: "classic_hidden",
+    isFree: true,
+    aiSummary: "质量一般但仍值得搜索观察。",
+    userState: {
+      favorite: true,
+      wishlist: false,
+      followed: true,
+      viewed: true,
+      updatedAt: "2026-05-05T10:10:00.000Z",
+    },
+  };
+
+  dashboard.classics = dashboard.classics.filter((game) => game.appid !== hiddenGame.appid);
+  dashboard.collections = {
+    favorites: [hiddenGame],
+    wishlist: [],
+    followed: [hiddenGame],
+    history: [hiddenGame],
+  };
+  dashboard.hiddenGames = [hiddenGame];
+
+  return { dashboard, hiddenGame };
 }
 
 function buildAnalysisReport(
@@ -217,6 +277,8 @@ function createDeferred<T>() {
 describe("App dashboard interactions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    isTauriRuntimeMock.mockReturnValue(false);
+    listenMock.mockResolvedValue(() => undefined);
     getDashboardMock.mockResolvedValue(buildDashboard());
     assessGameWithAiMock.mockResolvedValue({
       appid: 0,
@@ -229,10 +291,38 @@ describe("App dashboard interactions", () => {
     generateGameAnalysisMock.mockImplementation(async (appid: number) =>
       buildAnalysisReport(appid),
     );
+    retryAiAnalysisJobMock.mockResolvedValue({
+      totalGames: 1,
+      updatedGames: 0,
+      failedGames: 0,
+      message: "已重新加入 AI 分析队列。",
+    });
     syncSeedGamesMock.mockResolvedValue({
       updatedGames: 0,
       failedGames: 0,
       message: "已启动 Steam 同步任务。",
+    });
+    startClassicDiscoveryTaskMock.mockResolvedValue({
+      id: 99,
+      status: "running",
+      maxPages: 3,
+      pageSize: 100,
+      pagesProcessed: 0,
+      scannedApps: 0,
+      consideredApps: 0,
+      addedGames: 0,
+      rejectedGames: 0,
+      skippedExisting: 0,
+      skippedRejectedCache: 0,
+      failedGames: 0,
+      currentAppid: null,
+      lastAppid: null,
+      consecutiveEmptyPages: 0,
+      ruleVersion: "classic_v2",
+      startedAt: "2026-05-05T10:00:00Z",
+      updatedAt: "2026-05-05T10:00:00Z",
+      finishedAt: null,
+      lastError: null,
     });
   });
 
@@ -304,6 +394,30 @@ describe("App dashboard interactions", () => {
       ]);
       expect(screen.queryByRole("heading", { name: "精品老游区" })).not.toBeInTheDocument();
     });
+  });
+
+  it("keeps classic_hidden out of default sections but still searchable through browse and collections", async () => {
+    const { dashboard, hiddenGame } = buildDashboardWithClassicHidden();
+    getDashboardMock.mockResolvedValue(dashboard);
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "新游区" });
+    expect(screen.queryByText(hiddenGame.name)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "浏览全部" }));
+    fireEvent.change(screen.getByPlaceholderText("搜索游戏名称、类型、标签..."), {
+      target: { value: "Hidden Signal Ops" },
+    });
+
+    await waitFor(() =>
+      expect(screen.getAllByText(hiddenGame.name).length).toBeGreaterThan(0),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "收藏夹" }));
+    await waitFor(() =>
+      expect(screen.getAllByText(hiddenGame.name).length).toBeGreaterThan(0),
+    );
   });
 
   it("applies tag selections from the filter page", async () => {
@@ -392,6 +506,152 @@ describe("App dashboard interactions", () => {
     expect(getDashboardMock).toHaveBeenCalledTimes(2);
   });
 
+  it("polls for dashboard refresh while classic discovery is running", async () => {
+    vi.useFakeTimers();
+    getDashboardMock.mockResolvedValue(buildClassicDiscoveryDashboard());
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("heading", { name: "新游区" })).toBeInTheDocument();
+    expect(getDashboardMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(2_200);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(getDashboardMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes the dashboard when discovery task events arrive in tauri runtime", async () => {
+    vi.useFakeTimers();
+    isTauriRuntimeMock.mockReturnValue(true);
+    let discoveryEventHandler:
+      | ((event: { payload: unknown }) => void)
+      | null = null;
+    listenMock.mockImplementation(
+      async (eventName: string, handler: (event: { payload: unknown }) => void) => {
+        if (eventName === "discovery-task-updated") {
+          discoveryEventHandler = handler;
+        }
+        return () => undefined;
+      },
+    );
+    getDashboardMock.mockResolvedValue(buildDashboard());
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(getDashboardMock).toHaveBeenCalledTimes(1);
+    expect(discoveryEventHandler).not.toBeNull();
+
+    await act(async () => {
+      discoveryEventHandler?.({ payload: { status: "running" } });
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(2_200);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(getDashboardMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a toast when classic discovery finishes and dismisses it on click", async () => {
+    vi.useFakeTimers();
+    const runningDashboard = buildClassicDiscoveryDashboard();
+    const completedDashboard = buildDashboard();
+    completedDashboard.stats = {
+      ...completedDashboard.stats,
+      classicDiscoveryRunning: false,
+      classicDiscoveryStatus: "completed",
+      classicDiscoveryScannedApps: 146,
+      classicDiscoveryAddedGames: 8,
+    };
+
+    getDashboardMock
+      .mockResolvedValueOnce(runningDashboard)
+      .mockResolvedValue(completedDashboard);
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(2_200);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const toast = screen.getByRole("button", { name: /老游补库已完成/i });
+    expect(within(toast).getByText("已新增 8 个老游戏，扫描 146 个候选。")).toBeInTheDocument();
+
+    fireEvent.click(toast);
+
+    expect(
+      screen.queryByRole("button", { name: /老游补库已完成/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("auto dismisses task toast after hovering for three seconds and leaving", async () => {
+    vi.useFakeTimers();
+    const runningDashboard = buildAiBatchRefreshDashboard();
+    const completedDashboard = buildDashboard();
+    completedDashboard.stats = {
+      ...completedDashboard.stats,
+      aiBatchRefreshRunning: false,
+      aiBatchRefreshTotalCount: 20,
+      aiBatchRefreshProcessedCount: 20,
+      aiBatchRefreshUpdatedCount: 19,
+      aiBatchRefreshFailedCount: 1,
+    };
+
+    getDashboardMock
+      .mockResolvedValueOnce(runningDashboard)
+      .mockResolvedValue(completedDashboard);
+
+    render(<App />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(2_200);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const toast = screen.getByRole("button", { name: /AI 批量重算已完成/i });
+    fireEvent.mouseEnter(toast);
+
+    await act(async () => {
+      vi.advanceTimersByTime(3_000);
+      await Promise.resolve();
+    });
+
+    fireEvent.mouseLeave(toast);
+
+    expect(
+      screen.queryByRole("button", { name: /AI 批量重算已完成/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("clears the busy state after ai assess even if polling refresh overtakes loadDashboard", async () => {
     vi.useFakeTimers();
     const dashboard = buildAiBatchRefreshDashboard();
@@ -471,6 +731,17 @@ describe("App dashboard interactions", () => {
     getDashboardMock.mockResolvedValue(dashboard);
     getGameAnalysisMock.mockResolvedValue(report);
     generateGameAnalysisMock.mockResolvedValue(report);
+    const scrollToMock = vi.fn();
+    Object.defineProperty(window, "scrollTo", {
+      configurable: true,
+      value: scrollToMock,
+      writable: true,
+    });
+    Object.defineProperty(window, "scrollY", {
+      configurable: true,
+      value: 580,
+      writable: true,
+    });
 
     render(<App />);
 
@@ -491,6 +762,7 @@ describe("App dashboard interactions", () => {
 
     expect(await screen.findByText(report.overview)).toBeInTheDocument();
     expect(generateGameAnalysisMock).not.toHaveBeenCalled();
+    expect(scrollToMock).toHaveBeenCalledWith({ top: 0, behavior: "auto" });
   });
 
   it("refreshes the selected detail game from the latest dashboard payload", async () => {
@@ -845,5 +1117,183 @@ describe("App dashboard interactions", () => {
       expect(screen.getByText(targetName)).toBeInTheDocument();
       expect(screen.queryByText("分页新游 1")).not.toBeInTheDocument();
     });
+  });
+
+  it("restores the previous scroll position when returning from detail", async () => {
+    const dashboard = buildPagedDashboard();
+
+    getDashboardMock.mockResolvedValue(dashboard);
+    getGameAnalysisMock.mockImplementation(async (appid: number) =>
+      buildAnalysisReport(appid),
+    );
+    generateGameAnalysisMock.mockImplementation(async (appid: number) =>
+      buildAnalysisReport(appid),
+    );
+
+    const scrollToMock = vi.fn();
+    Object.defineProperty(window, "scrollTo", {
+      configurable: true,
+      value: scrollToMock,
+      writable: true,
+    });
+    Object.defineProperty(window, "scrollY", {
+      configurable: true,
+      value: 640,
+      writable: true,
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "新游区" });
+
+    fireEvent.click(screen.getAllByRole("button", { name: "查看全部 〉" })[0]);
+
+    await waitFor(() => {
+      expect(screen.getByText("第 1 / 2 页")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("第 2 / 2 页")).toBeInTheDocument();
+    });
+
+    const newGamesSection = screen
+      .getByRole("heading", { name: "新游区" })
+      .closest(".game-section");
+    if (!(newGamesSection instanceof HTMLElement)) {
+      throw new Error("Missing 新游区 section");
+    }
+
+    const targetName = within(newGamesSection).getAllByRole("heading", { level: 3 })[0]
+      ?.textContent;
+    if (!targetName) {
+      throw new Error("Missing page-2 target game");
+    }
+
+    fireEvent.click(
+      within(newGamesSection).getByRole("button", {
+        name: new RegExp(targetName, "i"),
+      }),
+    );
+
+    expect(await screen.findByText("打开详情页后应直接显示缓存分析。")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "← 返回" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("第 2 / 2 页")).toBeInTheDocument();
+      expect(scrollToMock).toHaveBeenCalledWith({ top: 640, behavior: "auto" });
+    });
+  });
+
+  it("shows the scroll dock while scrolling and switches action by scroll direction", async () => {
+    const root = document.documentElement;
+    const body = document.body;
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 900,
+      writable: true,
+    });
+    Object.defineProperty(root, "scrollHeight", {
+      configurable: true,
+      value: 3000,
+    });
+    Object.defineProperty(body, "scrollHeight", {
+      configurable: true,
+      value: 3000,
+    });
+    Object.defineProperty(root, "clientHeight", {
+      configurable: true,
+      value: 900,
+    });
+
+    let scrollYValue = 0;
+    Object.defineProperty(window, "scrollY", {
+      configurable: true,
+      get: () => scrollYValue,
+      set: (value: number) => {
+        scrollYValue = value;
+      },
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "新游区" });
+
+    act(() => {
+      scrollYValue = 450;
+      window.dispatchEvent(new Event("scroll"));
+    });
+
+    const dock = await screen.findByRole("button", { name: /置底/i });
+    expect(dock).toBeInTheDocument();
+    expect(screen.getByText("21%")).toBeInTheDocument();
+
+    act(() => {
+      scrollYValue = 180;
+      window.dispatchEvent(new Event("scroll"));
+    });
+
+    expect(await screen.findByRole("button", { name: /置顶/i })).toBeInTheDocument();
+  });
+
+  it("removes the scroll dock button from the tab order after it hides", async () => {
+    const root = document.documentElement;
+    const body = document.body;
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 900,
+      writable: true,
+    });
+    Object.defineProperty(root, "scrollHeight", {
+      configurable: true,
+      value: 3000,
+    });
+    Object.defineProperty(body, "scrollHeight", {
+      configurable: true,
+      value: 3000,
+    });
+    Object.defineProperty(root, "clientHeight", {
+      configurable: true,
+      value: 900,
+    });
+
+    let scrollYValue = 0;
+    Object.defineProperty(window, "scrollY", {
+      configurable: true,
+      get: () => scrollYValue,
+      set: (value: number) => {
+        scrollYValue = value;
+      },
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "新游区" });
+    vi.useFakeTimers();
+
+    const hiddenButton = screen.getByRole("button", { name: /置底/i, hidden: true });
+    expect(hiddenButton).toHaveAttribute("tabindex", "-1");
+    expect(hiddenButton.closest(".scroll-dock")).toHaveAttribute("aria-hidden", "true");
+
+    act(() => {
+      scrollYValue = 450;
+      window.dispatchEvent(new Event("scroll"));
+    });
+
+    const visibleButton = screen.getByRole("button", { name: /置底/i });
+    expect(visibleButton).toHaveAttribute("tabindex", "0");
+    expect(visibleButton.closest(".scroll-dock")).toHaveAttribute("aria-hidden", "false");
+
+    act(() => {
+      vi.advanceTimersByTime(2_500);
+    });
+
+    expect(screen.queryByRole("button", { name: /置底/i })).not.toBeInTheDocument();
+
+    const hiddenAgainButton = screen.getByRole("button", { name: /置底/i, hidden: true });
+    expect(hiddenAgainButton).toHaveAttribute("tabindex", "-1");
+    expect(hiddenAgainButton.closest(".scroll-dock")).toHaveAttribute("aria-hidden", "true");
   });
 });

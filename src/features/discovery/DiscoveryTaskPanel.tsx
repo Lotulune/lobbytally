@@ -55,6 +55,10 @@ function formatNumber(value: number | null | undefined) {
 
 function summarizeSnapshot(snapshot: DiscoveryRunSnapshot) {
   const meta = statusMeta[snapshot.status];
+  if (snapshot.completionReason === "page_budget_reached" && snapshot.addedGames === 0) {
+    return `发现任务${meta.label}：本轮已检查 ${snapshot.scannedApps} 个最近发售多人候选，但没有命中新游戏。`;
+  }
+
   return `发现任务${meta.label}：新增 ${snapshot.addedGames}/${snapshot.targetAddedGames}，已检查 ${snapshot.scannedApps} 个最近发售多人候选。`;
 }
 
@@ -66,17 +70,85 @@ function isTerminalStatus(status: DiscoveryRunStatus | null | undefined) {
   return status != null && terminalStatuses.includes(status);
 }
 
+function describeCompletionReason(snapshot: DiscoveryRunSnapshot | null) {
+  if (!snapshot) {
+    return "等待任务启动。";
+  }
+
+  if (snapshot.status === "interrupted") {
+    return "任务被中断，可继续恢复。";
+  }
+
+  if (snapshot.status === "running") {
+    return snapshot.currentAppid
+      ? `正在处理 AppID ${snapshot.currentAppid}。`
+      : "正在请求下一批最近发售候选。";
+  }
+
+  if (snapshot.completionReason === "paused") {
+    return "任务已暂停，可继续从上次位置恢复。";
+  }
+
+  if (snapshot.completionReason === "cancelled") {
+    return "任务已取消。";
+  }
+
+  if (snapshot.completionReason === "failed") {
+    return snapshot.lastError ?? "任务失败，请查看失败记录。";
+  }
+
+  if (snapshot.completionReason === "target_reached") {
+    return `本轮已达到目标，新增 ${snapshot.addedGames} 个新游戏。`;
+  }
+
+  if (snapshot.completionReason === "no_more_results") {
+    return `Steam 最近发售候选已扫到末尾，本轮共检查 ${snapshot.scannedApps} 个候选。`;
+  }
+
+  if (snapshot.completionReason === "page_budget_reached") {
+    return snapshot.addedGames > 0
+      ? `本轮已扫满当前页数预算，共检查 ${snapshot.scannedApps} 个候选，新增 ${snapshot.addedGames} 个新游戏。`
+      : `本轮已扫满当前页数预算，共检查 ${snapshot.scannedApps} 个最近发售多人候选，但没有命中新游戏。`;
+  }
+
+  if (snapshot.addedGames > 0) {
+    return `本轮已新增 ${snapshot.addedGames} 个新游戏。`;
+  }
+
+  if (snapshot.scannedApps > 0) {
+    return `本轮已扫完当前配置范围，共检查 ${snapshot.scannedApps} 个最近发售多人候选，但没有命中新游戏。`;
+  }
+
+  return "本轮没有可展示的发现结果。";
+}
+
+function displayProgressPercent(snapshot: DiscoveryRunSnapshot | null) {
+  if (!snapshot) {
+    return 0;
+  }
+
+  if (
+    snapshot.completionReason === "target_reached" ||
+    snapshot.completionReason === "page_budget_reached" ||
+    snapshot.completionReason === "no_more_results"
+  ) {
+    return 100;
+  }
+
+  return snapshot.progressPercent;
+}
+
 function hasPendingBackfill(stats: DashboardStats) {
   return stats.backfillRunning || stats.backfillPendingCount > 0;
 }
 
 function describeBackfillStatus(stats: DashboardStats) {
   if (stats.backfillRunning) {
-    return "补录中";
+    return "新游补全中";
   }
 
   if (stats.backfillPendingCount > 0) {
-    return "排队中";
+    return "待补全";
   }
 
   if (stats.backfillTotalCount > 0) {
@@ -84,6 +156,18 @@ function describeBackfillStatus(stats: DashboardStats) {
   }
 
   return "空闲";
+}
+
+function describePipelineHint(stats: DashboardStats) {
+  if (stats.backfillRunning || stats.backfillPendingCount > 0) {
+    return "新游发现结束后，老游补库会在新游补全清空后启动；新游 AI 仍会继续先跑。";
+  }
+
+  if (stats.aiBatchRefreshRunning || stats.aiBatchRefreshPendingCount > 0) {
+    return "新游补全已清空；老游补库可以启动。老游 AI 会继续排在新游 AI 队列之后。";
+  }
+
+  return "当前链路：新游入库与补全并行；老游补库只等新游补全清空，老游 AI 继续排在新游 AI 后面。";
 }
 
 function backfillProgressPercent(stats: DashboardStats) {
@@ -216,7 +300,7 @@ export function DiscoveryTaskPanel({
   }, [onRefreshDashboard, onStatus, stats]);
 
   const currentStatus = snapshot ? statusMeta[snapshot.status] : null;
-  const progressPercent = snapshot?.progressPercent ?? 0;
+  const progressPercent = displayProgressPercent(snapshot);
   const metadataProgressPercent = backfillProgressPercent(stats);
   const effectiveSyncMode = snapshot?.syncMode ?? syncMode;
   const isRunning = snapshot?.status === "running";
@@ -412,6 +496,8 @@ export function DiscoveryTaskPanel({
             <strong>{snapshot?.lastAppid ?? "无"}</strong>
           </div>
         </div>
+        <p className="mini-status">{describeCompletionReason(snapshot)}</p>
+        <p className="mini-status">{describePipelineHint(stats)}</p>
       </div>
 
       <div className="discovery-grid">
@@ -446,7 +532,7 @@ export function DiscoveryTaskPanel({
                   ? `AppID ${stats.backfillLastErrorAppid ?? "无"} · ${stats.backfillLastError}`
                   : effectiveSyncMode === "quick"
                     ? "当前选择部分拉取；新游戏不会自动补录评论和在线人数。"
-                    : "当前没有补全错误。"}
+                    : "新游补全会并发进行；补全清空后即可启动老游补库。"}
               </p>
             </div>
           </div>
@@ -493,6 +579,7 @@ export function DiscoveryTaskPanel({
                     新增 {item.addedGames}/{item.targetAddedGames} · 已检查 {item.scannedApps} · 失败 {item.failedGames}
                   </span>
                   <span>{`拉取方式：${discoverySyncModeLabel(item.syncMode)}`}</span>
+                  <span>{describeCompletionReason(item)}</span>
                   <p>{formatDateTime(item.finishedAt ?? item.updatedAt)}</p>
                 </div>
               ))}

@@ -29,9 +29,11 @@ export interface SaveConfigRequest {
 export interface DashboardPayload {
   newGames: GameCard[];
   classics: GameCard[];
+  hiddenGames: GameCard[];
   upcoming: GameCard[];
   recentDiscoveries: GameCard[];
   collections: UserCollections;
+  aiAnalysisQueueFailures: AiAnalysisQueueFailureItem[];
   stats: DashboardStats;
   config: PublicConfig;
 }
@@ -43,6 +45,17 @@ export interface DashboardStats {
   newGamesCount: number;
   classicGamesCount: number;
   lastDiscoveryAppid?: number | null;
+  classicDiscoveryRunning: boolean;
+  classicDiscoveryStatus?: DiscoveryRunStatus | null;
+  classicDiscoveryCurrentAppid?: number | null;
+  classicDiscoveryLastAppid?: number | null;
+  classicDiscoveryScannedApps: number;
+  classicDiscoveryAddedGames: number;
+  classicDiscoveryRejectedGames: number;
+  classicDiscoveryFailedGames: number;
+  classicDiscoverySkippedExisting: number;
+  classicDiscoverySkippedRejectedCache: number;
+  classicDiscoveryLastCompletedAt?: string | null;
   syncRunning: boolean;
   syncMode?: SyncMode | null;
   syncPendingCount: number;
@@ -71,6 +84,7 @@ export interface DashboardStats {
   aiBatchRefreshProcessedCount: number;
   aiBatchRefreshUpdatedCount: number;
   aiBatchRefreshFailedCount: number;
+  aiBatchRefreshFailedPendingReviewCount: number;
   aiBatchRefreshLastError?: string | null;
   aiBatchRefreshLastErrorAppid?: number | null;
   dataSource: string;
@@ -80,13 +94,14 @@ export interface GameCard {
   appid: number;
   name: string;
   shortDescription?: string | null;
-  section: "new" | "classic" | string;
+  section: "new" | "classic" | "classic_hidden" | string;
   releaseDate?: string | null;
   releaseDateText: string;
   releaseState: StoreReleaseState;
   demoStatus: DemoStatus;
   supportedLanguages: string[];
   isAdultContent: boolean;
+  isFree: boolean;
   priceText?: string | null;
   discountPercent?: number | null;
   positiveReviewPct?: number | null;
@@ -276,6 +291,15 @@ export type DiscoveryRunStatus =
   | "cancelled"
   | "interrupted";
 
+export type DiscoveryCompletionReason =
+  | "target_reached"
+  | "page_budget_reached"
+  | "no_more_results"
+  | "paused"
+  | "cancelled"
+  | "failed"
+  | "interrupted";
+
 export interface DiscoveryTaskRequest {
   syncMode: SyncMode;
   targetAddedGames: number;
@@ -293,6 +317,7 @@ export interface DiscoveryFailureItem {
 export interface DiscoveryRunSnapshot {
   id: number;
   status: DiscoveryRunStatus;
+  completionReason?: DiscoveryCompletionReason | null;
   syncMode: SyncMode;
   targetAddedGames: number;
   pageSize: number;
@@ -313,4 +338,38 @@ export interface DiscoveryRunSnapshot {
   lastError?: string | null;
   failures: DiscoveryFailureItem[];
   progressPercent: number;
+}
+
+export interface ClassicDiscoveryTaskRequest {
+  maxPages?: number;
+}
+
+export interface ClassicDiscoveryRunSnapshot {
+  id: number;
+  status: DiscoveryRunStatus;
+  maxPages: number;
+  pageSize: number;
+  pagesProcessed: number;
+  scannedApps: number;
+  consideredApps: number;
+  addedGames: number;
+  rejectedGames: number;
+  skippedExisting: number;
+  skippedRejectedCache: number;
+  failedGames: number;
+  currentAppid?: number | null;
+  lastAppid?: number | null;
+  consecutiveEmptyPages: number;
+  ruleVersion: string;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt?: string | null;
+  lastError?: string | null;
+}
+
+export interface AiAnalysisQueueFailureItem {
+  appid: number;
+  attempt: number;
+  lastError: string;
+  updatedAt: string;
 }

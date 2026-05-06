@@ -147,7 +147,10 @@ export function DetailPage({
         <div>
           <div className="hero-cover">
             <img src={activeMediaUrl} alt={`${game.name} 商店展示图`} />
-            <span>{demoLabel(game.demoStatus)}</span>
+            <div className="card-pill-stack">
+              {game.isFree ? <span className="demo-pill free">Free</span> : null}
+              <span>{demoLabel(game.demoStatus)}</span>
+            </div>
           </div>
           <div className="thumb-row">
             {storeGalleryImages.map((imageUrl, index) => (
@@ -319,6 +322,7 @@ export function DetailPage({
             <span>♟ {formatNumber(game.currentPlayers)}</span>
             <span>发售于 {game.releaseDateText}</span>
             <span>{demoLabel(game.demoStatus)}</span>
+            {game.isFree ? <span>Free To Play</span> : null}
           </div>
           <button
             className="gold-button"

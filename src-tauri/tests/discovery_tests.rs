@@ -17,6 +17,7 @@ fn multiplayer_snapshot() -> SteamGameSnapshot {
         demo_status: DemoStatus::ReleasedWithDemo,
         supported_languages: Some(vec!["English".to_string(), "Japanese".to_string()]),
         is_adult_content: Some(false),
+        is_free: Some(false),
         price_text: Some("$19.99".to_string()),
         discount_percent: Some(20),
         positive_review_pct: Some(93.0),
@@ -85,6 +86,73 @@ fn build_discovered_game_card_rejects_non_multiplayer_snapshot() {
 }
 
 #[test]
+fn build_discovered_game_card_rejects_low_signal_new_games_without_demo() {
+    let app = SteamAppListItem {
+        appid: 3_900_003,
+        name: "Thin Signal Arena".to_string(),
+    };
+    let mut snapshot = multiplayer_snapshot();
+    snapshot.total_reviews = Some(49);
+    snapshot.positive_review_pct = Some(95.0);
+    snapshot.demo_status = DemoStatus::Released;
+
+    assert!(build_discovered_game_card(&app, snapshot, "2026-04-26").is_none());
+
+    let mut snapshot = multiplayer_snapshot();
+    snapshot.total_reviews = Some(200);
+    snapshot.positive_review_pct = Some(39.0);
+    snapshot.demo_status = DemoStatus::Released;
+
+    assert!(build_discovered_game_card(&app, snapshot, "2026-04-26").is_none());
+}
+
+#[test]
+fn build_discovered_game_card_allows_low_signal_new_games_when_demo_is_present() {
+    let app = SteamAppListItem {
+        appid: 3_900_004,
+        name: "Demo Rescue Ops".to_string(),
+    };
+    let mut snapshot = multiplayer_snapshot();
+    snapshot.total_reviews = Some(12);
+    snapshot.positive_review_pct = Some(18.0);
+    snapshot.demo_status = DemoStatus::ReleasedWithDemo;
+
+    let card = build_discovered_game_card(&app, snapshot, "2026-04-26")
+        .expect("demo new game should bypass low-signal thresholds");
+
+    assert_eq!(card.section, "new");
+}
+
+#[test]
+fn build_discovered_game_card_rejects_legendary_titles_for_new_games() {
+    let app = SteamAppListItem {
+        appid: 3_900_005,
+        name: "多人传奇乱斗".to_string(),
+    };
+    let mut snapshot = multiplayer_snapshot();
+    snapshot.name = Some("多人传奇乱斗".to_string());
+    snapshot.total_reviews = Some(500);
+    snapshot.positive_review_pct = Some(88.0);
+
+    assert!(build_discovered_game_card(&app, snapshot, "2026-04-26").is_none());
+}
+
+#[test]
+fn build_discovered_game_card_rejects_legendary_titles_for_classic_games_too() {
+    let app = SteamAppListItem {
+        appid: 3_900_006,
+        name: "挂机传奇大厅".to_string(),
+    };
+    let mut snapshot = multiplayer_snapshot();
+    snapshot.name = Some("挂机传奇大厅".to_string());
+    snapshot.release_date = Some("2023-04-20".to_string());
+    snapshot.total_reviews = Some(5_000);
+    snapshot.positive_review_pct = Some(91.0);
+
+    assert!(build_discovered_game_card(&app, snapshot, "2026-04-26").is_none());
+}
+
+#[test]
 fn next_discovery_cursor_uses_last_appid_and_falls_back_to_last_app() {
     let explicit_cursor = SteamAppListPreview {
         apps: vec![SteamAppListItem {
@@ -117,7 +185,7 @@ fn next_discovery_cursor_uses_last_appid_and_falls_back_to_last_app() {
 fn discovery_defaults_scan_larger_candidate_pages() {
     assert_eq!(clamp_discovery_pages(None), 2);
     assert_eq!(clamp_discovery_page_size(None), 100);
-    assert_eq!(clamp_discovery_target_added_games(None), 6);
+    assert_eq!(clamp_discovery_target_added_games(None), 200);
     assert_eq!(clamp_discovery_pages(Some(99)), 5);
     assert_eq!(clamp_discovery_page_size(Some(999)), 100);
     assert_eq!(clamp_discovery_target_added_games(Some(999)), 200);
@@ -133,6 +201,6 @@ fn store_search_start_uses_page_offset_instead_of_appid_cursor() {
 #[test]
 fn store_search_discovery_uses_finite_page_budget() {
     assert!(!store_search_reached_page_budget(0));
-    assert!(!store_search_reached_page_budget(29));
-    assert!(store_search_reached_page_budget(30));
+    assert!(!store_search_reached_page_budget(1));
+    assert!(store_search_reached_page_budget(2));
 }

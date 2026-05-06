@@ -99,3 +99,58 @@ async fn steam_live_store_search_candidates_page_recent_releases() {
     assert_ne!(first_page.apps[0].appid, second_page.apps[0].appid);
     assert!(first_page.have_more_results);
 }
+
+#[tokio::test]
+#[ignore = "requires live Steam Store access"]
+async fn steam_live_recent_release_candidates_include_importable_new_games() {
+    let client = steam_http_client();
+    let today = recommendation::today_iso_utc();
+
+    let page = fetch_store_search_candidates(&client, 0, 12, "schinese")
+        .await
+        .expect("fetch recent release candidates");
+
+    assert!(
+        !page.apps.is_empty(),
+        "Steam recent-release candidate page should not be empty"
+    );
+
+    let mut diagnostics = Vec::new();
+    let mut imported_new_count = 0usize;
+
+    for app in page.apps.iter().take(8) {
+        let snapshot = fetch_game_snapshot(
+            &client,
+            app.appid,
+            "US",
+            "schinese",
+            SteamGameSnapshotEnrichment::Discovery,
+        )
+        .await
+        .expect("fetch live snapshot for recent candidate");
+
+        let multiplayer_modes = snapshot.multiplayer_modes.clone();
+        let release_date = snapshot.release_date.clone();
+        let release_date_text = snapshot.release_date_text.clone();
+        let card = build_discovered_game_card(app, snapshot, &today);
+        if card.as_ref().is_some_and(|card| card.section == "new") {
+            imported_new_count += 1;
+        }
+
+        diagnostics.push(format!(
+            "{}:{} => section={:?}, release_date={:?}, release_date_text={:?}, modes={:?}",
+            app.appid,
+            app.name,
+            card.as_ref().map(|card| card.section.clone()),
+            release_date,
+            release_date_text,
+            multiplayer_modes
+        ));
+    }
+
+    assert!(
+        imported_new_count > 0,
+        "expected at least one importable new game from live recent-release candidates; diagnostics: {}",
+        diagnostics.join(" | ")
+    );
+}

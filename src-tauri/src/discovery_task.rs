@@ -1,10 +1,14 @@
 use crate::backfill_task;
+use crate::auto_scheduler;
 use crate::db::{self, DiscoveryProgressPatch};
 use crate::discovery::{
     build_discovered_game_card, store_search_reached_page_budget, store_search_start_for_page,
     DISCOVERY_CURSOR_CONFIG_KEY,
 };
-use crate::models::{DiscoveryRunSnapshot, DiscoveryRunStatus, SyncMode};
+use crate::models::{
+    AiAnalysisQueueSource, DiscoveryCompletionReason, DiscoveryRunSnapshot, DiscoveryRunStatus,
+    SyncMode,
+};
 use crate::state::AppState;
 use crate::steam;
 use anyhow::{Context, Result};
@@ -42,7 +46,40 @@ pub fn spawn_discovery_worker(app: AppHandle, run_id: i64) {
             eprintln!("discovery worker {run_id} failed: {error:#}");
             let _ = fail_run_if_possible(&app, run_id, error.to_string());
         }
+        auto_scheduler::kick(app);
     });
+}
+
+pub fn restore_discovery_runtime(app: AppHandle) -> Result<()> {
+    let latest = {
+        let state = app.state::<AppState>();
+        let conn = state
+            .db
+            .lock()
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        db::load_latest_discovery_run(&conn)?
+    };
+    let Some(snapshot) = latest else {
+        return Ok(());
+    };
+    if !snapshot.can_resume() {
+        return Ok(());
+    }
+
+    let state = app.state::<AppState>();
+    let mut runtime = state
+        .discovery
+        .lock()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    if runtime.active_run_id.is_some() {
+        return Ok(());
+    }
+    runtime.active_run_id = Some(snapshot.id);
+    runtime.control = DiscoveryControl::None;
+    drop(runtime);
+
+    spawn_discovery_worker(app, snapshot.id);
+    Ok(())
 }
 
 async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
@@ -68,6 +105,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
         match current_control(&app)? {
             DiscoveryControl::CancelRequested => {
                 snapshot.status = DiscoveryRunStatus::Cancelled;
+                snapshot.completion_reason = Some(DiscoveryCompletionReason::Cancelled);
                 snapshot.current_appid = None;
                 snapshot.last_error = None;
                 snapshot.finished_at = Some(now_rfc3339()?);
@@ -77,6 +115,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
             }
             DiscoveryControl::PauseRequested => {
                 snapshot.status = DiscoveryRunStatus::Paused;
+                snapshot.completion_reason = Some(DiscoveryCompletionReason::Paused);
                 snapshot.current_appid = None;
                 snapshot.last_error = None;
                 snapshot.finished_at = None;
@@ -95,6 +134,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
 
         if snapshot.added_games >= snapshot.target_added_games as usize {
             snapshot.status = DiscoveryRunStatus::Completed;
+            snapshot.completion_reason = Some(DiscoveryCompletionReason::TargetReached);
             snapshot.current_appid = None;
             snapshot.last_error = None;
             snapshot.finished_at = Some(now_rfc3339()?);
@@ -105,6 +145,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
 
         if store_search_reached_page_budget(snapshot.pages_processed) {
             snapshot.status = DiscoveryRunStatus::Completed;
+            snapshot.completion_reason = Some(DiscoveryCompletionReason::PageBudgetReached);
             snapshot.current_appid = None;
             snapshot.last_error = None;
             snapshot.have_more_results = true;
@@ -135,6 +176,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
                     &error.to_string(),
                 )?;
                 snapshot.status = DiscoveryRunStatus::Failed;
+                snapshot.completion_reason = Some(DiscoveryCompletionReason::Failed);
                 snapshot.current_appid = None;
                 snapshot.last_error = Some(error.to_string());
                 snapshot.finished_at = Some(now_rfc3339()?);
@@ -147,6 +189,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
         let page_have_more_results = preview.have_more_results;
 
         snapshot.have_more_results = page_have_more_results;
+        snapshot.completion_reason = None;
         snapshot.last_error = None;
         snapshot.finished_at = None;
 
@@ -154,6 +197,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
             match current_control(&app)? {
                 DiscoveryControl::CancelRequested => {
                     snapshot.status = DiscoveryRunStatus::Cancelled;
+                    snapshot.completion_reason = Some(DiscoveryCompletionReason::Cancelled);
                     snapshot.current_appid = None;
                     snapshot.last_error = None;
                     snapshot.finished_at = Some(now_rfc3339()?);
@@ -163,6 +207,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
                 }
                 DiscoveryControl::PauseRequested => {
                     snapshot.status = DiscoveryRunStatus::Paused;
+                    snapshot.completion_reason = Some(DiscoveryCompletionReason::Paused);
                     snapshot.current_appid = None;
                     snapshot.last_error = None;
                     snapshot.finished_at = None;
@@ -202,10 +247,13 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
                 Ok(game_snapshot) => {
                     if let Some(card) = build_discovered_game_card(app_item, game_snapshot, &today)
                     {
-                        match card.section.as_str() {
-                            "new" => snapshot.added_new_games += 1,
-                            _ => snapshot.added_classic_games += 1,
+                        if card.section != "new" {
+                            snapshot.skipped_non_multiplayer += 1;
+                            mark_processed_app(&mut snapshot, app_item.appid);
+                            persist_snapshot(&app, run_id, &snapshot, true, false)?;
+                            continue;
                         }
+                        snapshot.added_new_games += 1;
                         {
                             let state = app.state::<AppState>();
                             let conn = state
@@ -216,6 +264,17 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
                         }
                         if snapshot.sync_mode == SyncMode::Full {
                             backfill_task::enqueue_backfill(&app, [app_item.appid])?;
+                        } else {
+                            let state = app.state::<AppState>();
+                            let conn = state
+                                .db
+                                .lock()
+                                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                            db::enqueue_ai_analysis_jobs(
+                                &conn,
+                                AiAnalysisQueueSource::NewRelease,
+                                [app_item.appid],
+                            )?;
                         }
                         known_appids.insert(app_item.appid);
                         snapshot.added_games += 1;
@@ -242,6 +301,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
 
             if snapshot.added_games >= snapshot.target_added_games as usize {
                 snapshot.status = DiscoveryRunStatus::Completed;
+                snapshot.completion_reason = Some(DiscoveryCompletionReason::TargetReached);
                 snapshot.current_appid = None;
                 snapshot.last_error = None;
                 snapshot.finished_at = Some(now_rfc3339()?);
@@ -266,6 +326,7 @@ async fn run_discovery_worker(app: AppHandle, run_id: i64) -> Result<()> {
 
         if !page_have_more_results || page_end_appid.is_none() {
             snapshot.status = DiscoveryRunStatus::Completed;
+            snapshot.completion_reason = Some(DiscoveryCompletionReason::NoMoreResults);
             snapshot.current_appid = None;
             snapshot.last_error = None;
             snapshot.have_more_results = false;
@@ -355,6 +416,7 @@ fn fail_run_if_possible(app: &AppHandle, run_id: i64, error: String) -> Result<(
         &error,
     )?;
     snapshot.status = DiscoveryRunStatus::Failed;
+    snapshot.completion_reason = Some(DiscoveryCompletionReason::Failed);
     snapshot.current_appid = None;
     snapshot.last_error = Some(error);
     snapshot.finished_at = Some(now_rfc3339()?);
@@ -366,6 +428,7 @@ fn fail_run_if_possible(app: &AppHandle, run_id: i64, error: String) -> Result<(
 fn snapshot_to_patch(snapshot: &DiscoveryRunSnapshot) -> DiscoveryProgressPatch {
     DiscoveryProgressPatch {
         status: Some(snapshot.status.clone()),
+        completion_reason: Some(snapshot.completion_reason.clone()),
         current_appid: Some(snapshot.current_appid),
         last_appid: Some(snapshot.last_appid),
         pages_processed: Some(snapshot.pages_processed),

@@ -16,6 +16,7 @@ function buildGame(appid: number, name: string): GameCard {
     demoStatus: "demo_only",
     supportedLanguages: ["English"],
     isAdultContent: false,
+    isFree: false,
     priceText: "",
     discountPercent: null,
     positiveReviewPct: 89,

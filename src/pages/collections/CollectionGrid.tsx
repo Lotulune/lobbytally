@@ -83,7 +83,7 @@ function LogoMark() {
 
 function defaultMeta(game: GameCard) {
   return {
-    primary: `${formatPct(game.positiveReviewPct)} 好评`,
+    primary: `${game.isFree ? "Free · " : ""}${formatPct(game.positiveReviewPct)} 好评`,
     secondary: game.multiplayerModes[0] ?? "多人合作",
   };
 }

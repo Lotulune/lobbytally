@@ -79,6 +79,23 @@ export function filterGames(
     .sort((left, right) => compareGames(left, right, sortMode));
 }
 
+export function filterRecentDiscoveries(games: GameCard[], query: string) {
+  const normalizedQuery = query.trim().toLowerCase();
+
+  return games.filter((game) => {
+    const haystack = [
+      game.name,
+      ...(Array.isArray(game.tags) ? game.tags : []),
+      ...(Array.isArray(game.multiplayerModes) ? game.multiplayerModes : []),
+      game.aiSummary,
+    ]
+      .join(" ")
+      .toLowerCase();
+
+    return normalizedQuery ? haystack.includes(normalizedQuery) : true;
+  });
+}
+
 export function buildDashboardSections({
   activeView,
   dashboard,
@@ -92,14 +109,13 @@ export function buildDashboardSections({
   query: string;
   sortMode: LibrarySortMode;
 }): DashboardSection[] {
+  const searchableGames = [...dashboard.newGames, ...dashboard.classics, ...dashboard.hiddenGames];
+  const useSearchablePool = activeView === "browse" && query.trim().length > 0;
   const visibleNewGames = filterGames(dashboard.newGames, query, filters, sortMode);
-  const visibleClassics = filterGames(dashboard.classics, query, filters, sortMode);
-  const visibleRecentDiscoveries = filterGames(
-    dashboard.recentDiscoveries,
-    query,
-    filters,
-    sortMode,
-  );
+  const visibleClassics = useSearchablePool
+    ? filterGames(searchableGames, query, filters, sortMode)
+    : filterGames(dashboard.classics, query, filters, sortMode);
+  const visibleRecentDiscoveries = filterRecentDiscoveries(dashboard.recentDiscoveries, query);
 
   const sections: Array<DashboardSection & { visible: boolean }> = [
     {

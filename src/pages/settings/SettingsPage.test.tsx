@@ -21,7 +21,10 @@ describe("Settings and About pages", () => {
         config={mockDashboard.config}
         isBusy={false}
         onRefreshAllAnalyses={vi.fn(async () => undefined)}
+        onRetryAiAnalysisJob={vi.fn(async () => undefined)}
+        onStartClassicDiscovery={vi.fn(async () => undefined)}
         stats={mockDashboard.stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
@@ -42,13 +45,17 @@ describe("Settings and About pages", () => {
   it("shows both sync and discovery operations in settings", () => {
     const onSync = vi.fn();
     const onRefreshAllAnalyses = vi.fn(async () => undefined);
+    const onStartClassicDiscovery = vi.fn(async () => undefined);
 
     render(
       <SettingsPage
         config={mockDashboard.config}
         isBusy={false}
         onRefreshAllAnalyses={onRefreshAllAnalyses}
+        onRetryAiAnalysisJob={vi.fn(async () => undefined)}
+        onStartClassicDiscovery={onStartClassicDiscovery}
         stats={mockDashboard.stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
@@ -64,15 +71,22 @@ describe("Settings and About pages", () => {
     fireEvent.click(screen.getByRole("button", { name: "完整同步" }));
     fireEvent.click(screen.getByRole("button", { name: "快速同步" }));
     fireEvent.click(screen.getByRole("button", { name: "批量重算 AI 评分" }));
+    fireEvent.click(screen.getByRole("button", { name: "启动老游补库" }));
 
     expect(onSync).toHaveBeenNthCalledWith(1, "full");
     expect(onSync).toHaveBeenNthCalledWith(2, "quick");
     expect(onRefreshAllAnalyses).toHaveBeenCalledTimes(1);
+    expect(onStartClassicDiscovery).toHaveBeenCalledWith(3);
     expect(screen.getByRole("button", { name: "完整同步" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "快速同步" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "批量重算 AI 评分" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "发现任务控制台" })).toBeInTheDocument();
     expect(screen.getByText("Steam 同步")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "老游补库会在新游发现结束且新游补全清空后启动；不必等待新游 AI 清空，但老游 AI 仍会排在新游 AI 后面。",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByText("当前库已就绪。")).toBeInTheDocument();
   });
 
@@ -84,7 +98,10 @@ describe("Settings and About pages", () => {
         config={mockDashboard.config}
         isBusy={false}
         onRefreshAllAnalyses={onRefreshAllAnalyses}
+        onRetryAiAnalysisJob={vi.fn(async () => undefined)}
+        onStartClassicDiscovery={vi.fn(async () => undefined)}
         stats={mockDashboard.stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
@@ -123,7 +140,10 @@ describe("Settings and About pages", () => {
         config={mockDashboard.config}
         isBusy={false}
         onRefreshAllAnalyses={vi.fn(async () => undefined)}
+        onRetryAiAnalysisJob={vi.fn(async () => undefined)}
+        onStartClassicDiscovery={vi.fn(async () => undefined)}
         stats={stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
@@ -138,6 +158,64 @@ describe("Settings and About pages", () => {
     expect(screen.getByText("进度 40%")).toBeInTheDocument();
     expect(screen.getByText("8/20")).toBeInTheDocument();
     expect(screen.getByText("7301: upstream timeout")).toBeInTheDocument();
+  });
+
+  it("renders AI failure queue entries and retry actions", () => {
+    const onRetryAiAnalysisJob = vi.fn(async () => undefined);
+
+    render(
+      <SettingsPage
+        config={mockDashboard.config}
+        isBusy={false}
+        onRefreshAllAnalyses={vi.fn(async () => undefined)}
+        onRetryAiAnalysisJob={onRetryAiAnalysisJob}
+        onStartClassicDiscovery={vi.fn(async () => undefined)}
+        stats={mockDashboard.stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
+        onRefreshDashboard={vi.fn(async () => undefined)}
+        onSave={vi.fn(async () => undefined)}
+        onStatus={vi.fn()}
+        onSync={vi.fn()}
+        status="当前库已就绪。"
+      />,
+    );
+
+    openSettingsSection("AI 批量重算");
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+
+    expect(screen.getByText(/待人工处理失败项：1/)).toBeInTheDocument();
+    expect(screen.getByText(/AppID 548430/)).toBeInTheDocument();
+    expect(onRetryAiAnalysisJob).toHaveBeenCalledWith(548430);
+  });
+
+  it("passes the entered classic discovery page budget to the manual start action", () => {
+    const onStartClassicDiscovery = vi.fn(async (_maxPages: number) => undefined);
+
+    render(
+      <SettingsPage
+        config={mockDashboard.config}
+        isBusy={false}
+        onRefreshAllAnalyses={vi.fn(async () => undefined)}
+        onRetryAiAnalysisJob={vi.fn(async () => undefined)}
+        onStartClassicDiscovery={onStartClassicDiscovery}
+        stats={mockDashboard.stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
+        onRefreshDashboard={vi.fn(async () => undefined)}
+        onSave={vi.fn(async () => undefined)}
+        onStatus={vi.fn()}
+        onSync={vi.fn()}
+        status="当前库已就绪。"
+      />,
+    );
+
+    openSettingsSection("发现任务");
+
+    fireEvent.change(screen.getByLabelText("老游补库页数"), {
+      target: { value: "2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "启动老游补库" }));
+
+    expect(onStartClassicDiscovery).toHaveBeenCalledWith(2);
   });
 
   it("renders a real about/diagnostic surface", () => {

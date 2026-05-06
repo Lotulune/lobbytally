@@ -55,6 +55,7 @@ pub struct SteamGameSnapshot {
     pub demo_status: DemoStatus,
     pub supported_languages: Option<Vec<String>>,
     pub is_adult_content: Option<bool>,
+    pub is_free: Option<bool>,
     pub price_text: Option<String>,
     pub discount_percent: Option<u32>,
     pub positive_review_pct: Option<f64>,
@@ -268,6 +269,7 @@ pub async fn fetch_game_snapshot(
             .map(parse_supported_languages)
             .filter(|languages| !languages.is_empty()),
         is_adult_content: details.as_ref().map(|details| details.is_adult_content()),
+        is_free: details.as_ref().and_then(|details| details.is_free),
         price_text: details
             .as_ref()
             .and_then(|details| details.price_text())
@@ -328,7 +330,7 @@ pub async fn fetch_store_search_candidates(
     count: u32,
     language: &str,
 ) -> Result<SteamStoreSearchPage> {
-    let query = store_search_candidate_query(start, count, language);
+    let query = store_search_candidate_query(start, count, language, "Released_DESC");
     let count = count.clamp(1, 100);
 
     let response = client
@@ -373,13 +375,18 @@ pub async fn fetch_store_search_candidates(
     Ok(page)
 }
 
-fn store_search_candidate_query(start: u32, count: u32, language: &str) -> Vec<(String, String)> {
+fn store_search_candidate_query(
+    start: u32,
+    count: u32,
+    language: &str,
+    sort_by: &str,
+) -> Vec<(String, String)> {
     let mut query = vec![
         ("query".to_string(), String::new()),
         ("start".to_string(), start.to_string()),
         ("count".to_string(), count.clamp(1, 100).to_string()),
         ("dynamic_data".to_string(), String::new()),
-        ("sort_by".to_string(), "Released_DESC".to_string()),
+        ("sort_by".to_string(), sort_by.to_string()),
         ("category1".to_string(), "998".to_string()),
         ("category3".to_string(), "1".to_string()),
         ("infinite".to_string(), "1".to_string()),
@@ -393,6 +400,57 @@ fn store_search_candidate_query(start: u32, count: u32, language: &str) -> Vec<(
     }
 
     query
+}
+
+pub async fn fetch_classic_search_candidates(
+    client: &Client,
+    start: u32,
+    count: u32,
+    language: &str,
+) -> Result<SteamStoreSearchPage> {
+    let query = store_search_candidate_query(start, count, language, "Reviews_DESC");
+    let count = count.clamp(1, 100);
+
+    let response = client
+        .get("https://store.steampowered.com/search/results/")
+        .timeout(STEAM_STORE_SEARCH_REQUEST_TIMEOUT)
+        .query(&query)
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "Steam Store Search：发送请求失败（{}）",
+                describe_reqwest_error(&error)
+            )
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("Steam Store Search：Steam 返回 HTTP {status}。"));
+    }
+
+    let response = response
+        .json::<SteamStoreSearchResponse>()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "Steam Store Search：解析响应失败（{}）",
+                describe_reqwest_error(&error)
+            )
+        })?;
+    if !response.is_success() {
+        return Err(anyhow!("Steam Store Search：Steam 返回失败状态。"));
+    }
+
+    let page = response.into_page(count);
+    if page.start != start {
+        return Err(anyhow!(
+            "Steam Store Search：分页响应异常，请求 start={start}，Steam 返回 start={}.",
+            page.start
+        ));
+    }
+
+    Ok(page)
 }
 
 async fn fetch_app_list_preview_from_endpoint(
@@ -776,8 +834,44 @@ fn parse_steam_date(date: Option<&str>) -> Option<String> {
 
     Date::parse(date, SHORT_STEAM_DATE)
         .or_else(|_| Date::parse(date, LONG_STEAM_DATE))
+        .or_else(|_| parse_chinese_steam_date(date))
         .ok()
         .and_then(|date| date.format(ISO_DATE).ok())
+}
+
+fn parse_chinese_steam_date(date: &str) -> Result<Date, time::error::Parse> {
+    let separators = ['年', '月', '日'];
+    let mut normalized = date.trim().to_string();
+    for separator in separators {
+        normalized = normalized.replace(separator, "-");
+    }
+    let normalized = normalized
+        .split('-')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if normalized.len() != 3 {
+        return Err(time::error::Parse::TryFromParsed(
+            time::error::TryFromParsed::InsufficientInformation,
+        ));
+    }
+
+    let year = normalized[0].parse::<i32>().map_err(|_| {
+        time::error::Parse::TryFromParsed(time::error::TryFromParsed::InsufficientInformation)
+    })?;
+    let month = normalized[1].parse::<u8>().map_err(|_| {
+        time::error::Parse::TryFromParsed(time::error::TryFromParsed::InsufficientInformation)
+    })?;
+    let day = normalized[2].parse::<u8>().map_err(|_| {
+        time::error::Parse::TryFromParsed(time::error::TryFromParsed::InsufficientInformation)
+    })?;
+
+    let month = time::Month::try_from(month).map_err(|_| {
+        time::error::Parse::TryFromParsed(time::error::TryFromParsed::InsufficientInformation)
+    })?;
+    Date::from_calendar_date(year, month, day).map_err(|_| {
+        time::error::Parse::TryFromParsed(time::error::TryFromParsed::InsufficientInformation)
+    })
 }
 
 fn normalize_review_text(text: &str) -> String {
@@ -1318,7 +1412,7 @@ mod tests {
 
     #[test]
     fn store_search_candidate_query_prefilters_to_multiplayer_games() {
-        let query = store_search_candidate_query(50, 500, "english");
+        let query = store_search_candidate_query(50, 500, "english", "Released_DESC");
 
         assert!(query.contains(&("category1".to_string(), "998".to_string())));
         assert!(query.contains(&("category3".to_string(), "1".to_string())));
@@ -1654,6 +1748,18 @@ mod tests {
                 "多人".to_string(),
                 "在线合作".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn parse_steam_date_accepts_chinese_store_dates() {
+        assert_eq!(
+            parse_steam_date(Some("2026 年 5 月 5 日")).as_deref(),
+            Some("2026-05-05")
+        );
+        assert_eq!(
+            parse_steam_date(Some("2025 年 12 月 6 日")).as_deref(),
+            Some("2025-12-06")
         );
     }
 

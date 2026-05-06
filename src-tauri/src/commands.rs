@@ -1,5 +1,6 @@
 use crate::ai_batch_refresh_task;
 use crate::backfill_task;
+use crate::classic_discovery_task;
 use crate::db;
 use crate::discovery::{
     build_discovered_game_card, clamp_discovery_page_size, clamp_discovery_pages,
@@ -10,7 +11,8 @@ use crate::discovery_task::{emit_snapshot, spawn_discovery_worker, DiscoveryCont
 use crate::game_analysis;
 use crate::llm::{self, LlmRuntimeConfig};
 use crate::models::{
-    AiAssessment, AiBatchRefreshReport, DashboardPayload, DiscoveryRunSnapshot, DiscoveryRunStatus,
+    AiAnalysisQueueSource, AiAssessment, AiBatchRefreshReport, ClassicDiscoveryRunSnapshot,
+    ClassicDiscoveryTaskRequest, DashboardPayload, DiscoveryRunSnapshot, DiscoveryRunStatus,
     DiscoveryTaskRequest, GameAnalysisReport, PublicConfig, SaveConfigRequest, SyncMode,
     SyncReport, SyncRequest, UserCollections, UserGameState, UserGameStatePatch,
 };
@@ -37,6 +39,7 @@ pub fn get_dashboard(state: State<'_, AppState>) -> Result<DashboardPayload, Str
     let persisted_sync_last_error = payload.stats.sync_last_error.clone();
     let persisted_sync_last_error_appid = payload.stats.sync_last_error_appid;
     let persisted_pending_count = payload.stats.backfill_pending_count;
+    let persisted_classic_status = payload.stats.classic_discovery_status.clone();
     let persisted_ai_batch_refresh_total_count = payload.stats.ai_batch_refresh_total_count;
     let persisted_ai_batch_refresh_processed_count = payload.stats.ai_batch_refresh_processed_count;
     let persisted_ai_batch_refresh_updated_count = payload.stats.ai_batch_refresh_updated_count;
@@ -76,6 +79,17 @@ pub fn get_dashboard(state: State<'_, AppState>) -> Result<DashboardPayload, Str
     };
     payload.stats.backfill_processed_count = backfill.processed_count;
     payload.stats.backfill_failed_count = backfill.failed_count;
+    let classic = state
+        .classic_discovery
+        .lock()
+        .map_err(|err| err.to_string())?
+        .snapshot();
+    payload.stats.classic_discovery_running = classic.running;
+    if classic.running {
+        payload.stats.classic_discovery_status = Some(DiscoveryRunStatus::Running);
+    } else {
+        payload.stats.classic_discovery_status = persisted_classic_status;
+    }
     let ai_batch_refresh = state
         .ai_batch_refresh
         .lock()
@@ -332,12 +346,15 @@ pub fn refresh_all_game_analyses(
     }
 
     if let Some(existing_snapshot) =
-        start_ai_batch_refresh_runtime(state.inner(), appids.len(), concurrency)
-            .map_err(to_command_error)?
+        start_ai_batch_refresh_runtime(state.inner(), 0, concurrency).map_err(to_command_error)?
     {
         return Ok(running_ai_batch_refresh_report(&existing_snapshot));
     }
-    ai_batch_refresh_task::spawn_ai_batch_refresh_worker(app, appids.clone(), concurrency);
+    {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
+        enqueue_full_refresh_ai_jobs(&conn).map_err(to_command_error)?;
+    }
+    ai_batch_refresh_task::spawn_ai_batch_refresh_worker(app, concurrency);
 
     Ok(AiBatchRefreshReport {
         total_games: appids.len(),
@@ -348,6 +365,38 @@ pub fn refresh_all_game_analyses(
             appids.len(),
             concurrency
         ),
+    })
+}
+
+#[tauri::command]
+pub fn retry_ai_analysis_job(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    appid: u32,
+) -> Result<AiBatchRefreshReport, String> {
+    {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
+        let source = db::load_game(&conn, appid)
+            .map_err(to_command_error)?
+            .map(|game| ai_analysis_source_for_section(game.section.as_str()))
+            .unwrap_or(AiAnalysisQueueSource::Classic);
+        if db::load_ai_analysis_queue_job(&conn, appid)
+            .map_err(to_command_error)?
+            .is_none()
+        {
+            db::enqueue_ai_analysis_jobs(&conn, source, [appid]).map_err(to_command_error)?;
+        }
+        db::update_ai_analysis_queue_job(&conn, appid, 1, None).map_err(to_command_error)?;
+    }
+    let concurrency =
+        resolve_batch_refresh_concurrency(state.inner(), None).map_err(to_command_error)?;
+    ai_batch_refresh_task::start_ai_batch_refresh_worker_if_idle(&app, concurrency)
+        .map_err(to_command_error)?;
+    Ok(AiBatchRefreshReport {
+        total_games: 1,
+        updated_games: 0,
+        failed_games: 0,
+        message: format!("已重新加入 AppID {appid} 的 AI 分析队列。"),
     })
 }
 
@@ -648,6 +697,77 @@ pub fn cancel_discovery_task(app: AppHandle) -> Result<DiscoveryRunSnapshot, Str
 }
 
 #[tauri::command]
+pub fn get_classic_discovery_task_snapshot(
+    app: AppHandle,
+) -> Result<Option<ClassicDiscoveryRunSnapshot>, String> {
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().map_err(|err| err.to_string())?;
+    db::load_latest_classic_discovery_run(&conn).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub fn list_classic_discovery_task_history(
+    app: AppHandle,
+    limit: Option<u32>,
+) -> Result<Vec<ClassicDiscoveryRunSnapshot>, String> {
+    let state = app.state::<AppState>();
+    let conn = state.db.lock().map_err(|err| err.to_string())?;
+    let mut runs = db::list_classic_discovery_runs(&conn).map_err(to_command_error)?;
+    let limit = limit.unwrap_or(8) as usize;
+    if runs.len() > limit {
+        runs.truncate(limit);
+    }
+    Ok(runs)
+}
+
+#[tauri::command]
+pub fn start_classic_discovery_task(
+    app: AppHandle,
+    request: ClassicDiscoveryTaskRequest,
+) -> Result<ClassicDiscoveryRunSnapshot, String> {
+    let state = app.state::<AppState>();
+    let mut runtime = state
+        .classic_discovery
+        .lock()
+        .map_err(|err| err.to_string())?;
+    if runtime.active_run_id.is_some() {
+        return Err("当前已有精品老游补库任务正在运行。".to_string());
+    }
+
+    let conn = state.db.lock().map_err(|err| err.to_string())?;
+    if let Some(latest) = db::load_latest_classic_discovery_run(&conn).map_err(to_command_error)? {
+        if latest.status == DiscoveryRunStatus::Running {
+            return Err("当前已有精品老游补库任务正在运行。".to_string());
+        }
+    }
+    let max_pages = request
+        .max_pages
+        .unwrap_or(db::CLASSIC_DISCOVERY_MAX_PAGES_DEFAULT)
+        .clamp(1, db::CLASSIC_DISCOVERY_MAX_PAGES_DEFAULT);
+    let start_offset =
+        resolve_manual_classic_discovery_start_offset(&conn).map_err(to_command_error)?;
+    let end_page = start_offset.saturating_add(max_pages);
+    let snapshot = db::create_classic_discovery_run(&conn, end_page, start_offset)
+        .map_err(to_command_error)?;
+    runtime.active_run_id = Some(snapshot.id);
+    runtime.control = classic_discovery_task::ClassicDiscoveryControl::None;
+    drop(conn);
+    drop(runtime);
+
+    classic_discovery_task::emit_snapshot(&app, &snapshot);
+    classic_discovery_task::spawn_classic_discovery_worker(app, snapshot.id);
+    Ok(snapshot)
+}
+
+fn resolve_manual_classic_discovery_start_offset(
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<u32> {
+    Ok(db::get_config(conn, db::CLASSIC_DISCOVERY_LAST_OFFSET_CONFIG_KEY)?
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0))
+}
+
+#[tauri::command]
 pub fn set_game_user_state(
     state: State<'_, AppState>,
     appid: u32,
@@ -692,6 +812,9 @@ pub(crate) fn merge_snapshot(
     if let Some(is_adult_content) = snapshot.is_adult_content {
         existing.is_adult_content = is_adult_content;
     }
+    if let Some(is_free) = snapshot.is_free {
+        existing.is_free = is_free;
+    }
     if let Some(price_text) = snapshot.price_text.filter(|text| !text.trim().is_empty()) {
         existing.price_text = Some(price_text);
     }
@@ -723,6 +846,13 @@ pub(crate) fn merge_snapshot(
     existing.section = match bucket_game(&facts, &crate::recommendation::today_iso_utc()) {
         ReleaseBucket::New => "new".to_string(),
         ReleaseBucket::Classic => "classic".to_string(),
+        ReleaseBucket::ClassicHidden => {
+            if existing.section == "classic" {
+                "classic".to_string()
+            } else {
+                "classic_hidden".to_string()
+            }
+        }
     };
     existing.recommendation_score = db::score_card(&existing);
     existing
@@ -730,6 +860,38 @@ pub(crate) fn merge_snapshot(
 
 fn to_command_error(error: anyhow::Error) -> String {
     error.to_string()
+}
+
+fn ai_analysis_source_for_section(section: &str) -> AiAnalysisQueueSource {
+    if section == "new" {
+        AiAnalysisQueueSource::NewRelease
+    } else {
+        AiAnalysisQueueSource::Classic
+    }
+}
+
+fn enqueue_full_refresh_ai_jobs(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    let games = db::list_game_appids_with_sections(conn)?;
+    let mut new_release = Vec::new();
+    let mut classic = Vec::new();
+
+    conn.execute("DELETE FROM ai_analysis_queue", [])?;
+
+    for (appid, section) in games {
+        match ai_analysis_source_for_section(section.as_str()) {
+            AiAnalysisQueueSource::NewRelease => new_release.push(appid),
+            AiAnalysisQueueSource::Classic => classic.push(appid),
+        }
+    }
+
+    if !new_release.is_empty() {
+        db::enqueue_ai_analysis_jobs(conn, AiAnalysisQueueSource::NewRelease, new_release)?;
+    }
+    if !classic.is_empty() {
+        db::enqueue_ai_analysis_jobs(conn, AiAnalysisQueueSource::Classic, classic)?;
+    }
+
+    Ok(())
 }
 
 fn load_cached_game_analysis(
@@ -1002,8 +1164,10 @@ fn sync_mode_label(mode: SyncMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
+        enqueue_full_refresh_ai_jobs,
         generate_assessment_from_report_pipeline, generate_or_load_game_analysis,
         load_cached_game_analysis, refresh_all_game_analyses_pipeline,
+        merge_snapshot, resolve_manual_classic_discovery_start_offset,
         start_ai_batch_refresh_runtime, visible_ai_batch_refresh_concurrency,
     };
     use crate::backfill_task::BackfillRuntimeState;
@@ -1015,6 +1179,7 @@ mod tests {
         GameAnalysisReport, GameCard, ReviewSnippet, StoreReleaseState, UserGameState,
     };
     use crate::recommendation::DemoStatus;
+    use crate::steam::SteamGameSnapshot;
     use crate::state::AppState;
     use crate::sync_task::SyncRuntimeState;
     use reqwest::Client;
@@ -1041,6 +1206,7 @@ mod tests {
             demo_status: DemoStatus::ReleasedWithDemo,
             supported_languages: vec!["English".to_string(), "Simplified Chinese".to_string()],
             is_adult_content: false,
+            is_free: false,
             price_text: Some("$19.99".to_string()),
             discount_percent: Some(15),
             positive_review_pct: Some(91.0),
@@ -1077,11 +1243,15 @@ mod tests {
             db: Mutex::new(conn),
             http: Client::builder().build().expect("build test client"),
             discovery: Mutex::new(DiscoveryRuntimeState::default()),
+            classic_discovery: Mutex::new(
+                crate::classic_discovery_task::ClassicDiscoveryRuntimeState::default(),
+            ),
             backfill: Mutex::new(BackfillRuntimeState::default()),
             sync: Mutex::new(SyncRuntimeState::default()),
             ai_batch_refresh: Mutex::new(
                 crate::ai_batch_refresh_task::AiBatchRefreshRuntimeState::default(),
             ),
+            auto_scheduler: Mutex::new(crate::state::AutoSchedulerRuntimeState::default()),
         }
     }
 
@@ -1099,6 +1269,7 @@ mod tests {
             demo_status: DemoStatus::Released,
             supported_languages: vec!["English".to_string(), "Simplified Chinese".to_string()],
             is_adult_content: false,
+            is_free: false,
             price_text: Some("$14.99".to_string()),
             discount_percent: None,
             positive_review_pct: Some(94.0),
@@ -1125,6 +1296,228 @@ mod tests {
             ],
             user_state: UserGameState::default(),
         }
+    }
+
+    #[test]
+    fn manual_classic_discovery_start_offset_defaults_to_zero_without_saved_progress() {
+        let state = seeded_state();
+        let conn = state.db.lock().expect("lock db");
+        let start_offset =
+            resolve_manual_classic_discovery_start_offset(&conn).expect("resolve start offset");
+
+        assert_eq!(start_offset, 0);
+    }
+
+    #[test]
+    fn manual_classic_discovery_start_offset_uses_saved_progress() {
+        let state = seeded_state();
+        let conn = state.db.lock().expect("lock db");
+
+        db::set_config(&conn, db::CLASSIC_DISCOVERY_LAST_OFFSET_CONFIG_KEY, "7")
+            .expect("seed last classic offset");
+
+        let start_offset =
+            resolve_manual_classic_discovery_start_offset(&conn).expect("resolve start offset");
+
+        assert_eq!(start_offset, 7);
+    }
+
+    #[test]
+    fn full_refresh_enqueue_preserves_real_ai_sources_per_game() {
+        let state = seeded_state();
+        let conn = state.db.lock().expect("lock db");
+
+        db::upsert_game(
+            &conn,
+            &GameCard {
+                appid: 8_402,
+                name: "Quiet Orbit".to_string(),
+                short_description: Some("classic".to_string()),
+                section: "classic".to_string(),
+                release_date: Some("2025-08-10".to_string()),
+                release_date_text: "2025-08-10".to_string(),
+                release_state: StoreReleaseState::Released,
+                demo_status: DemoStatus::Released,
+                supported_languages: vec!["English".to_string()],
+                is_adult_content: false,
+                is_free: false,
+                price_text: None,
+                discount_percent: None,
+                positive_review_pct: Some(82.0),
+                total_reviews: Some(1500),
+                current_players: Some(320),
+                recommendation_score: 70.0,
+                ai_score: None,
+                ai_summary: "classic".to_string(),
+                capsule_url: "https://example.com/classic.jpg".to_string(),
+                store_screenshot_urls: vec![],
+                tags: vec!["Co-op".to_string()],
+                multiplayer_modes: vec!["Online Co-op".to_string()],
+                review_snippets: vec![],
+                user_state: UserGameState::default(),
+            },
+        )
+        .expect("seed classic game");
+        db::upsert_game(
+            &conn,
+            &GameCard {
+                appid: 9_503,
+                name: "Hidden Orbit".to_string(),
+                short_description: Some("hidden".to_string()),
+                section: "classic_hidden".to_string(),
+                release_date: Some("2024-08-10".to_string()),
+                release_date_text: "2024-08-10".to_string(),
+                release_state: StoreReleaseState::Released,
+                demo_status: DemoStatus::Released,
+                supported_languages: vec!["English".to_string()],
+                is_adult_content: false,
+                is_free: true,
+                price_text: Some("Free To Play".to_string()),
+                discount_percent: None,
+                positive_review_pct: Some(68.0),
+                total_reviews: Some(350),
+                current_players: Some(21),
+                recommendation_score: 40.0,
+                ai_score: None,
+                ai_summary: "hidden".to_string(),
+                capsule_url: "https://example.com/hidden.jpg".to_string(),
+                store_screenshot_urls: vec![],
+                tags: vec!["Co-op".to_string()],
+                multiplayer_modes: vec!["Online Co-op".to_string()],
+                review_snippets: vec![],
+                user_state: UserGameState::default(),
+            },
+        )
+        .expect("seed hidden classic game");
+
+        enqueue_full_refresh_ai_jobs(&conn).expect("enqueue full refresh jobs");
+
+        let jobs = db::list_ai_analysis_queue_jobs(&conn).expect("list queued jobs");
+        let ordered = jobs
+            .into_iter()
+            .map(|job| (job.appid, job.source))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered,
+            vec![
+                (7_301, crate::models::AiAnalysisQueueSource::NewRelease),
+                (8_402, crate::models::AiAnalysisQueueSource::Classic),
+                (9_503, crate::models::AiAnalysisQueueSource::Classic),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_moves_older_mid_quality_new_game_into_classic_hidden() {
+        let existing = GameCard {
+            appid: 91_001,
+            name: "Borderline Squad".to_string(),
+            short_description: Some("before update".to_string()),
+            section: "new".to_string(),
+            release_date: Some("2026-03-01".to_string()),
+            release_date_text: "2026-03-01".to_string(),
+            release_state: StoreReleaseState::Released,
+            demo_status: DemoStatus::Released,
+            supported_languages: vec!["English".to_string()],
+            is_adult_content: false,
+            is_free: false,
+            price_text: Some("$14.99".to_string()),
+            discount_percent: None,
+            positive_review_pct: Some(72.0),
+            total_reviews: Some(280),
+            current_players: Some(40),
+            recommendation_score: 50.0,
+            ai_score: None,
+            ai_summary: "summary".to_string(),
+            capsule_url: "https://example.com/borderline.jpg".to_string(),
+            store_screenshot_urls: vec![],
+            tags: vec!["Co-op".to_string()],
+            multiplayer_modes: vec!["Online Co-op".to_string()],
+            review_snippets: vec![],
+            user_state: UserGameState::default(),
+        };
+        let snapshot = SteamGameSnapshot {
+            name: None,
+            short_description: None,
+            release_date: Some("2026-03-01".to_string()),
+            release_date_text: Some("2026-03-01".to_string()),
+            release_state: Some(StoreReleaseState::Released),
+            demo_status: DemoStatus::Released,
+            supported_languages: None,
+            is_adult_content: None,
+            is_free: Some(false),
+            price_text: Some("$14.99".to_string()),
+            discount_percent: None,
+            positive_review_pct: Some(68.0),
+            total_reviews: Some(320),
+            current_players: Some(55),
+            capsule_url: None,
+            store_screenshot_urls: vec![],
+            tags: vec!["Co-op".to_string()],
+            multiplayer_modes: vec!["Online Co-op".to_string()],
+            review_snippets: vec![],
+        };
+
+        let merged = merge_snapshot(existing, snapshot);
+
+        assert_eq!(merged.section, "classic_hidden");
+    }
+
+    #[test]
+    fn merge_snapshot_promotes_classic_hidden_to_classic_when_quality_threshold_is_met() {
+        let existing = GameCard {
+            appid: 91_002,
+            name: "Sleeper Hit".to_string(),
+            short_description: Some("before update".to_string()),
+            section: "classic_hidden".to_string(),
+            release_date: Some("2025-01-01".to_string()),
+            release_date_text: "2025-01-01".to_string(),
+            release_state: StoreReleaseState::Released,
+            demo_status: DemoStatus::Released,
+            supported_languages: vec!["English".to_string()],
+            is_adult_content: false,
+            is_free: true,
+            price_text: Some("Free To Play".to_string()),
+            discount_percent: None,
+            positive_review_pct: Some(69.0),
+            total_reviews: Some(380),
+            current_players: Some(120),
+            recommendation_score: 40.0,
+            ai_score: None,
+            ai_summary: "summary".to_string(),
+            capsule_url: "https://example.com/sleeper.jpg".to_string(),
+            store_screenshot_urls: vec![],
+            tags: vec!["Co-op".to_string()],
+            multiplayer_modes: vec!["Online Co-op".to_string()],
+            review_snippets: vec![],
+            user_state: UserGameState::default(),
+        };
+        let snapshot = SteamGameSnapshot {
+            name: None,
+            short_description: None,
+            release_date: Some("2025-01-01".to_string()),
+            release_date_text: Some("2025-01-01".to_string()),
+            release_state: Some(StoreReleaseState::Released),
+            demo_status: DemoStatus::Released,
+            supported_languages: None,
+            is_adult_content: None,
+            is_free: Some(true),
+            price_text: Some("Free To Play".to_string()),
+            discount_percent: None,
+            positive_review_pct: Some(83.0),
+            total_reviews: Some(1_240),
+            current_players: Some(180),
+            capsule_url: None,
+            store_screenshot_urls: vec![],
+            tags: vec!["Co-op".to_string()],
+            multiplayer_modes: vec!["Online Co-op".to_string()],
+            review_snippets: vec![],
+        };
+
+        let merged = merge_snapshot(existing, snapshot);
+
+        assert_eq!(merged.section, "classic");
     }
 
     fn spawn_single_use_chat_completion_server(body: &str) -> String {

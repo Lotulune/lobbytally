@@ -53,8 +53,16 @@ fn scoring_without_ai_score_does_not_get_a_hidden_default_boost() {
 fn bucket_game_splits_recent_and_classic_games() {
     assert_eq!(bucket_game(&base_facts(), "2026-04-26"), ReleaseBucket::New);
 
-    let mut classic = base_facts();
-    classic.release_date = Some("2020-05-13".to_string());
+    let mut hidden_classic = base_facts();
+    hidden_classic.release_date = Some("2020-05-13".to_string());
+
+    assert_eq!(
+        bucket_game(&hidden_classic, "2026-04-26"),
+        ReleaseBucket::ClassicHidden
+    );
+
+    let mut classic = hidden_classic;
+    classic.total_reviews = Some(1_200);
 
     assert_eq!(bucket_game(&classic, "2026-04-26"), ReleaseBucket::Classic);
 }

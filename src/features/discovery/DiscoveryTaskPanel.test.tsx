@@ -22,6 +22,7 @@ function createSnapshot(
   return {
     id: 42,
     status: "paused",
+    completionReason: "paused",
     syncMode: "full",
     targetAddedGames: 6,
     pageSize: 20,
@@ -61,6 +62,17 @@ const stats: DashboardStats = {
   newGamesCount: 32,
   classicGamesCount: 56,
   lastDiscoveryAppid: 730000,
+  classicDiscoveryRunning: false,
+  classicDiscoveryStatus: null,
+  classicDiscoveryCurrentAppid: null,
+  classicDiscoveryLastAppid: null,
+  classicDiscoveryScannedApps: 0,
+  classicDiscoveryAddedGames: 0,
+  classicDiscoveryRejectedGames: 0,
+  classicDiscoveryFailedGames: 0,
+  classicDiscoverySkippedExisting: 0,
+  classicDiscoverySkippedRejectedCache: 0,
+  classicDiscoveryLastCompletedAt: null,
   syncRunning: false,
   syncMode: null,
   syncPendingCount: 0,
@@ -89,6 +101,7 @@ const stats: DashboardStats = {
   aiBatchRefreshProcessedCount: 0,
   aiBatchRefreshUpdatedCount: 0,
   aiBatchRefreshFailedCount: 0,
+  aiBatchRefreshFailedPendingReviewCount: 0,
   aiBatchRefreshLastError: null,
   aiBatchRefreshLastErrorAppid: null,
   dataSource: "SQLite",
@@ -282,6 +295,31 @@ describe("DiscoveryTaskPanel", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows interrupted guidance instead of a misleading exhausted-range message", () => {
+    hookState = createHookState({
+      snapshot: createSnapshot({
+        status: "interrupted",
+        completionReason: null,
+        addedGames: 0,
+        addedNewGames: 0,
+        scannedApps: 127,
+      }),
+    });
+
+    render(
+      <DiscoveryTaskPanel
+        stats={stats}
+        onRefreshDashboard={vi.fn().mockResolvedValue(undefined)}
+        onStatus={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("任务被中断，可继续恢复。")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/本轮已扫完当前配置范围，共检查 127 个最近发售多人候选，但没有命中新游戏。/),
+    ).not.toBeInTheDocument();
+  });
+
   it("refreshes dashboard when a running task later becomes cancelled", async () => {
     const onRefreshDashboard = vi.fn().mockResolvedValue(undefined);
     hookState = createHookState({
@@ -367,12 +405,15 @@ describe("DiscoveryTaskPanel", () => {
 
     openDiscoverySubPanel("元数据补全");
     expect(screen.getByText("元数据补全")).toBeInTheDocument();
-    expect(screen.getByText("补录中")).toBeInTheDocument();
+    expect(screen.getByText("新游补全中")).toBeInTheDocument();
     expect(screen.getAllByText("2/5").length).toBeGreaterThan(0);
     expect(screen.getAllByText("3").length).toBeGreaterThan(0);
     expect(screen.getByText("730123")).toBeInTheDocument();
     expect(screen.getByText("1/2")).toBeInTheDocument();
     expect(screen.getByText("AppID 570 · temporary upstream error")).toBeInTheDocument();
+    expect(
+      screen.getByText("新游发现结束后，老游补库会在新游补全清空后启动；新游 AI 仍会继续先跑。"),
+    ).toBeInTheDocument();
 
     await waitFor(() => expect(onRefreshDashboard).toHaveBeenCalledTimes(1));
   });

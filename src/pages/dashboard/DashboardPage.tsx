@@ -314,9 +314,12 @@ function GameSection({
             >
               <div className="cover-wrap">
                 <img src={game.capsuleUrl} alt="" loading="lazy" />
-                <span className={`demo-pill ${game.demoStatus}`}>
-                  {demoLabel(game.demoStatus)}
-                </span>
+                <div className="card-pill-stack">
+                  {game.isFree ? <span className="demo-pill free">Free</span> : null}
+                  <span className={`demo-pill ${game.demoStatus}`}>
+                    {demoLabel(game.demoStatus)}
+                  </span>
+                </div>
               </div>
               <div className="game-body">
                 <h3>{game.name}</h3>
@@ -526,14 +529,14 @@ function RightRail({
                 {stats.backfillCurrentAppid
                   ? `当前正在补录 AppID ${stats.backfillCurrentAppid}（第 ${stats.backfillCurrentAttempt ?? 1}/${stats.backfillMaxAttempts} 次尝试）。`
                   : stats.backfillPendingCount > 0
-                    ? "发现任务结束后会继续补录在线人数和评论片段。"
+                    ? "新游补全清空后即可启动老游补库；老游 AI 仍会排在新游 AI 后面。"
                     : stats.backfillFailedCount > 0
                       ? "本轮补录已结束，但有部分游戏补录失败。"
-                      : "本轮补录已完成。"}
+                      : "本轮新游补全已完成；若有老游待入库，现在可以继续启动老游补库。"}
               </p>
             </>
           ) : (
-            <p className="mini-status">发现新游戏时可选完整拉取或部分拉取；只有完整拉取才会补录在线人数和评论片段。</p>
+            <p className="mini-status">新游发现可选完整拉取或部分拉取；只有完整拉取才会补录在线人数和评论片段，老游补库只等新游补全清空。</p>
           )}
         </div>
         <p className="mini-status">{stats.dataSource}</p>
@@ -758,11 +761,11 @@ function formatDateTime(value?: string | null) {
 
 function describeBackfillStatus(stats: DashboardStats) {
   if (stats.backfillRunning) {
-    return "补录中";
+    return "新游补全中";
   }
 
   if (stats.backfillPendingCount > 0) {
-    return "排队中";
+    return "待补全";
   }
 
   if (stats.backfillTotalCount > 0) {

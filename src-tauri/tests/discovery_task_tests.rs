@@ -16,6 +16,7 @@ fn sample_snapshot(status: DiscoveryRunStatus, added_games: usize) -> DiscoveryR
     DiscoveryRunSnapshot {
         id: 1,
         status,
+        completion_reason: None,
         sync_mode: SyncMode::Full,
         target_added_games: 10,
         page_size: 25,
@@ -58,6 +59,7 @@ fn discovery_run_snapshot_round_trips_with_failures() {
         run.id,
         db::DiscoveryProgressPatch {
             status: Some(DiscoveryRunStatus::Running),
+            completion_reason: None,
             current_appid: Some(Some(321_012)),
             last_appid: Some(Some(321_025)),
             pages_processed: Some(1),
@@ -131,6 +133,7 @@ fn mark_running_discovery_runs_interrupted_on_startup() {
         run.id,
         db::DiscoveryProgressPatch {
             status: Some(DiscoveryRunStatus::Running),
+            completion_reason: None,
             current_appid: Some(Some(555_012)),
             last_appid: Some(Some(555_030)),
             pages_processed: Some(2),
@@ -155,6 +158,10 @@ fn mark_running_discovery_runs_interrupted_on_startup() {
         .expect("run exists");
 
     assert_eq!(interrupted.status, DiscoveryRunStatus::Interrupted);
+    assert_eq!(
+        interrupted.completion_reason,
+        Some(tauri_app_lib::models::DiscoveryCompletionReason::Interrupted)
+    );
     assert_eq!(interrupted.added_games, 5);
     assert_eq!(interrupted.last_appid, Some(555_030));
 }

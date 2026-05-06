@@ -15,6 +15,8 @@ import type {
   DiscoveryTaskRequest,
   GameAnalysisReport,
   GameCard,
+  ClassicDiscoveryRunSnapshot,
+  ClassicDiscoveryTaskRequest,
   PublicConfig,
   SaveConfigRequest,
   SteamDiscoveryReport,
@@ -308,6 +310,26 @@ export async function refreshAllGameAnalyses(
   });
 }
 
+export async function retryAiAnalysisJob(
+  appid: number,
+): Promise<AiBatchRefreshReport> {
+  if (!isTauriRuntime()) {
+    mockDashboard.aiAnalysisQueueFailures = mockDashboard.aiAnalysisQueueFailures.filter(
+      (item) => item.appid !== appid,
+    );
+    mockDashboard.stats.aiBatchRefreshFailedPendingReviewCount =
+      mockDashboard.aiAnalysisQueueFailures.length;
+    return {
+      totalGames: 1,
+      updatedGames: 0,
+      failedGames: 0,
+      message: `浏览器预览模式：已模拟重试 AppID ${appid} 的 AI 分析任务。`,
+    };
+  }
+
+  return invoke<AiBatchRefreshReport>("retry_ai_analysis_job", { appid });
+}
+
 function clampBatchRefreshConcurrency(value?: number): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return undefined;
@@ -433,6 +455,7 @@ export async function startDiscoveryTask(
     const snapshot: DiscoveryRunSnapshot = {
       id: Date.now(),
       status: "completed",
+      completionReason: "target_reached",
       syncMode: request.syncMode,
       targetAddedGames: Math.max(1, request.targetAddedGames),
       pageSize: Math.max(1, request.pageSize),
@@ -472,6 +495,7 @@ export async function pauseDiscoveryTask(): Promise<DiscoveryRunSnapshot> {
     const snapshot: DiscoveryRunSnapshot = {
       ...cloneDiscoverySnapshot(current),
       status: "paused",
+      completionReason: "paused",
       currentAppid: null,
       updatedAt: new Date().toISOString(),
       finishedAt: null,
@@ -493,6 +517,7 @@ export async function resumeDiscoveryTask(): Promise<DiscoveryRunSnapshot> {
     const snapshot: DiscoveryRunSnapshot = {
       ...cloneDiscoverySnapshot(current),
       status: "running",
+      completionReason: null,
       finishedAt: null,
       updatedAt: new Date().toISOString(),
     };
@@ -514,6 +539,7 @@ export async function cancelDiscoveryTask(): Promise<DiscoveryRunSnapshot> {
     const snapshot: DiscoveryRunSnapshot = {
       ...cloneDiscoverySnapshot(current),
       status: "cancelled",
+      completionReason: "cancelled",
       currentAppid: null,
       updatedAt: now,
       finishedAt: now,
@@ -523,6 +549,47 @@ export async function cancelDiscoveryTask(): Promise<DiscoveryRunSnapshot> {
   }
 
   return invoke<DiscoveryRunSnapshot>("cancel_discovery_task");
+}
+
+export async function startClassicDiscoveryTask(
+  maxPages?: number,
+): Promise<ClassicDiscoveryRunSnapshot> {
+  if (!isTauriRuntime()) {
+    return {
+      id: Date.now(),
+      status: "running",
+      maxPages: clampClassicDiscoveryMaxPages(maxPages) ?? 3,
+      pageSize: 100,
+      pagesProcessed: 0,
+      scannedApps: 0,
+      consideredApps: 0,
+      addedGames: 0,
+      rejectedGames: 0,
+      skippedExisting: 0,
+      skippedRejectedCache: 0,
+      failedGames: 0,
+      currentAppid: null,
+      lastAppid: null,
+      consecutiveEmptyPages: 0,
+      ruleVersion: "classic_v2",
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      finishedAt: null,
+      lastError: null,
+    };
+  }
+
+  return invoke<ClassicDiscoveryRunSnapshot>("start_classic_discovery_task", {
+    request: { maxPages: clampClassicDiscoveryMaxPages(maxPages) } satisfies ClassicDiscoveryTaskRequest,
+  });
+}
+
+function clampClassicDiscoveryMaxPages(value?: number): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+
+  return Math.min(3, Math.max(1, Math.round(value)));
 }
 
 function refreshMockCollections() {

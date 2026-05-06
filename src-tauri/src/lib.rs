@@ -1,5 +1,7 @@
 pub mod ai_batch_refresh_task;
+pub mod auto_scheduler;
 pub mod backfill_task;
+pub mod classic_discovery_task;
 pub mod commands;
 pub mod db;
 pub mod discovery;
@@ -25,6 +27,7 @@ pub fn run() {
             let db_path = app_data_dir.join("mpgs.sqlite3");
             let db = db::open_database(&db_path)?;
             db::mark_running_discovery_runs_interrupted(&db)?;
+            db::mark_running_classic_discovery_runs_interrupted(&db)?;
             let http = reqwest::Client::builder()
                 .user_agent("MPGS/0.1 (+https://local.app)")
                 .build()?;
@@ -33,13 +36,17 @@ pub fn run() {
                 db: std::sync::Mutex::new(db),
                 http,
                 discovery: std::sync::Mutex::new(discovery_task::DiscoveryRuntimeState::default()),
+                classic_discovery: std::sync::Mutex::new(
+                    classic_discovery_task::ClassicDiscoveryRuntimeState::default(),
+                ),
                 backfill: std::sync::Mutex::new(backfill_task::BackfillRuntimeState::default()),
                 sync: std::sync::Mutex::new(sync_task::SyncRuntimeState::default()),
                 ai_batch_refresh: std::sync::Mutex::new(
                     ai_batch_refresh_task::AiBatchRefreshRuntimeState::default(),
                 ),
+                auto_scheduler: std::sync::Mutex::new(state::AutoSchedulerRuntimeState::default()),
             });
-            backfill_task::restore_backfill_runtime(app.handle().clone())?;
+            auto_scheduler::kick(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -60,6 +67,10 @@ pub fn run() {
             commands::pause_discovery_task,
             commands::resume_discovery_task,
             commands::cancel_discovery_task,
+            commands::get_classic_discovery_task_snapshot,
+            commands::list_classic_discovery_task_history,
+            commands::start_classic_discovery_task,
+            commands::retry_ai_analysis_job,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

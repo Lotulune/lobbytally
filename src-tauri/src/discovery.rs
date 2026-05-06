@@ -6,9 +6,12 @@ use crate::steam::{SteamAppListItem, SteamAppListPreview, SteamGameSnapshot};
 use serde::{Deserialize, Serialize};
 
 pub const DISCOVERY_CURSOR_CONFIG_KEY: &str = "steam_discovery_last_appid";
-pub const DISCOVERY_TASK_TARGET_ADDED_GAMES_DEFAULT: u32 = 6;
+pub const DISCOVERY_TASK_TARGET_ADDED_GAMES_DEFAULT: u32 = 200;
 pub const DISCOVERY_TASK_TARGET_ADDED_GAMES_MAX: u32 = 200;
-pub const STORE_SEARCH_DISCOVERY_MAX_PAGES_PER_RUN: u32 = 30;
+pub const STORE_SEARCH_DISCOVERY_MAX_PAGES_PER_RUN: u32 = 2;
+const NEW_DISCOVERY_MIN_TOTAL_REVIEWS: u32 = 50;
+const NEW_DISCOVERY_MIN_POSITIVE_REVIEW_PCT: f64 = 40.0;
+const NEW_DISCOVERY_BLOCKED_TITLE_KEYWORDS: [&str; 1] = ["传奇"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +77,12 @@ pub fn build_discovered_game_card(
         .name
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| app.name.clone());
+    if NEW_DISCOVERY_BLOCKED_TITLE_KEYWORDS
+        .iter()
+        .any(|keyword| name.contains(keyword))
+    {
+        return None;
+    }
     let release_date = snapshot.release_date;
     let release_date_text = snapshot
         .release_date_text
@@ -112,8 +121,14 @@ pub fn build_discovered_game_card(
     let section = match bucket_game(&facts, today_iso) {
         ReleaseBucket::New => "new",
         ReleaseBucket::Classic => "classic",
+        ReleaseBucket::ClassicHidden => "classic_hidden",
     }
     .to_string();
+    if section == "new"
+        && !passes_new_game_quality_gate(demo_status.clone(), total_reviews, positive_review_pct)
+    {
+        return None;
+    }
     let recommendation_score = compute_recommendation_score(&facts, today_iso);
 
     Some(GameCard {
@@ -127,6 +142,7 @@ pub fn build_discovered_game_card(
         demo_status,
         supported_languages,
         is_adult_content,
+        is_free: snapshot.is_free.unwrap_or(false),
         price_text,
         discount_percent,
         positive_review_pct,
@@ -142,6 +158,19 @@ pub fn build_discovered_game_card(
         review_snippets,
         user_state: UserGameState::default(),
     })
+}
+
+fn passes_new_game_quality_gate(
+    demo_status: DemoStatus,
+    total_reviews: Option<u32>,
+    positive_review_pct: Option<f64>,
+) -> bool {
+    if matches!(demo_status, DemoStatus::DemoOnly | DemoStatus::ReleasedWithDemo) {
+        return true;
+    }
+
+    total_reviews.unwrap_or_default() >= NEW_DISCOVERY_MIN_TOTAL_REVIEWS
+        && positive_review_pct.unwrap_or_default() >= NEW_DISCOVERY_MIN_POSITIVE_REVIEW_PCT
 }
 
 pub fn next_discovery_cursor(preview: &SteamAppListPreview) -> Option<u32> {
