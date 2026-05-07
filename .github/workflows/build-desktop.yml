@@ -1,0 +1,83 @@
+name: Build Desktop Apps
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-desktop.yml"
+      - "index.html"
+      - "package.json"
+      - "package-lock.json"
+      - "src/**"
+      - "src-tauri/**"
+      - "tsconfig.json"
+      - "tsconfig.node.json"
+      - "vite.config.ts"
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 20
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+            args: ""
+            apple_signing_identity: ""
+          - os: macos-latest
+            label: macos-arm64
+            args: --target aarch64-apple-darwin
+            apple_signing_identity: "-"
+          - os: macos-latest
+            label: macos-x64
+            args: --target x86_64-apple-darwin
+            apple_signing_identity: "-"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Set up Rust for Windows
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Rust for macOS targets
+        if: runner.os == 'macOS'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build outputs
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build desktop bundles
+        uses: tauri-apps/tauri-action@v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.apple_signing_identity }}
+        with:
+          args: ${{ matrix.args }}
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: mpgs-${{ matrix.label }}-[bundle]
