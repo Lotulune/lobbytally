@@ -34,14 +34,17 @@ jobs:
             label: windows-x64
             args: ""
             apple_signing_identity: ""
+            bundle_path: src-tauri/target/release/bundle/**
           - os: macos-latest
             label: macos-arm64
             args: --target aarch64-apple-darwin
             apple_signing_identity: "-"
+            bundle_path: src-tauri/target/aarch64-apple-darwin/release/bundle/**
           - os: macos-latest
             label: macos-x64
             args: --target x86_64-apple-darwin
             apple_signing_identity: "-"
+            bundle_path: src-tauri/target/x86_64-apple-darwin/release/bundle/**
 
     steps:
       - name: Check out repository
@@ -79,5 +82,11 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ matrix.apple_signing_identity }}
         with:
           args: ${{ matrix.args }}
-          uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: mpgs-${{ matrix.label }}-[bundle]
+
+      - name: Upload desktop bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpgs-${{ matrix.label }}
+          path: ${{ matrix.bundle_path }}
+          if-no-files-found: error
+          retention-days: 14
