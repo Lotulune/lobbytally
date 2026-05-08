@@ -108,6 +108,28 @@ pub async fn enhance_recommendation_response(
     }
 }
 
+pub async fn validate_runtime_config(client: &Client, config: &LlmRuntimeConfig) -> Result<()> {
+    let api_key = config
+        .api_key
+        .clone()
+        .context("LLM API key is required for connectivity validation")?;
+    let base_url = config.base_url.trim_end_matches('/').to_string();
+    let model = config.model.trim().to_string();
+
+    let _ = request_chat_completion_content(
+        client,
+        &api_key,
+        &base_url,
+        &model,
+        "You are a connectivity test assistant. Reply with plain text only.",
+        "Reply with OK.".to_string(),
+        0.0,
+    )
+    .await?;
+
+    Ok(())
+}
+
 pub fn build_analysis_narrative_cache_key(
     config: &LlmRuntimeConfig,
     game: &GameCard,

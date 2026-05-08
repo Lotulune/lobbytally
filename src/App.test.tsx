@@ -539,6 +539,31 @@ describe("App dashboard interactions", () => {
     expect(getDashboardMock).toHaveBeenCalledTimes(2);
   });
 
+  it("does not reopen auto onboarding after dismissing it in the same session", async () => {
+    isTauriRuntimeMock.mockReturnValue(true);
+    const dashboard = buildDashboard();
+    dashboard.config.onboardingCompleted = false;
+    getDashboardMock.mockResolvedValue(dashboard);
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "准备 Steam Web API" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "稍后设置" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "新游区" })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /初始化向导/ })).toBeInTheDocument();
+    });
+
+    expect(screen.queryByRole("heading", { name: "准备 Steam Web API" })).not.toBeInTheDocument();
+  });
+
   it("refreshes the dashboard when discovery task events arrive in tauri runtime", async () => {
     vi.useFakeTimers();
     isTauriRuntimeMock.mockReturnValue(true);
@@ -1543,22 +1568,45 @@ describe("App dashboard interactions", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "新游区" });
-
-    act(() => {
-      scrollYValue = 450;
-      window.dispatchEvent(new Event("scroll"));
+    const pageSurface = document.querySelector(".page-surface");
+    if (!(pageSurface instanceof HTMLElement)) {
+      throw new Error("Missing page-surface container");
+    }
+    Object.defineProperty(pageSurface, "scrollHeight", {
+      configurable: true,
+      value: 3000,
+    });
+    Object.defineProperty(pageSurface, "clientHeight", {
+      configurable: true,
+      value: 900,
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
     });
 
-    const dock = await screen.findByRole("button", { name: /置底/i });
-    expect(dock).toBeInTheDocument();
+    await act(async () => {
+      scrollYValue = 450;
+      pageSurface.scrollTop = 450;
+      pageSurface.dispatchEvent(new Event("scroll"));
+      window.dispatchEvent(new Event("scroll"));
+      await Promise.resolve();
+    });
+
+    const dock = screen.getByRole("button", { name: /置底/i });
+    expect(dock).toHaveAttribute("tabindex", "0");
+    expect(dock.closest(".scroll-dock")).toHaveAttribute("aria-hidden", "false");
     expect(screen.getByText("21%")).toBeInTheDocument();
 
-    act(() => {
+    await act(async () => {
       scrollYValue = 180;
+      pageSurface.scrollTop = 180;
+      pageSurface.dispatchEvent(new Event("scroll"));
       window.dispatchEvent(new Event("scroll"));
+      await Promise.resolve();
     });
 
-    expect(await screen.findByRole("button", { name: /置顶/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /置顶/i })).toHaveAttribute("tabindex", "0");
   });
 
   it("removes the scroll dock button from the tab order after it hides", async () => {
@@ -1594,15 +1642,34 @@ describe("App dashboard interactions", () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "新游区" });
+    const pageSurface = document.querySelector(".page-surface");
+    if (!(pageSurface instanceof HTMLElement)) {
+      throw new Error("Missing page-surface container");
+    }
+    Object.defineProperty(pageSurface, "scrollHeight", {
+      configurable: true,
+      value: 3000,
+    });
+    Object.defineProperty(pageSurface, "clientHeight", {
+      configurable: true,
+      value: 900,
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     vi.useFakeTimers();
 
     const hiddenButton = screen.getByRole("button", { name: /置底/i, hidden: true });
     expect(hiddenButton).toHaveAttribute("tabindex", "-1");
     expect(hiddenButton.closest(".scroll-dock")).toHaveAttribute("aria-hidden", "true");
 
-    act(() => {
+    await act(async () => {
       scrollYValue = 450;
+      pageSurface.scrollTop = 450;
+      pageSurface.dispatchEvent(new Event("scroll"));
       window.dispatchEvent(new Event("scroll"));
+      await Promise.resolve();
     });
 
     const visibleButton = screen.getByRole("button", { name: /置底/i });

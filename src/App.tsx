@@ -41,7 +41,12 @@ import {
 } from "./pages/dashboard/DashboardPage";
 import { DetailPage } from "./pages/detail/DetailPage";
 import { FilterPage } from "./pages/filter/FilterPage";
-import { SettingsPage } from "./pages/settings/SettingsPage";
+import { OnboardingWizard } from "./pages/onboarding/OnboardingWizard";
+import {
+  defaultSettingsExpandedState,
+  SettingsPage,
+  type SettingsExpandedState,
+} from "./pages/settings/SettingsPage";
 import { UpcomingPage } from "./pages/upcoming/UpcomingPage";
 import type { LibraryFilters, ViewId, LibrarySortMode } from "./pages/types";
 import type {
@@ -75,6 +80,10 @@ type AiConversation = {
   recommendation: AiRecommendationResponse | null;
   updatedAt: number;
 };
+
+type AppMode =
+  | { type: "main" }
+  | { type: "onboarding"; source: "auto" | "settings" };
 
 function createAiConversation(id: number): AiConversation {
   return {
@@ -159,6 +168,7 @@ function setPageScrollTop(container: HTMLElement | null, top: number) {
 
 function App() {
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
+  const [appMode, setAppMode] = useState<AppMode>({ type: "main" });
   const [activeView, setActiveView] = useState<ViewId>("home");
   const [selectedGame, setSelectedGame] = useState<GameCard | null>(null);
   const [query, setQuery] = useState("");
@@ -175,9 +185,12 @@ function App() {
   const [taskToasts, setTaskToasts] = useState<TaskToastItem[]>([]);
   const [sectionPages, setSectionPages] =
     useState<DashboardSectionPageState>(DEFAULT_SECTION_PAGES);
+  const [settingsExpandedSections, setSettingsExpandedSections] =
+    useState<SettingsExpandedState>(defaultSettingsExpandedState);
   const [discoveryTaskRunning, setDiscoveryTaskRunning] = useState(false);
   const mountedRef = useRef(true);
   const dashboardRequestIdRef = useRef(0);
+  const autoOnboardingDismissedRef = useRef(false);
   const detailReturnViewRef = useRef<ViewId>("home");
   const pageSurfaceRef = useRef<HTMLElement | null>(null);
   const viewScrollPositionsRef = useRef<Partial<Record<ViewId, number>>>({});
@@ -323,6 +336,19 @@ function App() {
       ...nextPayload.hiddenGames,
     ];
     setDashboard(nextPayload);
+    setAppMode((current) => {
+      if (nextPayload.config.onboardingCompleted) {
+        autoOnboardingDismissedRef.current = false;
+        return current;
+      }
+      if (current.type === "onboarding") {
+        return current;
+      }
+      if (isTauriRuntime() && !autoOnboardingDismissedRef.current) {
+        return { type: "onboarding", source: "auto" };
+      }
+      return current;
+    });
     setSelectedGame(
       (current) =>
         latestGames.find((game) => game.appid === current?.appid) ??
@@ -537,6 +563,19 @@ function App() {
     } finally {
       setIsBusy(false);
     }
+  }
+
+  async function handleExitOnboarding(target: "app" | "settings") {
+    autoOnboardingDismissedRef.current = true;
+    await refreshDashboard();
+    if (target === "settings") {
+      setActiveView("settings");
+    }
+    setAppMode({ type: "main" });
+  }
+
+  function handleOpenOnboardingFromSettings() {
+    setAppMode({ type: "onboarding", source: "settings" });
   }
 
   function syncGameAnalysisLocally(snapshot: GameAnalysisSnapshot) {
@@ -783,6 +822,18 @@ function App() {
     );
   }
 
+  if (appMode.type === "onboarding") {
+    return (
+      <ErrorBoundary>
+        <OnboardingWizard
+          config={dashboard.config}
+          source={appMode.source}
+          onExit={handleExitOnboarding}
+        />
+      </ErrorBoundary>
+    );
+  }
+
   const showDashboardRail = ["home", "new", "classic", "browse"].includes(activeView);
 
   return (
@@ -911,6 +962,7 @@ function App() {
           <SettingsPage
             config={dashboard.config}
             isBusy={isBusy}
+            onOpenOnboarding={handleOpenOnboardingFromSettings}
             onRefreshAllAnalyses={handleRefreshAllAnalyses}
             onRetryAiAnalysisJob={handleRetryAiAnalysisJob}
             onStartClassicDiscovery={handleStartClassicDiscovery}
@@ -918,6 +970,8 @@ function App() {
             onSave={handleSaveConfig}
             onStatus={setStatus}
             onSync={handleSync}
+            expandedSections={settingsExpandedSections}
+            onExpandedSectionsChange={setSettingsExpandedSections}
             status={status}
             stats={dashboard.stats}
             aiAnalysisQueueFailures={dashboard.aiAnalysisQueueFailures}

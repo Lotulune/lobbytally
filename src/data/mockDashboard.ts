@@ -357,11 +357,17 @@ export const mockDashboard: DashboardPayload = {
   },
   config: {
     steamApiKeyConfigured: false,
+    steamApiKeyValidated: false,
     llmApiKeyConfigured: false,
+    llmConfigValidated: false,
+    llmProvider: "deepseek",
     llmBaseUrl: "https://api.deepseek.com",
     llmModel: "deepseek-v4-flash",
     country: "US",
     language: "schinese",
     aiBatchRefreshConcurrency: 5,
+    onboardingCompleted: false,
+    onboardingCurrentStep: 1,
+    onboardingLlmProviderDraft: "deepseek",
   },
 };

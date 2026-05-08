@@ -6,24 +6,62 @@ export type StoreReleaseState =
   | "tba"
   | "unknown";
 
+export type LlmProvider = "deepseek" | "openai" | "anthropic" | "custom";
+
 export interface PublicConfig {
   steamApiKeyConfigured: boolean;
+  steamApiKeyValidated: boolean;
   llmApiKeyConfigured: boolean;
+  llmConfigValidated: boolean;
+  llmProvider: LlmProvider;
   llmBaseUrl: string;
   llmModel: string;
   country: string;
   language: string;
   aiBatchRefreshConcurrency: number;
+  onboardingCompleted: boolean;
+  onboardingCurrentStep: number;
+  onboardingLlmProviderDraft: LlmProvider;
 }
 
 export interface SaveConfigRequest {
   steamApiKey?: string;
+  steamApiKeyValidated?: boolean;
+  clearSteamApiKey?: boolean;
   llmApiKey?: string;
+  llmConfigValidated?: boolean;
+  clearLlmApiKey?: boolean;
+  llmProvider?: LlmProvider;
   llmBaseUrl?: string;
   llmModel?: string;
   country?: string;
   language?: string;
   aiBatchRefreshConcurrency?: number;
+  onboardingCompleted?: boolean;
+  onboardingCurrentStep?: number;
+  onboardingLlmProviderDraft?: LlmProvider;
+}
+
+export interface ValidateSteamConfigRequest {
+  steamApiKey?: string;
+}
+
+export interface ValidateLlmConfigRequest {
+  provider: LlmProvider;
+  apiKey?: string;
+  baseUrl: string;
+  model: string;
+}
+
+export interface ConnectionValidationResult {
+  success: boolean;
+  message: string;
+  diagnostic?: string | null;
+  latencyMs?: number | null;
+  provider?: LlmProvider | null;
+  baseUrl?: string | null;
+  model?: string | null;
+  appCount?: number | null;
 }
 
 export interface DashboardPayload {

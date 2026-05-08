@@ -5,24 +5,81 @@ use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 #[serde(rename_all = "camelCase")]
 pub struct PublicConfig {
     pub steam_api_key_configured: bool,
+    pub steam_api_key_validated: bool,
     pub llm_api_key_configured: bool,
+    pub llm_config_validated: bool,
+    pub llm_provider: LlmProvider,
     pub llm_base_url: String,
     pub llm_model: String,
     pub country: String,
     pub language: String,
     pub ai_batch_refresh_concurrency: u8,
+    pub onboarding_completed: bool,
+    pub onboarding_current_step: u8,
+    pub onboarding_llm_provider_draft: LlmProvider,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveConfigRequest {
     pub steam_api_key: Option<String>,
+    pub steam_api_key_validated: Option<bool>,
+    pub clear_steam_api_key: Option<bool>,
     pub llm_api_key: Option<String>,
+    pub llm_config_validated: Option<bool>,
+    pub clear_llm_api_key: Option<bool>,
+    pub llm_provider: Option<LlmProvider>,
     pub llm_base_url: Option<String>,
     pub llm_model: Option<String>,
     pub country: Option<String>,
     pub language: Option<String>,
     pub ai_batch_refresh_concurrency: Option<u8>,
+    pub onboarding_completed: Option<bool>,
+    pub onboarding_current_step: Option<u8>,
+    pub onboarding_llm_provider_draft: Option<LlmProvider>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    Deepseek,
+    Openai,
+    Anthropic,
+    Custom,
+}
+
+impl Default for LlmProvider {
+    fn default() -> Self {
+        Self::Deepseek
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateSteamConfigRequest {
+    pub steam_api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateLlmConfigRequest {
+    pub provider: LlmProvider,
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionValidationResult {
+    pub success: bool,
+    pub message: String,
+    pub diagnostic: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub provider: Option<LlmProvider>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub app_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

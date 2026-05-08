@@ -13,6 +13,7 @@ dist-ssr
 *.local
 .tmp_app_*.json
 vite-dev*.log
+tmp_store_results.html
 =
 
 # Editor directories and files

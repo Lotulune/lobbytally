@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mockDashboard } from "../../data/mockDashboard";
 import { AboutPage } from "../about/AboutPage";
@@ -10,16 +10,119 @@ function openSettingsSection(title: string) {
   fireEvent.click(screen.getByRole("button", { name: new RegExp(title) }));
 }
 
+function renderSettingsPage(
+  props: Partial<React.ComponentProps<typeof SettingsPage>> = {},
+) {
+  const defaultProps: React.ComponentProps<typeof SettingsPage> = {
+    config: mockDashboard.config,
+    isBusy: false,
+    onOpenOnboarding: vi.fn(),
+    onRefreshAllAnalyses: vi.fn(async () => undefined),
+    onRetryAiAnalysisJob: vi.fn(async () => undefined),
+    onStartClassicDiscovery: vi.fn(async () => undefined),
+    stats: mockDashboard.stats,
+    aiAnalysisQueueFailures: mockDashboard.aiAnalysisQueueFailures,
+    onRefreshDashboard: vi.fn(async () => undefined),
+    onSave: vi.fn(async () => undefined),
+    onStatus: vi.fn(),
+    onSync: vi.fn(),
+    status: "当前库已就绪。",
+  };
+
+  return render(<SettingsPage {...defaultProps} {...props} />);
+}
+
 afterEach(() => {
   cleanup();
 });
 
 describe("Settings and About pages", () => {
-  it("shows DeepSeek defaults while advertising OpenAI and Anthropic compatibility", () => {
+  it("starts with the onboarding wizard section collapsed", () => {
+    renderSettingsPage();
+
+    expect(screen.getByRole("button", { name: /初始化向导/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByRole("button", { name: "继续初始化" })).not.toBeInTheDocument();
+  });
+
+  it("keeps manually expanded sections open across config refreshes", () => {
+    const { rerender } = renderSettingsPage();
+
+    openSettingsSection("LLM 配置");
+    expect(screen.getByRole("button", { name: /LLM 配置/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+
+    rerender(
+      <SettingsPage
+        config={{ ...mockDashboard.config }}
+        isBusy={false}
+        onOpenOnboarding={vi.fn()}
+        onRefreshAllAnalyses={vi.fn(async () => undefined)}
+        onRetryAiAnalysisJob={vi.fn(async () => undefined)}
+        onStartClassicDiscovery={vi.fn(async () => undefined)}
+        stats={mockDashboard.stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
+        onRefreshDashboard={vi.fn(async () => undefined)}
+        onSave={vi.fn(async () => undefined)}
+        onStatus={vi.fn()}
+        onSync={vi.fn()}
+        status="配置已刷新。"
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /LLM 配置/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByRole("combobox", { name: "AI 提供方" })).toBeInTheDocument();
+  });
+
+  it("restores expanded sections supplied by the app session after remounting", () => {
+    const settingsSessionExpanded = {
+      onboarding: false,
+      apiKeys: false,
+      llmConfig: false,
+      sync: false,
+      aiBatch: false,
+      discovery: false,
+    };
+    const handleExpandedChange = vi.fn((next: typeof settingsSessionExpanded) => {
+      Object.assign(settingsSessionExpanded, next);
+    });
+    const firstRender = renderSettingsPage({
+      expandedSections: settingsSessionExpanded,
+      onExpandedSectionsChange: handleExpandedChange,
+    });
+
+    openSettingsSection("数据同步");
+    expect(handleExpandedChange).toHaveBeenLastCalledWith({
+      ...settingsSessionExpanded,
+      sync: true,
+    });
+
+    firstRender.unmount();
+    renderSettingsPage({
+      expandedSections: settingsSessionExpanded,
+      onExpandedSectionsChange: handleExpandedChange,
+    });
+
+    expect(screen.getByRole("button", { name: /数据同步/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: "完整同步" })).toBeInTheDocument();
+  });
+
+  it("shows DeepSeek defaults while supporting provider switching and onboarding entry", () => {
     render(
       <SettingsPage
         config={mockDashboard.config}
         isBusy={false}
+        onOpenOnboarding={vi.fn()}
         onRefreshAllAnalyses={vi.fn(async () => undefined)}
         onRetryAiAnalysisJob={vi.fn(async () => undefined)}
         onStartClassicDiscovery={vi.fn(async () => undefined)}
@@ -33,13 +136,107 @@ describe("Settings and About pages", () => {
       />,
     );
 
-    openSettingsSection("API 密钥");
+    openSettingsSection("LLM 配置");
+    openSettingsSection("初始化向导");
 
-    expect(
-      screen.getByPlaceholderText("输入 DeepSeek / OpenAI / Anthropic API Key"),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续初始化" })).toBeInTheDocument();
+    expect(screen.getByText("默认提供方")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "AI 提供方" })).toHaveValue("deepseek");
+    expect(screen.getByRole("combobox", { name: "AI 提供方" })).toHaveDisplayValue("DeepSeek");
     expect(screen.getByDisplayValue("https://api.deepseek.com")).toBeInTheDocument();
     expect(screen.getByDisplayValue("deepseek-v4-flash")).toBeInTheDocument();
+  });
+
+  it("allows testing saved credentials without entering replacement keys", async () => {
+    const onStatus = vi.fn();
+    const config = {
+      ...mockDashboard.config,
+      steamApiKeyConfigured: true,
+      steamApiKeyValidated: false,
+      llmApiKeyConfigured: true,
+      llmConfigValidated: false,
+    };
+
+    render(
+      <SettingsPage
+        config={config}
+        isBusy={false}
+        onOpenOnboarding={vi.fn()}
+        onRefreshAllAnalyses={vi.fn(async () => undefined)}
+        onRetryAiAnalysisJob={vi.fn(async () => undefined)}
+        onStartClassicDiscovery={vi.fn(async () => undefined)}
+        stats={mockDashboard.stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
+        onRefreshDashboard={vi.fn(async () => undefined)}
+        onSave={vi.fn(async () => undefined)}
+        onStatus={onStatus}
+        onSync={vi.fn()}
+        status="当前库已就绪。"
+      />,
+    );
+
+    openSettingsSection("初始化向导");
+
+    const steamTestButton = screen.getByRole("button", { name: "测试 Steam 连接" });
+    const aiTestButton = screen.getByRole("button", { name: "测试 AI 连接" });
+    expect(steamTestButton).toBeEnabled();
+    expect(aiTestButton).toBeEnabled();
+
+    fireEvent.click(steamTestButton);
+    await waitFor(() => {
+      expect(onStatus).toHaveBeenCalledWith("浏览器预览模式：已模拟 Steam 连接成功。");
+    });
+
+    fireEvent.click(aiTestButton);
+    await waitFor(() => {
+      expect(onStatus).toHaveBeenCalledWith("浏览器预览模式：已模拟 AI 连接成功。");
+    });
+  });
+
+  it("keeps a newly entered AI key when saving after provider switching", async () => {
+    const onSave = vi.fn(async () => undefined);
+
+    render(
+      <SettingsPage
+        config={{
+          ...mockDashboard.config,
+          llmApiKeyConfigured: true,
+        }}
+        isBusy={false}
+        onOpenOnboarding={vi.fn()}
+        onRefreshAllAnalyses={vi.fn(async () => undefined)}
+        onRetryAiAnalysisJob={vi.fn(async () => undefined)}
+        onStartClassicDiscovery={vi.fn(async () => undefined)}
+        stats={mockDashboard.stats}
+        aiAnalysisQueueFailures={mockDashboard.aiAnalysisQueueFailures}
+        onRefreshDashboard={vi.fn(async () => undefined)}
+        onSave={onSave}
+        onStatus={vi.fn()}
+        onSync={vi.fn()}
+        status="当前库已就绪。"
+      />,
+    );
+
+    openSettingsSection("API 密钥");
+    openSettingsSection("LLM 配置");
+
+    fireEvent.change(screen.getByRole("combobox", { name: "AI 提供方" }), {
+      target: { value: "openai" },
+    });
+    fireEvent.change(screen.getByLabelText("OpenAI API Key"), {
+      target: { value: "openai-test-key" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+
+    await waitFor(() => {
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          llmProvider: "openai",
+          llmApiKey: "openai-test-key",
+          clearLlmApiKey: undefined,
+        }),
+      );
+    });
   });
 
   it("shows both sync and discovery operations in settings", () => {
@@ -51,6 +248,7 @@ describe("Settings and About pages", () => {
       <SettingsPage
         config={mockDashboard.config}
         isBusy={false}
+        onOpenOnboarding={vi.fn()}
         onRefreshAllAnalyses={onRefreshAllAnalyses}
         onRetryAiAnalysisJob={vi.fn(async () => undefined)}
         onStartClassicDiscovery={onStartClassicDiscovery}
@@ -97,6 +295,7 @@ describe("Settings and About pages", () => {
       <SettingsPage
         config={mockDashboard.config}
         isBusy={false}
+        onOpenOnboarding={vi.fn()}
         onRefreshAllAnalyses={onRefreshAllAnalyses}
         onRetryAiAnalysisJob={vi.fn(async () => undefined)}
         onStartClassicDiscovery={vi.fn(async () => undefined)}
@@ -139,6 +338,7 @@ describe("Settings and About pages", () => {
       <SettingsPage
         config={mockDashboard.config}
         isBusy={false}
+        onOpenOnboarding={vi.fn()}
         onRefreshAllAnalyses={vi.fn(async () => undefined)}
         onRetryAiAnalysisJob={vi.fn(async () => undefined)}
         onStartClassicDiscovery={vi.fn(async () => undefined)}
@@ -167,6 +367,7 @@ describe("Settings and About pages", () => {
       <SettingsPage
         config={mockDashboard.config}
         isBusy={false}
+        onOpenOnboarding={vi.fn()}
         onRefreshAllAnalyses={vi.fn(async () => undefined)}
         onRetryAiAnalysisJob={onRetryAiAnalysisJob}
         onStartClassicDiscovery={vi.fn(async () => undefined)}
@@ -181,10 +382,9 @@ describe("Settings and About pages", () => {
     );
 
     openSettingsSection("AI 批量重算");
-    fireEvent.click(screen.getByRole("button", { name: "重试" }));
-
     expect(screen.getByText(/待人工处理失败项：1/)).toBeInTheDocument();
     expect(screen.getByText(/AppID 548430/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
     expect(onRetryAiAnalysisJob).toHaveBeenCalledWith(548430);
   });
 
@@ -195,6 +395,7 @@ describe("Settings and About pages", () => {
       <SettingsPage
         config={mockDashboard.config}
         isBusy={false}
+        onOpenOnboarding={vi.fn()}
         onRefreshAllAnalyses={vi.fn(async () => undefined)}
         onRetryAiAnalysisJob={vi.fn(async () => undefined)}
         onStartClassicDiscovery={onStartClassicDiscovery}

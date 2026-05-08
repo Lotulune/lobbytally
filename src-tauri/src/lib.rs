@@ -53,6 +53,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_dashboard,
             commands::save_config,
+            commands::validate_steam_config,
+            commands::validate_llm_config,
             commands::sync_seed_games,
             commands::discover_steam_games,
             commands::assess_game_with_ai,

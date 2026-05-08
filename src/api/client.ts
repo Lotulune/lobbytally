@@ -13,6 +13,7 @@ import type {
   AnalysisReviewEvidenceItem,
   AnalysisReviewStance,
   AnalysisSource,
+  ConnectionValidationResult,
   DashboardPayload,
   DiscoveryRunSnapshot,
   DiscoveryTaskRequest,
@@ -20,6 +21,7 @@ import type {
   GameCard,
   ClassicDiscoveryRunSnapshot,
   ClassicDiscoveryTaskRequest,
+  LlmProvider,
   PublicConfig,
   SaveConfigRequest,
   SteamDiscoveryReport,
@@ -30,6 +32,8 @@ import type {
   UserCollections,
   UserGameState,
   UserGameStatePatch,
+  ValidateLlmConfigRequest,
+  ValidateSteamConfigRequest,
 } from "../types";
 
 export const isTauriRuntime = () =>
@@ -215,14 +219,41 @@ export async function saveConfig(
   request: SaveConfigRequest,
 ): Promise<PublicConfig> {
   if (!isTauriRuntime()) {
+    const nextProvider = request.llmProvider ?? mockDashboard.config.llmProvider;
+    const steamConfigured =
+      request.clearSteamApiKey
+        ? false
+        : request.steamApiKey !== undefined
+          ? Boolean(request.steamApiKey.trim())
+          : mockDashboard.config.steamApiKeyConfigured;
+    const llmConfigured =
+      request.clearLlmApiKey
+        ? false
+        : request.llmApiKey !== undefined
+          ? Boolean(request.llmApiKey.trim())
+          : mockDashboard.config.llmApiKeyConfigured;
+    const steamValidated =
+      request.steamApiKeyValidated ??
+      (request.steamApiKey !== undefined || request.clearSteamApiKey
+        ? false
+        : mockDashboard.config.steamApiKeyValidated);
+    const llmValidated =
+      request.llmConfigValidated ??
+      (request.llmApiKey !== undefined ||
+      request.clearLlmApiKey ||
+      request.llmProvider !== undefined ||
+      request.llmBaseUrl !== undefined ||
+      request.llmModel !== undefined
+        ? false
+        : mockDashboard.config.llmConfigValidated);
+
     return {
       ...mockDashboard.config,
-      steamApiKeyConfigured:
-        Boolean(request.steamApiKey?.trim()) ||
-        mockDashboard.config.steamApiKeyConfigured,
-      llmApiKeyConfigured:
-        Boolean(request.llmApiKey?.trim()) ||
-        mockDashboard.config.llmApiKeyConfigured,
+      steamApiKeyConfigured: steamConfigured,
+      steamApiKeyValidated: steamValidated,
+      llmApiKeyConfigured: llmConfigured,
+      llmConfigValidated: llmValidated,
+      llmProvider: nextProvider,
       llmBaseUrl: request.llmBaseUrl || mockDashboard.config.llmBaseUrl,
       llmModel: request.llmModel || mockDashboard.config.llmModel,
       country: request.country || mockDashboard.config.country,
@@ -230,9 +261,57 @@ export async function saveConfig(
       aiBatchRefreshConcurrency:
         clampBatchRefreshConcurrency(request.aiBatchRefreshConcurrency) ??
         mockDashboard.config.aiBatchRefreshConcurrency,
+      onboardingCompleted:
+        request.onboardingCompleted ?? mockDashboard.config.onboardingCompleted,
+      onboardingCurrentStep:
+        request.onboardingCurrentStep ?? mockDashboard.config.onboardingCurrentStep,
+      onboardingLlmProviderDraft:
+        request.onboardingLlmProviderDraft ?? mockDashboard.config.onboardingLlmProviderDraft,
     };
   }
   return invoke<PublicConfig>("save_config", { request });
+}
+
+export async function validateSteamConfig(
+  request: ValidateSteamConfigRequest,
+): Promise<ConnectionValidationResult> {
+  if (!isTauriRuntime()) {
+    if (request.steamApiKey !== undefined && !request.steamApiKey.trim()) {
+      throw new Error("请先输入 Steam Web API Key。");
+    }
+
+    return {
+      success: true,
+      message: "浏览器预览模式：已模拟 Steam 连接成功。",
+      diagnostic: "预览模式不会真正请求 Steam。",
+      latencyMs: 120,
+      appCount: 5,
+    };
+  }
+
+  return invoke<ConnectionValidationResult>("validate_steam_config", { request });
+}
+
+export async function validateLlmConfig(
+  request: ValidateLlmConfigRequest,
+): Promise<ConnectionValidationResult> {
+  if (!isTauriRuntime()) {
+    if (request.apiKey !== undefined && !request.apiKey.trim()) {
+      throw new Error("请先输入 API Key。");
+    }
+
+    return {
+      success: true,
+      message: "浏览器预览模式：已模拟 AI 连接成功。",
+      diagnostic: "预览模式不会真正调用模型。",
+      latencyMs: 180,
+      provider: request.provider,
+      baseUrl: request.baseUrl,
+      model: request.model,
+    };
+  }
+
+  return invoke<ConnectionValidationResult>("validate_llm_config", { request });
 }
 
 export async function syncSeedGames(mode: SyncMode = "full"): Promise<SyncReport> {
@@ -354,6 +433,34 @@ function clampBatchRefreshConcurrency(value?: number): number | undefined {
   }
 
   return Math.min(10, Math.max(1, Math.round(value)));
+}
+
+export function getDefaultLlmBaseUrl(provider: LlmProvider): string {
+  switch (provider) {
+    case "openai":
+      return "https://api.openai.com/v1";
+    case "anthropic":
+      return "https://api.anthropic.com";
+    case "custom":
+      return "https://api.deepseek.com";
+    case "deepseek":
+    default:
+      return "https://api.deepseek.com";
+  }
+}
+
+export function getDefaultLlmModel(provider: LlmProvider): string {
+  switch (provider) {
+    case "openai":
+      return "gpt-4.1";
+    case "anthropic":
+      return "claude-sonnet-4-20250514";
+    case "custom":
+      return "deepseek-v4-flash";
+    case "deepseek":
+    default:
+      return "deepseek-v4-flash";
+  }
 }
 
 export async function getGameAnalysis(

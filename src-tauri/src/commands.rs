@@ -14,15 +14,17 @@ use crate::llm::{self, LlmRuntimeConfig};
 use crate::models::{
     AiAnalysisQueueSource, AiAssessment, AiBatchRefreshReport, AiRecommendationRequest,
     AiRecommendationResponse, ClassicDiscoveryRunSnapshot, ClassicDiscoveryTaskRequest,
-    DashboardPayload, DiscoveryRunSnapshot, DiscoveryRunStatus, DiscoveryTaskRequest,
-    GameAnalysisReport, PublicConfig, SaveConfigRequest, SyncMode, SyncReport, SyncRequest,
-    UserCollections, UserGameState, UserGameStatePatch,
+    ConnectionValidationResult, DashboardPayload, DiscoveryRunSnapshot, DiscoveryRunStatus,
+    DiscoveryTaskRequest, GameAnalysisReport, PublicConfig, SaveConfigRequest,
+    SyncMode, SyncReport, SyncRequest, UserCollections, UserGameState, UserGameStatePatch,
+    ValidateLlmConfigRequest, ValidateSteamConfigRequest,
 };
 use crate::recommendation::{bucket_game, ReleaseBucket};
 use crate::state::AppState;
 use crate::steam::{self, SteamGameSnapshot};
 use crate::sync_task;
 use std::collections::HashSet;
+use std::time::Instant;
 use tauri::{AppHandle, Manager, State};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -129,38 +131,85 @@ pub fn save_config(
 ) -> Result<PublicConfig, String> {
     let conn = state.db.lock().map_err(|err| err.to_string())?;
 
-    if let Some(value) = request
-        .steam_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        db::set_config(&conn, "steam_api_key", value).map_err(to_command_error)?;
+    let saved_config = db::public_config(&conn).map_err(to_command_error)?;
+    let mut steam_validation_invalidated = false;
+    let mut llm_validation_invalidated = false;
+
+    if request.clear_steam_api_key.unwrap_or(false) {
+        if saved_config.steam_api_key_configured {
+            db::delete_config(&conn, "steam_api_key").map_err(to_command_error)?;
+            steam_validation_invalidated = true;
+        }
+    } else if let Some(raw_value) = request.steam_api_key.as_deref() {
+        let next_value = raw_value.trim();
+        let current_value = db::get_secret(&conn, "steam_api_key").map_err(to_command_error)?;
+        if next_value.is_empty() {
+            if current_value.is_some() {
+                db::delete_config(&conn, "steam_api_key").map_err(to_command_error)?;
+                steam_validation_invalidated = true;
+            }
+        } else {
+            if current_value.as_deref() != Some(next_value) {
+                steam_validation_invalidated = true;
+            }
+            db::set_config(&conn, "steam_api_key", next_value).map_err(to_command_error)?;
+        }
     }
-    if let Some(value) = request
-        .llm_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        db::set_config(&conn, "llm_api_key", value).map_err(to_command_error)?;
+
+    let requested_provider = request.llm_provider.unwrap_or(saved_config.llm_provider);
+    if requested_provider != saved_config.llm_provider {
+        db::set_config(
+            &conn,
+            "llm_provider",
+            db::llm_provider_config_value(requested_provider),
+        )
+        .map_err(to_command_error)?;
+        llm_validation_invalidated = true;
     }
-    if let Some(value) = request
-        .llm_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        db::set_config(&conn, "llm_base_url", value).map_err(to_command_error)?;
+
+    if request.clear_llm_api_key.unwrap_or(false) {
+        if saved_config.llm_api_key_configured {
+            db::delete_config(&conn, "llm_api_key").map_err(to_command_error)?;
+            llm_validation_invalidated = true;
+        }
+    } else if let Some(raw_value) = request.llm_api_key.as_deref() {
+        let next_value = raw_value.trim();
+        let current_value = db::get_secret(&conn, "llm_api_key").map_err(to_command_error)?;
+        if next_value.is_empty() {
+            if current_value.is_some() {
+                db::delete_config(&conn, "llm_api_key").map_err(to_command_error)?;
+                llm_validation_invalidated = true;
+            }
+        } else {
+            if current_value.as_deref() != Some(next_value) {
+                llm_validation_invalidated = true;
+            }
+            db::set_config(&conn, "llm_api_key", next_value).map_err(to_command_error)?;
+        }
     }
-    if let Some(value) = request
-        .llm_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        db::set_config(&conn, "llm_model", value).map_err(to_command_error)?;
+
+    if let Some(raw_value) = request.llm_base_url.as_deref() {
+        let next_value = raw_value.trim();
+        let current_value = saved_config.llm_base_url.trim();
+        if !next_value.is_empty() {
+            if current_value != next_value {
+                llm_validation_invalidated = true;
+            }
+            db::set_config(&conn, "llm_base_url", next_value).map_err(to_command_error)?;
+        }
     }
+
+    if let Some(raw_value) = request.llm_model.as_deref() {
+        let next_value = raw_value.trim();
+        let current_value = saved_config.llm_model.trim();
+        if !next_value.is_empty() {
+            if current_value != next_value {
+                llm_validation_invalidated = true;
+            }
+            db::set_config(&conn, "llm_model", next_value).map_err(to_command_error)?;
+        }
+    }
+
     if let Some(value) = request
         .country
         .as_deref()
@@ -186,7 +235,140 @@ pub fn save_config(
         .map_err(to_command_error)?;
     }
 
+    if let Some(value) = request.onboarding_completed {
+        db::set_bool_config(&conn, "onboarding_completed", value).map_err(to_command_error)?;
+    }
+
+    if let Some(value) = request.onboarding_current_step {
+        db::set_config(&conn, "onboarding_current_step", &value.clamp(1, 5).to_string())
+            .map_err(to_command_error)?;
+    }
+
+    if let Some(value) = request.onboarding_llm_provider_draft {
+        db::set_config(
+            &conn,
+            "onboarding_llm_provider_draft",
+            db::llm_provider_config_value(value),
+        )
+        .map_err(to_command_error)?;
+    }
+
+    if steam_validation_invalidated {
+        db::set_bool_config(&conn, "steam_api_key_validated", false).map_err(to_command_error)?;
+    } else if let Some(validated) = request.steam_api_key_validated {
+        db::set_bool_config(&conn, "steam_api_key_validated", validated)
+            .map_err(to_command_error)?;
+    }
+
+    if llm_validation_invalidated {
+        db::set_bool_config(&conn, "llm_config_validated", false).map_err(to_command_error)?;
+    } else if let Some(validated) = request.llm_config_validated {
+        db::set_bool_config(&conn, "llm_config_validated", validated)
+            .map_err(to_command_error)?;
+    }
+
     db::public_config(&conn).map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn validate_steam_config(
+    state: State<'_, AppState>,
+    request: ValidateSteamConfigRequest,
+) -> Result<ConnectionValidationResult, String> {
+    let api_key = {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
+        resolve_validation_api_key(
+            &conn,
+            request.steam_api_key.as_deref(),
+            "steam_api_key",
+            "请先输入 Steam Web API Key。",
+        )?
+    };
+
+    let started_at = Instant::now();
+    let preview = steam::fetch_app_list_preview(&state.http, &api_key, 5, None)
+        .await
+        .map_err(to_command_error)?;
+    let latency_ms = started_at.elapsed().as_millis().try_into().ok();
+
+    Ok(ConnectionValidationResult {
+        success: true,
+        message: "Steam 连接测试成功，可以继续保存。".to_string(),
+        diagnostic: preview.last_appid.map(|last_appid| {
+            format!(
+                "已成功读取 Steam AppList 预览，last_appid={}，have_more_results={}。",
+                last_appid,
+                preview.have_more_results.unwrap_or(false)
+            )
+        }),
+        latency_ms,
+        provider: None,
+        base_url: None,
+        model: None,
+        app_count: Some(preview.apps.len()),
+    })
+}
+
+#[tauri::command]
+pub async fn validate_llm_config(
+    state: State<'_, AppState>,
+    request: ValidateLlmConfigRequest,
+) -> Result<ConnectionValidationResult, String> {
+    let api_key = {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
+        resolve_validation_api_key(
+            &conn,
+            request.api_key.as_deref(),
+            "llm_api_key",
+            "请先输入 API Key。",
+        )?
+    };
+    let base_url = request.base_url.trim().to_string();
+    let model = request.model.trim().to_string();
+    if base_url.is_empty() {
+        return Err("请先填写 Base URL。".to_string());
+    }
+    if model.is_empty() {
+        return Err("请先填写模型名称。".to_string());
+    }
+
+    let config = LlmRuntimeConfig {
+        api_key: Some(api_key),
+        base_url: base_url.clone(),
+        model: model.clone(),
+    };
+
+    let started_at = Instant::now();
+    llm::validate_runtime_config(&state.http, &config)
+        .await
+        .map_err(to_command_error)?;
+    let latency_ms = started_at.elapsed().as_millis().try_into().ok();
+
+    Ok(ConnectionValidationResult {
+        success: true,
+        message: "AI 连接测试成功，可以继续保存。".to_string(),
+        diagnostic: Some("已完成最小模型调用探测。".to_string()),
+        latency_ms,
+        provider: Some(request.provider),
+        base_url: Some(base_url),
+        model: Some(model),
+        app_count: None,
+    })
+}
+
+fn resolve_validation_api_key(
+    conn: &rusqlite::Connection,
+    draft_key: Option<&str>,
+    config_key: &str,
+    missing_message: &str,
+) -> Result<String, String> {
+    if let Some(value) = draft_key.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(value.to_string());
+    }
+
+    db::get_secret(conn, config_key)
+        .map_err(to_command_error)?
+        .ok_or_else(|| missing_message.to_string())
 }
 
 #[tauri::command]
@@ -1186,12 +1368,13 @@ fn running_ai_batch_refresh_report(
 }
 
 fn load_llm_runtime_config(conn: &rusqlite::Connection) -> anyhow::Result<LlmRuntimeConfig> {
+    let provider = db::load_llm_provider(conn)?;
     Ok(LlmRuntimeConfig {
         api_key: db::get_secret(conn, "llm_api_key")?,
         base_url: db::get_config(conn, "llm_base_url")?
-            .unwrap_or_else(|| "https://api.deepseek.com".to_string()),
+            .unwrap_or_else(|| db::default_llm_base_url(provider).to_string()),
         model: db::get_config(conn, "llm_model")?
-            .unwrap_or_else(|| "deepseek-v4-flash".to_string()),
+            .unwrap_or_else(|| db::default_llm_model(provider).to_string()),
     })
 }
 
@@ -1212,8 +1395,8 @@ mod tests {
         enqueue_full_refresh_ai_jobs, generate_assessment_from_report_pipeline,
         generate_or_load_game_analysis, load_cached_game_analysis, merge_snapshot,
         recommend_games_pipeline, refresh_all_game_analyses_pipeline,
-        resolve_manual_classic_discovery_start_offset, start_ai_batch_refresh_runtime,
-        visible_ai_batch_refresh_concurrency,
+        resolve_manual_classic_discovery_start_offset, resolve_validation_api_key,
+        start_ai_batch_refresh_runtime, visible_ai_batch_refresh_concurrency,
     };
     use crate::backfill_task::BackfillRuntimeState;
     use crate::db;
@@ -1235,6 +1418,52 @@ mod tests {
     use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn validation_api_key_prefers_non_empty_draft() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        db::migrate(&conn).expect("migrate");
+        db::set_config(&conn, "steam_api_key", "saved-key").expect("seed saved key");
+
+        let resolved = resolve_validation_api_key(
+            &conn,
+            Some("  draft-key  "),
+            "steam_api_key",
+            "missing key",
+        )
+        .expect("resolve draft key");
+
+        assert_eq!(resolved, "draft-key");
+    }
+
+    #[test]
+    fn validation_api_key_uses_saved_secret_when_draft_is_empty() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        db::migrate(&conn).expect("migrate");
+        db::set_config(&conn, "llm_api_key", "saved-llm-key").expect("seed saved key");
+
+        let missing_draft =
+            resolve_validation_api_key(&conn, None, "llm_api_key", "missing key")
+                .expect("resolve saved key without draft");
+        let empty_draft =
+            resolve_validation_api_key(&conn, Some("   "), "llm_api_key", "missing key")
+                .expect("resolve saved key with empty draft");
+
+        assert_eq!(missing_draft, "saved-llm-key");
+        assert_eq!(empty_draft, "saved-llm-key");
+    }
+
+    #[test]
+    fn validation_api_key_reports_missing_when_no_draft_or_saved_secret_exists() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        db::migrate(&conn).expect("migrate");
+
+        let error =
+            resolve_validation_api_key(&conn, Some(""), "steam_api_key", "missing key")
+                .expect_err("missing key should fail");
+
+        assert_eq!(error, "missing key");
+    }
 
     fn seeded_state() -> AppState {
         let conn = Connection::open_in_memory().expect("open in-memory db");

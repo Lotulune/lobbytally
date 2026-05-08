@@ -5,8 +5,9 @@ use crate::models::{
     AiAnalysisQueueFailureItem, AiAnalysisQueueSource, ClassicDiscoveryRejectCacheEntry,
     ClassicDiscoveryRunSnapshot, ClassicRejectReasonCode, DashboardPayload, DashboardStats,
     DiscoveryCompletionReason, DiscoveryFailureItem, DiscoveryRunSnapshot, DiscoveryRunStatus,
-    DiscoveryTaskRequest, GameAnalysisReport, GameCard, PublicConfig, ReviewSnippet,
-    StoreReleaseState, SyncMode, UserCollections, UserGameState, UserGameStatePatch,
+    DiscoveryTaskRequest, GameAnalysisReport, GameCard, LlmProvider, PublicConfig,
+    ReviewSnippet, StoreReleaseState, SyncMode, UserCollections, UserGameState,
+    UserGameStatePatch,
 };
 use crate::recommendation::{
     bucket_game, compute_recommendation_score, today_iso_utc, DemoStatus, GameFacts, ReleaseBucket,
@@ -17,8 +18,19 @@ use std::collections::HashSet;
 use std::path::Path;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com";
-const DEFAULT_LLM_MODEL: &str = "deepseek-v4-flash";
+pub const DEFAULT_LLM_PROVIDER: LlmProvider = LlmProvider::Deepseek;
+pub const DEFAULT_LLM_BASE_URL: &str = "https://api.deepseek.com";
+pub const DEFAULT_LLM_MODEL: &str = "deepseek-v4-flash";
+pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4.1";
+pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-20250514";
+const STEAM_API_KEY_VALIDATED_CONFIG_KEY: &str = "steam_api_key_validated";
+const LLM_CONFIG_VALIDATED_CONFIG_KEY: &str = "llm_config_validated";
+const LLM_PROVIDER_CONFIG_KEY: &str = "llm_provider";
+const ONBOARDING_COMPLETED_CONFIG_KEY: &str = "onboarding_completed";
+const ONBOARDING_CURRENT_STEP_CONFIG_KEY: &str = "onboarding_current_step";
+const ONBOARDING_LLM_PROVIDER_DRAFT_CONFIG_KEY: &str = "onboarding_llm_provider_draft";
 const MAX_SQLITE_U32: i64 = u32::MAX as i64;
 pub const DEFAULT_AI_BATCH_REFRESH_CONCURRENCY: u8 = 5;
 pub const MIN_AI_BATCH_REFRESH_CONCURRENCY: u8 = 1;
@@ -346,6 +358,20 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     set_config_if_missing(conn, "llm_base_url", DEFAULT_LLM_BASE_URL)?;
     set_config_if_missing(conn, "llm_model", DEFAULT_LLM_MODEL)?;
+    set_config_if_missing(
+        conn,
+        LLM_PROVIDER_CONFIG_KEY,
+        llm_provider_config_value(DEFAULT_LLM_PROVIDER),
+    )?;
+    set_config_if_missing(conn, STEAM_API_KEY_VALIDATED_CONFIG_KEY, "false")?;
+    set_config_if_missing(conn, LLM_CONFIG_VALIDATED_CONFIG_KEY, "false")?;
+    set_config_if_missing(conn, ONBOARDING_COMPLETED_CONFIG_KEY, "false")?;
+    set_config_if_missing(conn, ONBOARDING_CURRENT_STEP_CONFIG_KEY, "1")?;
+    set_config_if_missing(
+        conn,
+        ONBOARDING_LLM_PROVIDER_DRAFT_CONFIG_KEY,
+        llm_provider_config_value(DEFAULT_LLM_PROVIDER),
+    )?;
     set_config_if_missing(conn, "country", "US")?;
     set_config_if_missing(conn, "language", "schinese")?;
     set_config_if_missing(
@@ -1720,15 +1746,31 @@ pub fn list_ai_analysis_queue_failures(
 }
 
 pub fn public_config(conn: &Connection) -> Result<PublicConfig> {
+    let llm_provider = load_llm_provider(conn)?;
+    let llm_provider_draft = load_onboarding_llm_provider_draft(conn)?;
     Ok(PublicConfig {
         steam_api_key_configured: get_secret(conn, "steam_api_key")?.is_some(),
+        steam_api_key_validated: get_bool_config(conn, STEAM_API_KEY_VALIDATED_CONFIG_KEY)?
+            .unwrap_or(false),
         llm_api_key_configured: get_secret(conn, "llm_api_key")?.is_some(),
+        llm_config_validated: get_bool_config(conn, LLM_CONFIG_VALIDATED_CONFIG_KEY)?
+            .unwrap_or(false),
+        llm_provider,
         llm_base_url: get_config(conn, "llm_base_url")?
-            .unwrap_or_else(|| DEFAULT_LLM_BASE_URL.to_string()),
-        llm_model: get_config(conn, "llm_model")?.unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string()),
+            .unwrap_or_else(|| default_llm_base_url(llm_provider).to_string()),
+        llm_model: get_config(conn, "llm_model")?
+            .unwrap_or_else(|| default_llm_model(llm_provider).to_string()),
         country: get_config(conn, "country")?.unwrap_or_else(|| "US".to_string()),
         language: get_config(conn, "language")?.unwrap_or_else(|| "schinese".to_string()),
         ai_batch_refresh_concurrency: load_ai_batch_refresh_concurrency(conn)?,
+        onboarding_completed: get_bool_config(conn, ONBOARDING_COMPLETED_CONFIG_KEY)?
+            .unwrap_or(false),
+        onboarding_current_step: get_config(conn, ONBOARDING_CURRENT_STEP_CONFIG_KEY)?
+            .as_deref()
+            .and_then(|value| value.trim().parse::<u8>().ok())
+            .map(|value| value.clamp(1, 5))
+            .unwrap_or(1),
+        onboarding_llm_provider_draft: llm_provider_draft,
     })
 }
 
@@ -1755,12 +1797,21 @@ pub fn set_config(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn delete_config(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM app_config WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 pub fn set_config_if_missing(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO app_config (key, value) VALUES (?1, ?2)",
         params![key, value],
     )?;
     Ok(())
+}
+
+pub fn set_bool_config(conn: &Connection, key: &str, value: bool) -> Result<()> {
+    set_config(conn, key, if value { "true" } else { "false" })
 }
 
 pub fn get_config(conn: &Connection, key: &str) -> Result<Option<String>> {
@@ -1773,8 +1824,68 @@ pub fn get_config(conn: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+pub fn get_bool_config(conn: &Connection, key: &str) -> Result<Option<bool>> {
+    Ok(get_config(conn, key)?.map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }))
+}
+
 pub fn get_secret(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(get_config(conn, key)?.filter(|value| !value.trim().is_empty()))
+}
+
+pub fn default_llm_base_url(provider: LlmProvider) -> &'static str {
+    match provider {
+        LlmProvider::Deepseek => DEFAULT_LLM_BASE_URL,
+        LlmProvider::Openai => DEFAULT_OPENAI_BASE_URL,
+        LlmProvider::Anthropic => DEFAULT_ANTHROPIC_BASE_URL,
+        LlmProvider::Custom => DEFAULT_LLM_BASE_URL,
+    }
+}
+
+pub fn default_llm_model(provider: LlmProvider) -> &'static str {
+    match provider {
+        LlmProvider::Deepseek => DEFAULT_LLM_MODEL,
+        LlmProvider::Openai => DEFAULT_OPENAI_MODEL,
+        LlmProvider::Anthropic => DEFAULT_ANTHROPIC_MODEL,
+        LlmProvider::Custom => DEFAULT_LLM_MODEL,
+    }
+}
+
+pub fn load_llm_provider(conn: &Connection) -> Result<LlmProvider> {
+    Ok(get_config(conn, LLM_PROVIDER_CONFIG_KEY)?
+        .as_deref()
+        .and_then(parse_llm_provider_config_value)
+        .unwrap_or(DEFAULT_LLM_PROVIDER))
+}
+
+pub fn load_onboarding_llm_provider_draft(conn: &Connection) -> Result<LlmProvider> {
+    Ok(get_config(conn, ONBOARDING_LLM_PROVIDER_DRAFT_CONFIG_KEY)?
+        .as_deref()
+        .and_then(parse_llm_provider_config_value)
+        .unwrap_or_else(|| load_llm_provider(conn).unwrap_or(DEFAULT_LLM_PROVIDER)))
+}
+
+pub fn llm_provider_config_value(provider: LlmProvider) -> &'static str {
+    match provider {
+        LlmProvider::Deepseek => "deepseek",
+        LlmProvider::Openai => "openai",
+        LlmProvider::Anthropic => "anthropic",
+        LlmProvider::Custom => "custom",
+    }
+}
+
+pub fn parse_llm_provider_config_value(value: &str) -> Option<LlmProvider> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "deepseek" => Some(LlmProvider::Deepseek),
+        "openai" => Some(LlmProvider::Openai),
+        "anthropic" => Some(LlmProvider::Anthropic),
+        "custom" => Some(LlmProvider::Custom),
+        _ => None,
+    }
 }
 
 pub fn facts_from_card(card: &GameCard) -> GameFacts {
@@ -3275,6 +3386,12 @@ mod tests {
             .expect("serialize public config");
 
         assert_eq!(config["aiBatchRefreshConcurrency"], 5);
+        assert_eq!(config["llmProvider"], "deepseek");
+        assert_eq!(config["steamApiKeyValidated"], false);
+        assert_eq!(config["llmConfigValidated"], false);
+        assert_eq!(config["onboardingCompleted"], false);
+        assert_eq!(config["onboardingCurrentStep"], 1);
+        assert_eq!(config["onboardingLlmProviderDraft"], "deepseek");
         assert_eq!(
             get_config(&conn, "ai_batch_refresh_concurrency").expect("load concurrency config"),
             Some("5".to_string())

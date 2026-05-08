@@ -1,18 +1,34 @@
-import { useState } from "react";
-import { previewSteamAppList } from "../../api/client";
+import { useEffect, useMemo, useState } from "react";
+import {
+  getDefaultLlmBaseUrl,
+  getDefaultLlmModel,
+  previewSteamAppList,
+  validateLlmConfig,
+  validateSteamConfig,
+} from "../../api/client";
 import { DiscoveryTaskPanel } from "../../features/discovery/DiscoveryTaskPanel";
 import type {
   AiAnalysisQueueFailureItem,
+  ConnectionValidationResult,
   DashboardPayload,
+  LlmProvider,
   SaveConfigRequest,
   SyncMode,
   SteamAppListPreview,
 } from "../../types";
 
-type SectionKey = "apiKeys" | "llmConfig" | "sync" | "aiBatch" | "discovery";
+export type SettingsSectionKey =
+  | "onboarding"
+  | "apiKeys"
+  | "llmConfig"
+  | "sync"
+  | "aiBatch"
+  | "discovery";
+export type SettingsExpandedState = Record<SettingsSectionKey, boolean>;
 const DEFAULT_CLASSIC_DISCOVERY_MAX_PAGES = 3;
 
-let globalExpandedState: Record<SectionKey, boolean> = {
+export const defaultSettingsExpandedState: SettingsExpandedState = {
+  onboarding: false,
   apiKeys: false,
   llmConfig: false,
   sync: false,
@@ -55,6 +71,7 @@ function SettingsSection({
 export function SettingsPage({
   config,
   isBusy,
+  onOpenOnboarding,
   onRefreshAllAnalyses,
   onRetryAiAnalysisJob,
   onStartClassicDiscovery,
@@ -65,9 +82,12 @@ export function SettingsPage({
   onStatus,
   onSave,
   onSync,
+  expandedSections,
+  onExpandedSectionsChange,
 }: {
   config: DashboardPayload["config"];
   isBusy: boolean;
+  onOpenOnboarding: () => void;
   onRefreshAllAnalyses: (concurrency: number) => Promise<void>;
   onRetryAiAnalysisJob: (appid: number) => Promise<void>;
   onStartClassicDiscovery: (maxPages: number) => Promise<void>;
@@ -78,28 +98,74 @@ export function SettingsPage({
   onStatus: (message: string) => void;
   onSave: (request: SaveConfigRequest) => Promise<void>;
   onSync: (mode: SyncMode) => void;
+  expandedSections?: SettingsExpandedState;
+  onExpandedSectionsChange?: (expanded: SettingsExpandedState) => void;
 }) {
-  const [form, setForm] = useState<SaveConfigRequest>({
-    llmBaseUrl: config.llmBaseUrl,
-    llmModel: config.llmModel,
-    country: config.country,
-    language: config.language,
-    aiBatchRefreshConcurrency: config.aiBatchRefreshConcurrency,
-  });
+  const [form, setForm] = useState<SaveConfigRequest>(() => buildFormFromConfig(config));
   const [preview, setPreview] = useState<SteamAppListPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [isPreviewing, setIsPreviewing] = useState(false);
+  const [isTestingSteam, setIsTestingSteam] = useState(false);
+  const [isTestingLlm, setIsTestingLlm] = useState(false);
+  const [steamValidation, setSteamValidation] = useState<ConnectionValidationResult | null>(
+    config.steamApiKeyValidated
+      ? {
+          success: true,
+          message: "当前已保存的 Steam Key 最近一次测试成功。",
+        }
+      : null,
+  );
+  const [llmValidation, setLlmValidation] = useState<ConnectionValidationResult | null>(
+    config.llmConfigValidated
+      ? {
+          success: true,
+          message: "当前已保存的 AI 配置最近一次测试成功。",
+          provider: config.llmProvider,
+          baseUrl: config.llmBaseUrl,
+          model: config.llmModel,
+        }
+      : null,
+  );
   const [classicDiscoveryMaxPages, setClassicDiscoveryMaxPages] = useState(
     DEFAULT_CLASSIC_DISCOVERY_MAX_PAGES,
   );
-  const [expanded, setExpanded] = useState<Record<SectionKey, boolean>>(globalExpandedState);
+  const [localExpanded, setLocalExpanded] = useState<SettingsExpandedState>(
+    defaultSettingsExpandedState,
+  );
+  const expanded = expandedSections ?? localExpanded;
 
-  const toggle = (key: SectionKey) =>
-    setExpanded((prev) => {
-      const next = { ...prev, [key]: !prev[key] };
-      globalExpandedState = next;
-      return next;
-    });
+  useEffect(() => {
+    setForm(buildFormFromConfig(config));
+    setSteamValidation(
+      config.steamApiKeyValidated
+        ? {
+            success: true,
+            message: "当前已保存的 Steam Key 最近一次测试成功。",
+          }
+        : null,
+    );
+    setLlmValidation(
+      config.llmConfigValidated
+        ? {
+            success: true,
+            message: "当前已保存的 AI 配置最近一次测试成功。",
+            provider: config.llmProvider,
+            baseUrl: config.llmBaseUrl,
+            model: config.llmModel,
+          }
+        : null,
+    );
+  }, [config]);
+
+  const toggle = (key: SettingsSectionKey) => {
+    const nextExpanded = { ...expanded, [key]: !expanded[key] };
+    if (onExpandedSectionsChange) {
+      onExpandedSectionsChange(nextExpanded);
+      return;
+    }
+
+    setLocalExpanded(nextExpanded);
+  };
 
   const hasSyncResume = !stats.syncRunning && stats.syncPendingCount > 0;
   const hasSyncActivity =
@@ -128,6 +194,27 @@ export function SettingsPage({
   const classicDiscoveryActionMaxPages = clampClassicDiscoveryMaxPages(
     classicDiscoveryMaxPages,
   );
+  const steamStatus = describeCredentialStatus(
+    config.steamApiKeyConfigured,
+    config.steamApiKeyValidated,
+  );
+  const llmStatus = describeCredentialStatus(
+    config.llmApiKeyConfigured,
+    config.llmConfigValidated,
+  );
+  const llmProvider = form.llmProvider ?? config.llmProvider;
+  const showAdvanced = llmProvider === "custom";
+  const steamDraftKey = form.steamApiKey?.trim() ?? "";
+  const canTestSteam = Boolean(steamDraftKey || config.steamApiKeyConfigured);
+  const llmDraftKey = form.llmApiKey?.trim() ?? "";
+  const llmProviderChanged = llmProvider !== config.llmProvider;
+  const canUseSavedLlmKey = config.llmApiKeyConfigured && !llmProviderChanged && !form.clearLlmApiKey;
+  const canTestLlm = Boolean(llmDraftKey || canUseSavedLlmKey);
+
+  const onboardingSummary = useMemo(() => {
+    const readyCount = Number(config.steamApiKeyValidated) + Number(config.llmConfigValidated);
+    return config.onboardingCompleted ? "已完成" : `${readyCount}/2 已验证`;
+  }, [config]);
 
   async function handlePreviewSteamApps() {
     setIsPreviewing(true);
@@ -141,32 +228,173 @@ export function SettingsPage({
     }
   }
 
-  const apiKeyStatus = [
-    config.steamApiKeyConfigured ? "Steam" : "",
-    config.llmApiKeyConfigured ? "LLM" : "",
-  ]
-    .filter(Boolean)
-    .join(" + ");
+  async function handleValidateSteamDraft() {
+    const draft = form.steamApiKey?.trim();
+    if (!draft && !config.steamApiKeyConfigured) {
+      onStatus("请先输入当前要测试的 Steam Web API Key。");
+      return;
+    }
+
+    setIsTestingSteam(true);
+    try {
+      const result = await validateSteamConfig({ steamApiKey: draft || undefined });
+      setSteamValidation(result);
+      onStatus(result.message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setSteamValidation({
+        success: false,
+        message,
+        diagnostic: "可以先保存，再回来继续测试。",
+      });
+      onStatus(message);
+    } finally {
+      setIsTestingSteam(false);
+    }
+  }
+
+  async function handleValidateLlmDraft() {
+    const draftKey = form.llmApiKey?.trim();
+    const draftBaseUrl = (form.llmBaseUrl ?? config.llmBaseUrl).trim();
+    const draftModel = (form.llmModel ?? config.llmModel).trim();
+    if (!draftKey && !canUseSavedLlmKey) {
+      onStatus("请先输入当前要测试的 AI API Key。");
+      return;
+    }
+
+    setIsTestingLlm(true);
+    try {
+      const result = await validateLlmConfig({
+        provider: llmProvider,
+        apiKey: draftKey || undefined,
+        baseUrl: draftBaseUrl,
+        model: draftModel,
+      });
+      setLlmValidation(result);
+      onStatus(result.message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLlmValidation({
+        success: false,
+        message,
+        diagnostic: "可以先保存，再回来继续测试。",
+        provider: llmProvider,
+        baseUrl: draftBaseUrl,
+        model: draftModel,
+      });
+      onStatus(message);
+    } finally {
+      setIsTestingLlm(false);
+    }
+  }
+
+  async function handleSaveAll() {
+    const nextRequest: SaveConfigRequest = {
+      ...form,
+      clearLlmApiKey:
+        form.clearLlmApiKey && !form.llmApiKey?.trim() ? true : undefined,
+      steamApiKeyValidated:
+        form.steamApiKey?.trim() || steamValidation?.success === false
+          ? Boolean(steamValidation?.success)
+          : undefined,
+      llmConfigValidated:
+        form.llmApiKey?.trim() ||
+        llmProvider !== config.llmProvider ||
+        (form.llmBaseUrl ?? config.llmBaseUrl) !== config.llmBaseUrl ||
+        (form.llmModel ?? config.llmModel) !== config.llmModel
+          ? Boolean(llmValidation?.success)
+          : undefined,
+    };
+
+    await onSave(nextRequest);
+    setForm(buildFormFromConfig({ ...config, ...nextRequest } as DashboardPayload["config"]));
+  }
+
+  function handleProviderChange(provider: LlmProvider) {
+    setForm((current) => ({
+      ...current,
+      llmProvider: provider,
+      llmApiKey: "",
+      llmBaseUrl: getDefaultLlmBaseUrl(provider),
+      llmModel: getDefaultLlmModel(provider),
+      clearLlmApiKey: config.llmApiKeyConfigured,
+    }));
+    setLlmValidation(null);
+  }
 
   return (
     <section className="settings-page">
       <h2>设置</h2>
 
-      {/* API 密钥 */}
+      <SettingsSection
+        title="初始化向导"
+        status={onboardingSummary}
+        expanded={expanded.onboarding}
+        onToggle={() => toggle("onboarding")}
+      >
+        <p className="settings-card-desc">
+          首次引导会带你完成 Steam 与 AI 配置。你可以随时从这里继续初始化或重新打开整个向导。
+        </p>
+        <div className="settings-copy-block settings-copy-block-muted">
+          <div className="backfill-status-grid">
+            <div>
+              <span>Steam</span>
+              <strong>{steamStatus}</strong>
+            </div>
+            <div>
+              <span>AI</span>
+              <strong>{llmStatus}</strong>
+            </div>
+            <div>
+              <span>下次进入步骤</span>
+              <strong>{config.onboardingCurrentStep}</strong>
+            </div>
+            <div>
+              <span>默认提供方</span>
+              <strong>{providerLabel(config.onboardingLlmProviderDraft)}</strong>
+            </div>
+          </div>
+        </div>
+        <div className="settings-card-actions">
+          <button className="gold-button" type="button" onClick={onOpenOnboarding}>
+            {config.onboardingCompleted ? "重新打开向导" : "继续初始化"}
+          </button>
+          <button
+            className="ghost-button"
+            type="button"
+            disabled={!canTestSteam || isTestingSteam}
+            onClick={() => void handleValidateSteamDraft()}
+          >
+            {isTestingSteam ? "Steam 测试中…" : "测试 Steam 连接"}
+          </button>
+          <button
+            className="ghost-button"
+            type="button"
+            disabled={!canTestLlm || isTestingLlm}
+            onClick={() => void handleValidateLlmDraft()}
+          >
+            {isTestingLlm ? "AI 测试中…" : "测试 AI 连接"}
+          </button>
+        </div>
+      </SettingsSection>
+
       <SettingsSection
         title="API 密钥"
-        status={apiKeyStatus || "未配置"}
+        status={`${steamStatus} / ${llmStatus}`}
         expanded={expanded.apiKeys}
         onToggle={() => toggle("apiKeys")}
       >
         <p className="settings-card-desc">
-          Steam Key 用于同步应用列表与数据；LLM Key 用于 AI 分析文案增强。
+          Steam Key 用于同步应用列表与数据；AI Key 用于推荐、摘要和分析增强。保存不等于验证成功，验证状态会单独记录。
         </p>
         <div className="settings-form-stack">
           <label>
             Steam Web API Key
             <input
-              onChange={(event) => setForm({ ...form, steamApiKey: event.currentTarget.value })}
+              onChange={(event) => {
+                setForm({ ...form, steamApiKey: event.currentTarget.value });
+                setSteamValidation(null);
+              }}
               placeholder={
                 config.steamApiKeyConfigured ? "已配置，输入新值可覆盖" : "输入 Steam Web API Key"
               }
@@ -174,51 +402,52 @@ export function SettingsPage({
             />
           </label>
           <label>
-            LLM API Key
+            {providerLabel(llmProvider)} API Key
             <input
-              onChange={(event) => setForm({ ...form, llmApiKey: event.currentTarget.value })}
+              value={form.llmApiKey ?? ""}
+              onChange={(event) => {
+                setForm({
+                  ...form,
+                  llmApiKey: event.currentTarget.value,
+                  clearLlmApiKey: undefined,
+                });
+                setLlmValidation(null);
+              }}
               placeholder={
-                config.llmApiKeyConfigured
-                  ? "已配置，输入新值可覆盖"
-                  : "输入 DeepSeek / OpenAI / Anthropic API Key"
+                config.llmApiKeyConfigured ? "已配置，输入新值可覆盖" : "输入 API Key"
               }
               type="password"
             />
           </label>
         </div>
         <p className="settings-hint">
-          Steam Key 与 LLM Key 仅保存在本机 SQLite，不会上传至任何服务器。
+          Steam Key 与 AI Key 仅保存在本机 SQLite，不会上传至任何服务器。
         </p>
+        <ValidationBlock title="Steam 验证结果" result={steamValidation} />
+        <ValidationBlock title="AI 验证结果" result={llmValidation} />
       </SettingsSection>
 
-      {/* LLM 配置 */}
       <SettingsSection
         title="LLM 配置"
-        status={form.llmModel || config.llmModel || "未设置"}
+        status={`${providerLabel(llmProvider)} / ${llmStatus}`}
         expanded={expanded.llmConfig}
         onToggle={() => toggle("llmConfig")}
       >
         <p className="settings-card-desc">
-          默认提供方是 DeepSeek，同时兼容 OpenAI 的 <code>chat/completions</code> 和 Anthropic 的 <code>messages</code> 格式。
+          默认提供方是 DeepSeek。切换提供方时会同步覆盖 Base URL / 模型，并清空旧 API Key，等待你重新输入和验证。
         </p>
         <div className="settings-grid">
           <label>
-            LLM Base URL
-            <input
-              value={form.llmBaseUrl ?? ""}
-              onChange={(event) =>
-                setForm({ ...form, llmBaseUrl: event.currentTarget.value })
-              }
-            />
-          </label>
-          <label>
-            模型
-            <input
-              value={form.llmModel ?? ""}
-              onChange={(event) =>
-                setForm({ ...form, llmModel: event.currentTarget.value })
-              }
-            />
+            AI 提供方
+            <select
+              value={llmProvider}
+              onChange={(event) => handleProviderChange(event.currentTarget.value as LlmProvider)}
+            >
+              <option value="deepseek">DeepSeek</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="custom">Custom</option>
+            </select>
           </label>
           <label>
             地区
@@ -239,32 +468,68 @@ export function SettingsPage({
             />
           </label>
         </div>
+        <div className="settings-form-stack">
+          <label>
+            Base URL
+            <input
+              value={form.llmBaseUrl ?? ""}
+              onChange={(event) => {
+                setForm({ ...form, llmBaseUrl: event.currentTarget.value });
+                setLlmValidation(null);
+              }}
+            />
+          </label>
+          <label>
+            模型
+            <input
+              value={form.llmModel ?? ""}
+              onChange={(event) => {
+                setForm({ ...form, llmModel: event.currentTarget.value });
+                setLlmValidation(null);
+              }}
+            />
+          </label>
+        </div>
+        {!showAdvanced ? (
+          <p className="settings-hint">
+            当前是标准提供方，通常只需要填写 API Key。如果你要改高级参数，也可以直接在这里覆盖。
+          </p>
+        ) : null}
         <div className="settings-copy-block settings-copy-block-muted">
-          <p className="settings-hint">常见 Base URL 示例：</p>
+          <p className="settings-hint">常见默认值：</p>
           <ul className="settings-provider-list">
             <li>
-              <span>DeepSeek OpenAI 兼容</span>
+              <span>DeepSeek</span>
               <code>https://api.deepseek.com</code>
-              <code>https://api.deepseek.com/v1</code>
+              <code>deepseek-v4-flash</code>
             </li>
             <li>
-              <span>DeepSeek Anthropic 兼容</span>
-              <code>https://api.deepseek.com/anthropic</code>
+              <span>OpenAI</span>
+              <code>https://api.openai.com/v1</code>
+              <code>gpt-4.1</code>
             </li>
             <li>
-              <span>官方 Anthropic</span>
+              <span>Anthropic</span>
               <code>https://api.anthropic.com</code>
+              <code>claude-sonnet-4-20250514</code>
             </li>
           </ul>
         </div>
         <div className="settings-card-actions">
-          <button className="gold-button" disabled={isBusy} type="button" onClick={() => onSave(form)}>
+          <button className="gold-button" disabled={isBusy} type="button" onClick={() => void handleSaveAll()}>
             保存设置
+          </button>
+          <button
+            className="ghost-button"
+            disabled={!canTestLlm || isTestingLlm}
+            type="button"
+            onClick={() => void handleValidateLlmDraft()}
+          >
+            {isTestingLlm ? "AI 测试中…" : "测试当前草稿"}
           </button>
         </div>
       </SettingsSection>
 
-      {/* 数据同步 */}
       <SettingsSection
         title="数据同步"
         status={syncStatusLabel}
@@ -294,7 +559,7 @@ export function SettingsPage({
           <button
             className="muted-button"
             type="button"
-            onClick={handlePreviewSteamApps}
+            onClick={() => void handlePreviewSteamApps()}
             disabled={isPreviewing || isBusy}
           >
             {isPreviewing ? "读取中…" : "预览 Steam AppList"}
@@ -345,8 +610,8 @@ export function SettingsPage({
                   : hasSyncResume
                     ? `队列中仍有 ${formatNumber(stats.syncPendingCount)} 个游戏待续同步。`
                     : stats.syncFailedCount > 0
-                    ? `同步已结束，但最近一次失败发生在 AppID ${stats.syncLastErrorAppid ?? "无"}。`
-                    : "本轮同步已完成。"}
+                      ? `同步已结束，但最近一次失败发生在 AppID ${stats.syncLastErrorAppid ?? "无"}。`
+                      : "本轮同步已完成。"}
               </p>
               {stats.syncLastError ? <p className="settings-error">{stats.syncLastError}</p> : null}
             </>
@@ -375,7 +640,6 @@ export function SettingsPage({
         )}
       </SettingsSection>
 
-      {/* AI 批量重算 */}
       <SettingsSection
         title="AI 批量重算"
         status={aiBatchRefreshStatusLabel}
@@ -504,7 +768,6 @@ export function SettingsPage({
         </div>
       </SettingsSection>
 
-      {/* 发现任务 */}
       <SettingsSection
         title="发现任务"
         status={stats.backfillRunning ? "新游补全中" : classicDiscoveryStatusLabel}
@@ -587,6 +850,62 @@ export function SettingsPage({
       <p className="mini-status">{status}</p>
     </section>
   );
+}
+
+function ValidationBlock({
+  title,
+  result,
+}: {
+  title: string;
+  result: ConnectionValidationResult | null;
+}) {
+  if (!result) {
+    return null;
+  }
+
+  return (
+    <div className="settings-copy-block settings-copy-block-muted">
+      <strong>{title}</strong>
+      <p className={result.success ? "mini-status" : "settings-error"}>{result.message}</p>
+      {result.diagnostic ? <p className="mini-status">{result.diagnostic}</p> : null}
+      <div className="settings-provider-list">
+        {typeof result.latencyMs === "number" ? <span>延迟 {result.latencyMs}ms</span> : null}
+        {typeof result.appCount === "number" ? <span>预览 {result.appCount} 条</span> : null}
+        {result.model ? <span>模型 {result.model}</span> : null}
+      </div>
+    </div>
+  );
+}
+
+function buildFormFromConfig(config: DashboardPayload["config"]): SaveConfigRequest {
+  return {
+    llmProvider: config.llmProvider,
+    llmBaseUrl: config.llmBaseUrl,
+    llmModel: config.llmModel,
+    country: config.country,
+    language: config.language,
+    aiBatchRefreshConcurrency: config.aiBatchRefreshConcurrency,
+  };
+}
+
+function providerLabel(provider: LlmProvider) {
+  switch (provider) {
+    case "openai":
+      return "OpenAI";
+    case "anthropic":
+      return "Anthropic";
+    case "custom":
+      return "Custom";
+    case "deepseek":
+    default:
+      return "DeepSeek";
+  }
+}
+
+function describeCredentialStatus(configured: boolean, validated: boolean) {
+  if (validated) return "已保存 / 已验证";
+  if (configured) return "已保存 / 未验证";
+  return "未配置";
 }
 
 function formatNumber(value?: number | null) {
