@@ -46,6 +46,13 @@ fn public_fixture_app() -> axum::Router {
     ))
 }
 
+fn public_unavailable_app() -> axum::Router {
+    build_router_with_state(AppState::new(
+        test_config().service_info(),
+        DatabaseHealth::Unavailable,
+    ))
+}
+
 async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
     let response = public_empty_app()
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -168,6 +175,19 @@ async fn game_detail_and_analysis_return_not_found_for_missing_public_game() {
         analysis_value["error"]["code"],
         "public_game_analysis_not_found"
     );
+}
+
+#[tokio::test]
+async fn unavailable_database_returns_public_catalog_unavailable_not_safe_mode() {
+    let response = get_response_from(public_unavailable_app(), "/api/v1/discovery-home").await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(value["error"]["code"], "public_catalog_unavailable");
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use mpgs_server::{ConfigError, ServerConfig};
+use mpgs_server::{ConfigError, ServerConfig, StartupConfig};
 
 fn env(values: &[(&str, &str)]) -> HashMap<String, String> {
     values
@@ -113,4 +113,25 @@ fn server_config_rejects_invalid_bind_address() {
 
     assert!(matches!(error, ConfigError::InvalidBindAddr(_)));
     assert!(error.to_string().contains("MPGS_SERVER_BIND"));
+}
+
+#[test]
+fn startup_config_enters_safe_mode_when_active_config_is_missing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = StartupConfig::from_env_vars(env(&[(
+        "MPGS_CONFIG_DIR",
+        temp_dir.path().to_str().unwrap(),
+    )]))
+    .unwrap();
+
+    let StartupConfig::SafeMode {
+        bind_addr,
+        service_info,
+    } = config
+    else {
+        panic!("missing active config should enter safe mode");
+    };
+
+    assert_eq!(bind_addr, SocketAddr::from(([127, 0, 0, 1], 4310)));
+    assert_eq!(service_info.service_name, "MPGS Public Discovery Service");
 }

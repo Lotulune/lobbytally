@@ -10,7 +10,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-pub use config::{ConfigError, ConfigHealth, ServerConfig};
+pub use config::{ConfigError, ConfigHealth, ServerConfig, StartupConfig};
 use health::{HealthResponse, HealthStatus};
 use mpgs_core::models::{PublicCatalogStatus, ServiceCapability, ServiceInfo};
 use public_catalog::{
@@ -85,6 +85,14 @@ impl AppState {
             config_health,
         }
     }
+
+    pub fn safe_mode(config: ServiceInfoConfig) -> Self {
+        Self {
+            service_info: config.service_info_with_catalog_status(PublicCatalogStatus::Unavailable),
+            database_health: DatabaseHealth::SafeMode,
+            config_health: ConfigHealth::HealthyForTest,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -98,6 +106,7 @@ pub enum DatabaseHealth {
         detail: Option<PublicGameDetail>,
         analysis: Option<PublicGameAnalysis>,
     },
+    SafeMode,
     Unavailable,
 }
 
@@ -105,9 +114,13 @@ impl DatabaseHealth {
     async fn is_healthy(&self) -> bool {
         match self {
             Self::Pool(pool) => db::migration_health_check(pool).await.unwrap_or(false),
-            Self::HealthyForTest | Self::PublicCatalogFixture { .. } => true,
+            Self::HealthyForTest | Self::PublicCatalogFixture { .. } | Self::SafeMode => true,
             Self::Unavailable => false,
         }
+    }
+
+    fn is_safe_mode(&self) -> bool {
+        matches!(self, Self::SafeMode)
     }
 }
 
@@ -161,6 +174,9 @@ async fn discovery_home(State(state): State<AppState>, headers: HeaderMap) -> Re
     {
         Ok(etag) => etag,
         Err(error) => {
+            if state.database_health.is_safe_mode() {
+                return safe_mode_error_response();
+            }
             return service_error_response(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "public_catalog_unavailable",
@@ -175,6 +191,7 @@ async fn discovery_home(State(state): State<AppState>, headers: HeaderMap) -> Re
 
     match state.database_health.discovery_home().await {
         Ok(payload) => json_with_etag(payload, etag),
+        Err(error) if state.database_health.is_safe_mode() => safe_mode_error_response(),
         Err(error) => service_error_response(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "public_catalog_unavailable",
@@ -207,6 +224,9 @@ async fn games(
     {
         Ok(etag) => etag,
         Err(error) => {
+            if state.database_health.is_safe_mode() {
+                return safe_mode_error_response();
+            }
             return service_error_response(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "public_catalog_unavailable",
@@ -221,6 +241,7 @@ async fn games(
 
     match state.database_health.public_games_page(limit, offset).await {
         Ok(payload) => json_with_etag(payload, etag),
+        Err(error) if state.database_health.is_safe_mode() => safe_mode_error_response(),
         Err(error) => service_error_response(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "public_catalog_unavailable",
@@ -262,6 +283,7 @@ async fn game_detail(
             "public_game_not_found",
             "公开游戏不存在。",
         ),
+        Err(error) if state.database_health.is_safe_mode() => safe_mode_error_response(),
         Err(error) => service_error_response(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "public_catalog_unavailable",
@@ -303,6 +325,7 @@ async fn game_analysis(
             "public_game_analysis_not_found",
             "公开游戏分析不存在。",
         ),
+        Err(error) if state.database_health.is_safe_mode() => safe_mode_error_response(),
         Err(error) => service_error_response(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "public_catalog_unavailable",
@@ -340,6 +363,7 @@ impl DatabaseHealth {
             Self::Pool(pool) => db::public_catalog_revision(pool).await,
             Self::HealthyForTest => Ok(0),
             Self::PublicCatalogFixture { revision, .. } => Ok(*revision),
+            Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -377,6 +401,7 @@ impl DatabaseHealth {
                     },
                 })
             }
+            Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -405,6 +430,7 @@ impl DatabaseHealth {
                     },
                 })
             }
+            Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -419,6 +445,7 @@ impl DatabaseHealth {
             Self::PublicCatalogFixture { detail, .. } => Ok(detail
                 .clone()
                 .filter(|detail| detail.game.appid == appid)),
+            Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -433,6 +460,7 @@ impl DatabaseHealth {
             Self::PublicCatalogFixture { analysis, .. } => {
                 Ok(analysis.clone().filter(|analysis| analysis.appid == appid))
             }
+            Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -444,6 +472,14 @@ fn service_error_response(
     message: &'static str,
 ) -> Response {
     (status, Json(ServiceErrorEnvelope::new(code, message))).into_response()
+}
+
+fn safe_mode_error_response() -> Response {
+    service_error_response(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "service_safe_mode",
+        "服务处于安全修复模式。",
+    )
 }
 
 fn json_with_etag<T>(payload: T, etag: String) -> Response

@@ -16,6 +16,15 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone)]
+pub enum StartupConfig {
+    Ready(ServerConfig),
+    SafeMode {
+        bind_addr: SocketAddr,
+        service_info: ServiceInfoConfig,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub enum ConfigHealth {
     #[doc(hidden)]
     HealthyForTest,
@@ -141,6 +150,59 @@ impl ServerConfig {
             database_url: secrets_config.database.url,
             service_info,
             config_health: ConfigHealth::active_files(service_path, secrets_path),
+        })
+    }
+}
+
+impl StartupConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_env_vars(std::env::vars())
+    }
+
+    pub fn from_env_vars(
+        vars: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, ConfigError> {
+        let vars: HashMap<String, String> = vars.into_iter().collect();
+        if vars.contains_key("MPGS_CONFIG_DIR") {
+            return match ServerConfig::from_env_vars(vars.clone()) {
+                Ok(config) => Ok(Self::Ready(config)),
+                Err(ConfigError::UnreadableActiveConfig { .. })
+                | Err(ConfigError::InvalidActiveConfigToml { .. }) => {
+                    Ok(Self::safe_mode_from_env_vars(&vars)?)
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        ServerConfig::from_env_vars(vars).map(Self::Ready)
+    }
+
+    fn safe_mode_from_env_vars(vars: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        let bind_addr = vars
+            .get("MPGS_SERVER_BIND")
+            .map(String::as_str)
+            .unwrap_or("127.0.0.1:4310")
+            .parse()
+            .map_err(ConfigError::InvalidBindAddr)?;
+
+        let service_info = ServiceInfoConfig {
+            service_instance_id: vars
+                .get("MPGS_SERVICE_INSTANCE_ID")
+                .cloned()
+                .unwrap_or_else(|| "018fb770-8998-7699-a6e4-b7b59f2f9c01".to_string()),
+            service_name: vars
+                .get("MPGS_SERVICE_NAME")
+                .cloned()
+                .unwrap_or_else(|| "MPGS Public Discovery Service".to_string()),
+            service_version: vars
+                .get("MPGS_SERVICE_VERSION")
+                .cloned()
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
+        };
+
+        Ok(Self::SafeMode {
+            bind_addr,
+            service_info,
         })
     }
 }
