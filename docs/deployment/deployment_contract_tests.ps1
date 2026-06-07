@@ -7,6 +7,7 @@ $caddyCompose = Get-Content -Raw -Path (Join-Path $root "deploy\compose.caddy.ym
 $caddyfile = Get-Content -Raw -Path (Join-Path $root "deploy\Caddyfile")
 $dockerfile = Get-Content -Raw -Path (Join-Path $root "Dockerfile.mpgs-server")
 $deploymentDoc = Get-Content -Raw -Path (Join-Path $root "docs\deployment\mpgs-server-compose.md")
+$serviceConfigExample = Get-Content -Raw -Path (Join-Path $root "deploy\config\active\service.toml")
 $secretsExample = Get-Content -Raw -Path (Join-Path $root "deploy\config\active\secrets.toml.example")
 $setupExample = Get-Content -Raw -Path (Join-Path $root "deploy\config\setup.toml.example")
 $localBuildScript = Get-Content -Raw -Path (Join-Path $root "deploy\scripts\build-mpgs-server-image.ps1")
@@ -44,6 +45,12 @@ if ($deploymentDoc -notmatch 'Do not build on the VPS' -or $deploymentDoc -notma
 }
 if ($deploymentDoc -notmatch 'active/service.toml' -or $deploymentDoc -notmatch 'active/secrets.toml') {
     throw "deployment docs must describe the active TOML config files."
+}
+if ($serviceConfigExample -notmatch '\[service_connection\]' -or $serviceConfigExample -notmatch 'public_base_url') {
+    throw "active service config example must include the public service connection URL."
+}
+if ($deploymentDoc -notmatch 'service_connection\.public_base_url' -or $deploymentDoc -notmatch 'connection-share API') {
+    throw "deployment docs must describe the public base URL used for keyless connection sharing."
 }
 if ($deploymentDoc -notmatch 'only locates the config directory') {
     throw "deployment docs must state that .env only locates config, not service secrets."

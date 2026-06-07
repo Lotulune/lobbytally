@@ -119,6 +119,56 @@
         }
       }
     },
+    "/api/v1/admin/connection-share": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "admin_connection_share",
+        "responses": {
+          "200": {
+            "description": "Keyless service connection file for client import",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceConnectionFileResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin session required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Request rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Connection share unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/admin/diagnostics": {
       "get": {
         "tags": [
@@ -1091,6 +1141,40 @@
         "enum": [
           "public_catalog_read"
         ]
+      },
+      "ServiceConnectionFileResponse": {
+        "type": "object",
+        "required": [
+          "serviceName",
+          "serviceInstanceId",
+          "apiVersion",
+          "baseUrl",
+          "serviceInfoUrl",
+          "capabilities"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "baseUrl": {
+            "type": "string"
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServiceCapability"
+            }
+          },
+          "serviceInfoUrl": {
+            "type": "string"
+          },
+          "serviceInstanceId": {
+            "type": "string"
+          },
+          "serviceName": {
+            "type": "string"
+          }
+        }
       },
       "ServiceErrorBody": {
         "type": "object",

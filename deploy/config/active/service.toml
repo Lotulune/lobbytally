@@ -4,3 +4,6 @@ bind_addr = "0.0.0.0:4310"
 instance_id = "018fb770-8998-7699-a6e4-b7b59f2f9c01"
 name = "MPGS Public Discovery Service"
 version = "0.1.0"
+
+[service_connection]
+public_base_url = "https://mpgs.example.com"

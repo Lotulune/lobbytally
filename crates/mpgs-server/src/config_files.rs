@@ -1,4 +1,5 @@
 use crate::admin::hash_token;
+use mpgs_core::models::ServiceCapability;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -32,16 +33,34 @@ pub struct PendingConfigResponse {
     pub restart_required: bool,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceConnectionFileResponse {
+    pub service_name: String,
+    pub service_instance_id: String,
+    pub api_version: String,
+    pub base_url: String,
+    pub service_info_url: String,
+    pub capabilities: Vec<ServiceCapability>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ActiveServiceConfig {
     bind_addr: Option<String>,
     service_identity: ActiveServiceIdentityConfig,
+    service_connection: Option<ActiveServiceConnectionConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ActiveServiceIdentityConfig {
     instance_id: String,
+    name: String,
     version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActiveServiceConnectionConfig {
+    public_base_url: String,
 }
 
 impl ConfigFileManager {
@@ -92,11 +111,45 @@ version = "{version}"
                     .unwrap_or(env!("CARGO_PKG_VERSION"))
             )
         );
+        let service_toml =
+            if let Some(service_connection) = active_service.service_connection.as_ref() {
+                format!(
+                    r#"{service_toml}
+[service_connection]
+public_base_url = "{public_base_url}"
+"#,
+                    public_base_url = escape_toml_string(normalize_public_base_url(
+                        &service_connection.public_base_url
+                    ))
+                )
+            } else {
+                service_toml
+            };
         atomic_write(&pending_service_path(&self.config_dir), &service_toml)?;
 
         Ok(PendingConfigResponse {
             pending_config_version: hash_token(&service_toml),
             restart_required: true,
+        })
+    }
+
+    pub fn service_connection_file(&self) -> io::Result<ServiceConnectionFileResponse> {
+        let active_service = read_service_config(&active_service_path(&self.config_dir))?;
+        let Some(service_connection) = active_service.service_connection.as_ref() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "service_connection.public_base_url is not configured",
+            ));
+        };
+        let base_url = normalize_public_base_url(&service_connection.public_base_url).to_string();
+
+        Ok(ServiceConnectionFileResponse {
+            service_name: active_service.service_identity.name,
+            service_instance_id: active_service.service_identity.instance_id,
+            api_version: "v1".to_string(),
+            service_info_url: format!("{base_url}/api/v1/service-info"),
+            base_url,
+            capabilities: vec![ServiceCapability::PublicCatalogRead],
         })
     }
 
@@ -151,4 +204,8 @@ fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
 
 fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn normalize_public_base_url(value: &str) -> &str {
+    value.trim().trim_end_matches('/')
 }

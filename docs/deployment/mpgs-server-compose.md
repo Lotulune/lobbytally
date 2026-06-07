@@ -83,6 +83,15 @@ Edit:
 - `deploy/config/active/service.toml` for non-sensitive service identity and bind settings.
 - `deploy/config/active/secrets.toml` for the Postgres URL, admin token hash, session secret, and future server-side secrets.
 
+Set `service_connection.public_base_url` in `deploy/config/active/service.toml` to the HTTPS address clients should import or type. With the Caddy profile this is usually:
+
+```toml
+[service_connection]
+public_base_url = "https://mpgs.example.com"
+```
+
+The admin connection-share API uses this value to generate a keyless service connection file. It does not infer the public URL from request headers and it must not include setup or admin tokens.
+
 For the default Compose network, `deploy/config/active/secrets.toml` should use:
 
 ```toml

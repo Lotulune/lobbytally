@@ -49,6 +49,7 @@ fn openapi_includes_service_info_route() {
     assert!(value["paths"]["/api/v1/admin/overview"]["get"].is_object());
     assert!(value["paths"]["/api/v1/admin/diagnostics"]["get"].is_object());
     assert!(value["paths"]["/api/v1/admin/config-state"]["get"].is_object());
+    assert!(value["paths"]["/api/v1/admin/connection-share"]["get"].is_object());
     assert!(value["paths"]["/api/v1/admin/config/pending/service-identity"]["post"].is_object());
     assert!(value["paths"]["/api/v1/admin/restart"]["post"].is_object());
     assert!(value["paths"]["/api/v1/setup/status"]["get"].is_object());

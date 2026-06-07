@@ -22,6 +22,7 @@ use axum::{
 pub use config::{ConfigError, ConfigHealth, ServerConfig, StartupConfig};
 use config_files::{
     ConfigFileManager, ConfigStateResponse, PendingConfigResponse, PendingServiceIdentityRequest,
+    ServiceConnectionFileResponse,
 };
 use health::{HealthResponse, HealthStatus};
 use mpgs_core::models::{PublicCatalogStatus, ServiceCapability, ServiceInfo};
@@ -311,6 +312,10 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .route("/api/v1/admin/overview", get(admin_overview))
         .route("/api/v1/admin/diagnostics", get(admin_diagnostics))
         .route("/api/v1/admin/config-state", get(admin_config_state))
+        .route(
+            "/api/v1/admin/connection-share",
+            get(admin_connection_share),
+        )
         .route(
             "/api/v1/admin/config/pending/service-identity",
             post(admin_pending_service_identity),
@@ -691,6 +696,44 @@ async fn admin_config_state(State(state): State<AppState>, headers: HeaderMap) -
             StatusCode::SERVICE_UNAVAILABLE,
             "config_state_unavailable",
             "配置状态暂不可用。",
+        ),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/connection-share",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Keyless service connection file for client import", body = ServiceConnectionFileResponse),
+        (status = 401, description = "Admin session required", body = ServiceErrorEnvelope),
+        (status = 429, description = "Request rate limited", body = ServiceErrorEnvelope),
+        (status = 503, description = "Connection share unavailable", body = ServiceErrorEnvelope)
+    )
+)]
+async fn admin_connection_share(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.rate_limits.allow(RateLimitBucket::Admin) {
+        return rate_limited_response();
+    }
+
+    if !admin_session_is_valid(&state, &headers) {
+        return admin_session_required_response();
+    }
+
+    let Some(config_file_manager) = state.config_file_manager.as_ref() else {
+        return service_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config_manager_unavailable",
+            "配置管理器不可用。",
+        );
+    };
+
+    match config_file_manager.service_connection_file() {
+        Ok(payload) => Json(payload).into_response(),
+        Err(_) => service_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "connection_share_unavailable",
+            "服务连接分享暂不可用。",
         ),
     }
 }
@@ -1152,6 +1195,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         admin_overview,
         admin_diagnostics,
         admin_config_state,
+        admin_connection_share,
         admin_pending_service_identity,
         admin_restart,
         setup_status,
@@ -1166,6 +1210,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
         config_files::ConfigStateResponse,
         config_files::PendingConfigResponse,
         config_files::PendingServiceIdentityRequest,
+        config_files::ServiceConnectionFileResponse,
         restart::RestartRequest,
         restart::RestartResponse,
         setup::SetupCompleteRequest,
