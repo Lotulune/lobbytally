@@ -48,7 +48,7 @@ The setup token allows the first-run setup API to write `deploy/config/active/se
 
 Do not put the raw setup token in `.env`, Postgres, docs, or logs.
 
-Management configuration changes are written under `deploy/config/pending` first and report `restartRequired=true`. The service does not copy active secrets into pending files for service identity edits, so saving non-secret settings must not clear Steam, LLM, R2, or admin credentials. A later managed-restart slice will validate and promote pending configuration before the process exits.
+Management configuration changes are written under `deploy/config/pending` first and report `restartRequired=true`. The service does not copy active secrets into pending files for service identity edits, so saving non-secret settings must not clear Steam, LLM, R2, or admin credentials. On the next startup, the service validates pending service configuration before promoting it to active. A later managed-restart slice will add the authenticated self-exit endpoint that triggers the container restart.
 
 For manual offline configuration instead, create the active secrets file:
 

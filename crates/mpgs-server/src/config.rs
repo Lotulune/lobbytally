@@ -3,7 +3,9 @@ use std::fs;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use crate::{config_files::ConfigFileManager, setup::SetupAccess, AdminAuthConfig, ServiceInfoConfig};
+use crate::{
+    config_files::ConfigFileManager, setup::SetupAccess, AdminAuthConfig, ServiceInfoConfig,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -131,6 +133,7 @@ impl ServerConfig {
     pub fn from_config_dir(config_dir: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let config_dir = config_dir.as_ref();
         let active_dir = config_dir.join("active");
+        promote_pending_service_config(config_dir)?;
         let service_path = active_dir.join("service.toml");
         let secrets_path = active_dir.join("secrets.toml");
 
@@ -263,6 +266,45 @@ fn read_setup_access(config_dir: &Path) -> Result<Option<SetupAccess>, ConfigErr
         config_dir.to_path_buf(),
         setup_config.setup.token_hash,
     )))
+}
+
+fn promote_pending_service_config(config_dir: &Path) -> Result<(), ConfigError> {
+    let pending_service_path = config_dir.join("pending").join("service.toml");
+    if !pending_service_path.exists() {
+        return Ok(());
+    }
+
+    let contents = fs::read_to_string(&pending_service_path).map_err(|source| {
+        ConfigError::UnreadableActiveConfig {
+            path: pending_service_path.clone(),
+            source,
+        }
+    })?;
+    toml::from_str::<ActiveServiceConfig>(&contents).map_err(|source| {
+        ConfigError::InvalidActiveConfigToml {
+            path: pending_service_path.clone(),
+            source,
+        }
+    })?;
+
+    let active_service_path = config_dir.join("active").join("service.toml");
+    let temp_active_path = active_service_path.with_extension("toml.tmp");
+    fs::write(&temp_active_path, contents).map_err(|source| {
+        ConfigError::UnreadableActiveConfig {
+            path: temp_active_path.clone(),
+            source,
+        }
+    })?;
+    fs::rename(&temp_active_path, &active_service_path).map_err(|source| {
+        ConfigError::UnreadableActiveConfig {
+            path: active_service_path,
+            source,
+        }
+    })?;
+    fs::remove_file(&pending_service_path).map_err(|source| ConfigError::UnreadableActiveConfig {
+        path: pending_service_path,
+        source,
+    })
 }
 
 #[derive(Debug, Deserialize)]

@@ -61,6 +61,102 @@ session_secret = "test-session-secret"
 }
 
 #[test]
+fn server_config_promotes_valid_pending_service_config_before_startup() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let active_dir = temp_dir.path().join("active");
+    let pending_dir = temp_dir.path().join("pending");
+    fs::create_dir(&active_dir).unwrap();
+    fs::create_dir(&pending_dir).unwrap();
+    fs::write(
+        active_dir.join("service.toml"),
+        r#"
+bind_addr = "0.0.0.0:4310"
+
+[service_identity]
+instance_id = "018fb770-8998-7699-a6e4-b7b59f2f9c01"
+name = "MPGS Active Service"
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        active_dir.join("secrets.toml"),
+        r#"
+[database]
+url = "postgres://mpgs:secret@postgres:5432/mpgs"
+
+[admin]
+token_hash = "sha256:test-hash"
+session_secret = "test-session-secret"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        pending_dir.join("service.toml"),
+        r#"
+bind_addr = "0.0.0.0:4310"
+
+[service_identity]
+instance_id = "018fb770-8998-7699-a6e4-b7b59f2f9c01"
+name = "MPGS Pending Service"
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+
+    let config = ServerConfig::from_config_dir(temp_dir.path()).unwrap();
+
+    assert_eq!(config.service_info.service_name, "MPGS Pending Service");
+    assert!(fs::read_to_string(active_dir.join("service.toml"))
+        .unwrap()
+        .contains("MPGS Pending Service"));
+    assert!(!pending_dir.join("service.toml").exists());
+}
+
+#[test]
+fn server_config_rejects_invalid_pending_service_config_without_overwriting_active() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let active_dir = temp_dir.path().join("active");
+    let pending_dir = temp_dir.path().join("pending");
+    fs::create_dir(&active_dir).unwrap();
+    fs::create_dir(&pending_dir).unwrap();
+    fs::write(
+        active_dir.join("service.toml"),
+        r#"
+bind_addr = "0.0.0.0:4310"
+
+[service_identity]
+instance_id = "018fb770-8998-7699-a6e4-b7b59f2f9c01"
+name = "MPGS Active Service"
+version = "0.1.0"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        active_dir.join("secrets.toml"),
+        r#"
+[database]
+url = "postgres://mpgs:secret@postgres:5432/mpgs"
+
+[admin]
+token_hash = "sha256:test-hash"
+session_secret = "test-session-secret"
+"#,
+    )
+    .unwrap();
+    fs::write(pending_dir.join("service.toml"), "not = valid = toml").unwrap();
+
+    let error = ServerConfig::from_config_dir(temp_dir.path())
+        .expect_err("invalid pending service config should be rejected before startup");
+
+    assert!(matches!(error, ConfigError::InvalidActiveConfigToml { .. }));
+    assert!(fs::read_to_string(active_dir.join("service.toml"))
+        .unwrap()
+        .contains("MPGS Active Service"));
+    assert!(pending_dir.join("service.toml").exists());
+}
+
+#[test]
 fn server_config_loads_required_database_and_public_identity_env() {
     let config = ServerConfig::from_env_vars(env(&[
         ("MPGS_SERVER_BIND", "0.0.0.0:4310"),
