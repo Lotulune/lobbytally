@@ -15,6 +15,20 @@
           "public"
         ],
         "operationId": "discovery_home",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Return 304 when the public discovery home ETag still matches",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Public catalog discovery home summary",
@@ -25,6 +39,9 @@
                 }
               }
             }
+          },
+          "304": {
+            "description": "Public catalog discovery home has not changed"
           },
           "503": {
             "description": "Public catalog unavailable",
@@ -71,6 +88,18 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Return 304 when the paginated public games ETag still matches",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -83,6 +112,9 @@
                 }
               }
             }
+          },
+          "304": {
+            "description": "Paginated public games have not changed"
           },
           "503": {
             "description": "Public catalog unavailable",
@@ -114,6 +146,18 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Return 304 when the public game detail ETag still matches",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -126,6 +170,9 @@
                 }
               }
             }
+          },
+          "304": {
+            "description": "Public game detail has not changed"
           },
           "404": {
             "description": "Public game not found",
@@ -167,6 +214,18 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Return 304 when the public game analysis ETag still matches",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -179,6 +238,9 @@
                 }
               }
             }
+          },
+          "304": {
+            "description": "Public game analysis has not changed"
           },
           "404": {
             "description": "Public game analysis not found",

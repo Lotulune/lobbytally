@@ -58,6 +58,14 @@ pub async fn public_catalog_status(
     }
 }
 
+pub async fn public_catalog_revision(pool: &PgPool) -> Result<i64, sqlx_core::error::Error> {
+    sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
+        "SELECT revision FROM public_catalog.public_catalog_state WHERE id = TRUE",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn migration_health_check(pool: &PgPool) -> Result<bool, sqlx_core::error::Error> {
     sqlx_core::query_scalar::query_scalar::<Postgres, bool>(
         r#"

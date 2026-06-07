@@ -5,6 +5,7 @@ pub mod public_catalog;
 
 use axum::{
     extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -91,6 +92,12 @@ pub enum DatabaseHealth {
     Pool(PgPool),
     #[doc(hidden)]
     HealthyForTest,
+    #[doc(hidden)]
+    PublicCatalogFixture {
+        revision: i64,
+        detail: Option<PublicGameDetail>,
+        analysis: Option<PublicGameAnalysis>,
+    },
     Unavailable,
 }
 
@@ -98,7 +105,7 @@ impl DatabaseHealth {
     async fn is_healthy(&self) -> bool {
         match self {
             Self::Pool(pool) => db::migration_health_check(pool).await.unwrap_or(false),
-            Self::HealthyForTest => true,
+            Self::HealthyForTest | Self::PublicCatalogFixture { .. } => true,
             Self::Unavailable => false,
         }
     }
@@ -139,14 +146,35 @@ async fn service_info(State(state): State<AppState>) -> Json<ServiceInfo> {
     get,
     path = "/api/v1/discovery-home",
     tag = "public",
+    params(("If-None-Match" = Option<String>, Header, description = "Return 304 when the public discovery home ETag still matches")),
     responses(
         (status = 200, description = "Public catalog discovery home summary", body = DiscoveryHomeResponse),
+        (status = 304, description = "Public catalog discovery home has not changed"),
         (status = 503, description = "Public catalog unavailable", body = ServiceErrorEnvelope)
     )
 )]
-async fn discovery_home(State(state): State<AppState>) -> Response {
+async fn discovery_home(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let etag = match state
+        .database_health
+        .public_catalog_list_etag("discovery-home", None)
+        .await
+    {
+        Ok(etag) => etag,
+        Err(error) => {
+            return service_error_response(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "public_catalog_unavailable",
+                public_catalog_error_message(error),
+            );
+        }
+    };
+
+    if request_matches_etag(&headers, &etag) {
+        return not_modified_response(etag);
+    }
+
     match state.database_health.discovery_home().await {
-        Ok(payload) => Json(payload).into_response(),
+        Ok(payload) => json_with_etag(payload, etag),
         Err(error) => service_error_response(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "public_catalog_unavailable",
@@ -159,16 +187,40 @@ async fn discovery_home(State(state): State<AppState>) -> Response {
     get,
     path = "/api/v1/games",
     tag = "public",
-    params(GamesQuery),
+    params(GamesQuery, ("If-None-Match" = Option<String>, Header, description = "Return 304 when the paginated public games ETag still matches")),
     responses(
         (status = 200, description = "Paginated public games", body = PublicGamesPage),
+        (status = 304, description = "Paginated public games have not changed"),
         (status = 503, description = "Public catalog unavailable", body = ServiceErrorEnvelope)
     )
 )]
-async fn games(State(state): State<AppState>, Query(query): Query<GamesQuery>) -> Response {
+async fn games(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GamesQuery>,
+) -> Response {
     let (limit, offset) = query.normalized();
+    let etag = match state
+        .database_health
+        .public_catalog_list_etag("games", Some((limit, offset)))
+        .await
+    {
+        Ok(etag) => etag,
+        Err(error) => {
+            return service_error_response(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "public_catalog_unavailable",
+                public_catalog_error_message(error),
+            );
+        }
+    };
+
+    if request_matches_etag(&headers, &etag) {
+        return not_modified_response(etag);
+    }
+
     match state.database_health.public_games_page(limit, offset).await {
-        Ok(payload) => Json(payload).into_response(),
+        Ok(payload) => json_with_etag(payload, etag),
         Err(error) => service_error_response(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "public_catalog_unavailable",
@@ -181,16 +233,30 @@ async fn games(State(state): State<AppState>, Query(query): Query<GamesQuery>) -
     get,
     path = "/api/v1/games/{appid}",
     tag = "public",
-    params(("appid" = u32, Path, description = "Steam AppID")),
+    params(
+        ("appid" = u32, Path, description = "Steam AppID"),
+        ("If-None-Match" = Option<String>, Header, description = "Return 304 when the public game detail ETag still matches")
+    ),
     responses(
         (status = 200, description = "Public game detail", body = PublicGameDetail),
+        (status = 304, description = "Public game detail has not changed"),
         (status = 404, description = "Public game not found", body = ServiceErrorEnvelope),
         (status = 503, description = "Public catalog unavailable", body = ServiceErrorEnvelope)
     )
 )]
-async fn game_detail(State(state): State<AppState>, Path(appid): Path<u32>) -> Response {
+async fn game_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(appid): Path<u32>,
+) -> Response {
     match state.database_health.public_game_detail(appid).await {
-        Ok(Some(payload)) => Json(payload).into_response(),
+        Ok(Some(payload)) => {
+            let etag = public_game_detail_etag(&payload);
+            if request_matches_etag(&headers, &etag) {
+                return not_modified_response(etag);
+            }
+            json_with_etag(payload, etag)
+        }
         Ok(None) => service_error_response(
             axum::http::StatusCode::NOT_FOUND,
             "public_game_not_found",
@@ -208,16 +274,30 @@ async fn game_detail(State(state): State<AppState>, Path(appid): Path<u32>) -> R
     get,
     path = "/api/v1/games/{appid}/analysis",
     tag = "public",
-    params(("appid" = u32, Path, description = "Steam AppID")),
+    params(
+        ("appid" = u32, Path, description = "Steam AppID"),
+        ("If-None-Match" = Option<String>, Header, description = "Return 304 when the public game analysis ETag still matches")
+    ),
     responses(
         (status = 200, description = "Public game analysis", body = PublicGameAnalysis),
+        (status = 304, description = "Public game analysis has not changed"),
         (status = 404, description = "Public game analysis not found", body = ServiceErrorEnvelope),
         (status = 503, description = "Public catalog unavailable", body = ServiceErrorEnvelope)
     )
 )]
-async fn game_analysis(State(state): State<AppState>, Path(appid): Path<u32>) -> Response {
+async fn game_analysis(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(appid): Path<u32>,
+) -> Response {
     match state.database_health.public_game_analysis(appid).await {
-        Ok(Some(payload)) => Json(payload).into_response(),
+        Ok(Some(payload)) => {
+            let etag = public_game_analysis_etag(&payload);
+            if request_matches_etag(&headers, &etag) {
+                return not_modified_response(etag);
+            }
+            json_with_etag(payload, etag)
+        }
         Ok(None) => service_error_response(
             axum::http::StatusCode::NOT_FOUND,
             "public_game_analysis_not_found",
@@ -255,10 +335,48 @@ async fn healthz(State(state): State<AppState>) -> (axum::http::StatusCode, Json
 }
 
 impl DatabaseHealth {
+    async fn public_catalog_revision(&self) -> Result<i64, sqlx_core::error::Error> {
+        match self {
+            Self::Pool(pool) => db::public_catalog_revision(pool).await,
+            Self::HealthyForTest => Ok(0),
+            Self::PublicCatalogFixture { revision, .. } => Ok(*revision),
+            Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
+        }
+    }
+
+    async fn public_catalog_list_etag(
+        &self,
+        endpoint: &'static str,
+        pagination: Option<(u32, u32)>,
+    ) -> Result<String, sqlx_core::error::Error> {
+        let revision = self.public_catalog_revision().await?;
+        let pagination_key = pagination
+            .map(|(limit, offset)| format!(":limit={limit}:offset={offset}"))
+            .unwrap_or_default();
+
+        Ok(format!("\"public-catalog:{endpoint}:rev={revision}{pagination_key}\""))
+    }
+
     async fn discovery_home(&self) -> Result<DiscoveryHomeResponse, sqlx_core::error::Error> {
         match self {
             Self::Pool(pool) => db::discovery_home(pool).await,
             Self::HealthyForTest => Ok(DiscoveryHomeResponse::empty()),
+            Self::PublicCatalogFixture { detail, .. } => {
+                let item = detail.iter().map(|detail| detail.game.clone()).collect();
+                Ok(DiscoveryHomeResponse {
+                    status: if detail.is_some() {
+                        PublicCatalogStatus::Ready
+                    } else {
+                        PublicCatalogStatus::Empty
+                    },
+                    total_games: detail.iter().count() as i64,
+                    sections: public_catalog::DiscoveryHomeSections {
+                        newly_published: item,
+                        high_confidence: Vec::new(),
+                        recently_added: Vec::new(),
+                    },
+                })
+            }
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -271,6 +389,22 @@ impl DatabaseHealth {
         match self {
             Self::Pool(pool) => db::public_games_page(pool, limit, offset).await,
             Self::HealthyForTest => Ok(PublicGamesPage::empty(limit, offset)),
+            Self::PublicCatalogFixture { detail, .. } => {
+                let items = detail
+                    .iter()
+                    .map(|detail| detail.game.clone())
+                    .skip(offset as usize)
+                    .take(limit as usize)
+                    .collect();
+                Ok(PublicGamesPage {
+                    items,
+                    page: public_catalog::PageMeta {
+                        limit,
+                        offset,
+                        total: detail.iter().count() as i64,
+                    },
+                })
+            }
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -282,6 +416,9 @@ impl DatabaseHealth {
         match self {
             Self::Pool(pool) => db::public_game_detail(pool, appid).await,
             Self::HealthyForTest => Ok(None),
+            Self::PublicCatalogFixture { detail, .. } => Ok(detail
+                .clone()
+                .filter(|detail| detail.game.appid == appid)),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -293,6 +430,9 @@ impl DatabaseHealth {
         match self {
             Self::Pool(pool) => db::public_game_analysis(pool, appid).await,
             Self::HealthyForTest => Ok(None),
+            Self::PublicCatalogFixture { analysis, .. } => {
+                Ok(analysis.clone().filter(|analysis| analysis.appid == appid))
+            }
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
     }
@@ -304,6 +444,49 @@ fn service_error_response(
     message: &'static str,
 ) -> Response {
     (status, Json(ServiceErrorEnvelope::new(code, message))).into_response()
+}
+
+fn json_with_etag<T>(payload: T, etag: String) -> Response
+where
+    T: serde::Serialize,
+{
+    let mut response = Json(payload).into_response();
+    insert_etag(response.headers_mut(), &etag);
+    response
+}
+
+fn not_modified_response(etag: String) -> Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    insert_etag(response.headers_mut(), &etag);
+    response
+}
+
+fn insert_etag(headers: &mut HeaderMap, etag: &str) {
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        headers.insert(header::ETAG, value);
+    }
+}
+
+fn request_matches_etag(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').map(str::trim).any(|candidate| candidate == etag))
+        .unwrap_or(false)
+}
+
+fn public_game_detail_etag(payload: &PublicGameDetail) -> String {
+    format!(
+        "\"public-catalog:game:{}:updated={}\"",
+        payload.game.appid, payload.game.updated_at
+    )
+}
+
+fn public_game_analysis_etag(payload: &PublicGameAnalysis) -> String {
+    format!(
+        "\"public-catalog:game-analysis:{}:generated={}\"",
+        payload.appid, payload.generated_at
+    )
 }
 
 fn public_catalog_error_message(_error: sqlx_core::error::Error) -> &'static str {

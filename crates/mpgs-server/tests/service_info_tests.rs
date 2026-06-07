@@ -46,3 +46,24 @@ fn openapi_includes_service_info_route() {
     assert!(value["paths"]["/api/v1/games/{appid}"]["get"].is_object());
     assert!(value["paths"]["/api/v1/games/{appid}/analysis"]["get"].is_object());
 }
+
+#[test]
+fn openapi_documents_public_read_conditional_cache_contract() {
+    let value = serde_json::to_value(build_openapi()).unwrap();
+
+    for path in [
+        "/api/v1/discovery-home",
+        "/api/v1/games",
+        "/api/v1/games/{appid}",
+        "/api/v1/games/{appid}/analysis",
+    ] {
+        let get = &value["paths"][path]["get"];
+        let parameters = get["parameters"].as_array().unwrap();
+        assert!(
+            parameters
+                .iter()
+                .any(|parameter| parameter["name"] == "If-None-Match")
+        );
+        assert!(get["responses"]["304"].is_object());
+    }
+}
