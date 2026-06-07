@@ -97,6 +97,9 @@ if ($localBuildScript -notmatch 'Dockerfile\.mpgs-server' -or $localBuildScript 
 if ($remoteDeployScript -notmatch 'docker load' -or $remoteDeployScript -notmatch 'up -d' -or $remoteDeployScript -notmatch '/healthz' -or $remoteDeployScript -notmatch '/api/v1/service-info') {
     throw "remote deploy script must load the image, start compose, and probe healthz plus service-info."
 }
+if ($remoteDeployScript -notmatch 'deploy/config/active/service.toml') {
+    throw "remote deploy script must upload the active service config example for first manual configuration."
+}
 if ($remoteDeployScript -match 'cargo build|rustc|docker build|docker compose build|npm run|pnpm|yarn') {
     throw "remote deploy script must not compile or build artifacts on the VPS."
 }

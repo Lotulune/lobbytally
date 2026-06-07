@@ -83,6 +83,7 @@ foreach ($file in $deployFiles) {
 }
 
 Invoke-Checked "scp" @((Join-Path $root "deploy/config/setup.toml.example"), (Format-RemoteTarget $RemoteHost "$RemotePath/deploy/config/"))
+Invoke-Checked "scp" @((Join-Path $root "deploy/config/active/service.toml"), (Format-RemoteTarget $RemoteHost "$RemotePath/deploy/config/active/"))
 Invoke-Checked "scp" @((Join-Path $root "deploy/config/active/secrets.toml.example"), (Format-RemoteTarget $RemoteHost "$RemotePath/deploy/config/active/"))
 Invoke-Checked "scp" @($imageTarPath, (Format-RemoteTarget $RemoteHost "$RemotePath/$remoteImageName"))
 
