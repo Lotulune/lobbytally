@@ -387,4 +387,29 @@ describe("DashboardPage", () => {
     expect(screen.queryByRole("button", { name: "完整同步" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "快速同步" })).not.toBeInTheDocument();
   });
+
+  it("uses public-service copy instead of local scan diagnostics in the right rail", () => {
+    renderDashboardPage({
+      activeView: "home",
+      statsOverride: {
+        ...mockDashboard.stats,
+        sourceKind: "public_service",
+        dataSource: "公共发现服务：MPGS Test Service",
+        totalGames: 42,
+        newGamesCount: 8,
+        classicGamesCount: 4,
+        seedCount: 0,
+        lastDiscoveryAppid: 123456,
+        lastSyncAt: "2026-06-08T10:00:00.000Z",
+      },
+    });
+
+    expect(screen.getByText("公共库状态")).toBeInTheDocument();
+    expect(screen.getByText("匿名只读")).toBeInTheDocument();
+    expect(screen.getByText("个人状态")).toBeInTheDocument();
+    expect(screen.getByText("本地保存")).toBeInTheDocument();
+    expect(screen.queryByText("扫描游标")).not.toBeInTheDocument();
+    expect(screen.queryByText(/最近同步/)).not.toBeInTheDocument();
+    expect(screen.queryByText("123456")).not.toBeInTheDocument();
+  });
 });

@@ -438,12 +438,27 @@ function RightRail({
             <strong>{formatNumber(stats.classicGamesCount)}</strong>
             <span>老游区</span>
           </div>
-          <div className="stats-item">
-            <strong>{stats.lastDiscoveryAppid ?? "无"}</strong>
-            <span>扫描游标</span>
-          </div>
+          {isPublicServiceMode ? (
+            <>
+              <div className="stats-item">
+                <strong>匿名只读</strong>
+                <span>公共库状态</span>
+              </div>
+              <div className="stats-item">
+                <strong>本地保存</strong>
+                <span>个人状态</span>
+              </div>
+            </>
+          ) : (
+            <div className="stats-item">
+              <strong>{stats.lastDiscoveryAppid ?? "无"}</strong>
+              <span>扫描游标</span>
+            </div>
+          )}
         </div>
-        <p className="stats-meta">最近同步：{formatDateTime(stats.lastSyncAt)}</p>
+        {!isPublicServiceMode ? (
+          <p className="stats-meta">最近同步：{formatDateTime(stats.lastSyncAt)}</p>
+        ) : null}
         {!isPublicServiceMode ? (
           <>
             <div className="backfill-status-block">
