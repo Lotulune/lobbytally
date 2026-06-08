@@ -141,7 +141,7 @@ export function buildDashboardSections({
     {
       id: "recent",
       title: "最近发现",
-      subtitle: "刚导入到本地库的多人游戏",
+      subtitle: "最近收录的多人游戏",
       games:
         activeView === "home"
           ? visibleRecentDiscoveries.slice(0, HOME_SECTION_LIMITS.recent)

@@ -415,6 +415,26 @@ describe("DetailPage", () => {
     expect(screen.getByText("✅ 推荐")).toBeInTheDocument();
   });
 
+  it("uses public-service copy for empty review and related panels in read-only mode", () => {
+    const game = {
+      ...buildGame(),
+      reviewSnippets: [],
+    };
+
+    renderDetailPage(game, {
+      analysisReadOnly: true,
+      relatedGames: [],
+    });
+
+    fireEvent.click(screen.getByRole("tab", { name: /玩家评价/i }));
+    expect(screen.getByText("当前公共数据暂未提供评论摘录。")).toBeInTheDocument();
+    expect(screen.queryByText(/本地库/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("tab", { name: /相关游戏/i }));
+    expect(screen.getByText("公共发现服务暂未提供可关联的候选项。")).toBeInTheDocument();
+    expect(screen.queryByText(/同步更多游戏/)).not.toBeInTheDocument();
+  });
+
   it("renders the localized short description when available", () => {
     const game = buildGame();
     render(

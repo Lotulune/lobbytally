@@ -275,7 +275,11 @@ export function DetailPage({
               ) : (
                 <div className="detail-empty-state">
                   <h3>还没有可展示的玩家评价</h3>
-                  <p>当前数据源尚未返回评论摘录，之后同步到本地库后会显示在这里。</p>
+                  <p>
+                    {analysisReadOnly
+                      ? "当前公共数据暂未提供评论摘录。"
+                      : "当前数据源尚未返回评论摘录，之后同步到本地库后会显示在这里。"}
+                  </p>
                 </div>
               )}
             </div>
@@ -311,7 +315,11 @@ export function DetailPage({
               ) : (
                 <div className="detail-empty-state">
                   <h3>还没有相关游戏</h3>
-                  <p>当前没有可关联的候选项，稍后同步更多游戏后会补全这一栏。</p>
+                  <p>
+                    {analysisReadOnly
+                      ? "公共发现服务暂未提供可关联的候选项。"
+                      : "当前没有可关联的候选项，稍后同步更多游戏后会补全这一栏。"}
+                  </p>
                 </div>
               )}
             </div>

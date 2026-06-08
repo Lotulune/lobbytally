@@ -201,7 +201,7 @@ describe("DashboardPage", () => {
         {
           id: "recent",
           title: "最近发现",
-          subtitle: "刚导入到本地库的多人游戏",
+          subtitle: "最近收录的多人游戏",
           games: createGames(15, "最近发现游戏"),
         },
       ],
@@ -248,6 +248,20 @@ describe("DashboardPage", () => {
     const recentSection = sections.find((section) => section.id === "recent");
     expect(recentSection?.games).toHaveLength(9);
     expect(recentSection?.games[0].name).toBe("低门槛导入 1");
+  });
+
+  it("uses service-neutral copy for the recent discoveries section", () => {
+    const sections = buildDashboardSections({
+      activeView: "browse",
+      dashboard: mockDashboard,
+      filters,
+      query: "",
+      sortMode: "recommended",
+    });
+
+    const recentSection = sections.find((section) => section.id === "recent");
+    expect(recentSection?.subtitle).toBe("最近收录的多人游戏");
+    expect(recentSection?.subtitle).not.toContain("本地库");
   });
 
   it("reports section page changes through the page callback", () => {
