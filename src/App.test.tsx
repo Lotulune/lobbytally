@@ -4,6 +4,10 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { mockDashboard } from "./data/mockDashboard";
+import {
+  clearCurrentServiceConnection,
+  getCurrentServiceConnection,
+} from "./domain/serviceConnectionStorage";
 import type { AiRecommendationResponse, GameAnalysisReport } from "./types";
 
 const assessGameWithAiMock = vi.fn();
@@ -297,6 +301,9 @@ function createDeferred<T>() {
 describe("App dashboard interactions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+    clearCurrentServiceConnection();
     isTauriRuntimeMock.mockReturnValue(false);
     listenMock.mockResolvedValue(() => undefined);
     getDashboardMock.mockResolvedValue(buildDashboard());
@@ -357,6 +364,8 @@ describe("App dashboard interactions", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
+    clearCurrentServiceConnection();
     cleanup();
   });
 
@@ -673,6 +682,96 @@ describe("App dashboard interactions", () => {
     expect(
       screen.queryByRole("heading", { name: "AI 智能推荐助手 Beta" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("imports a service connection file, validates public reads, and refreshes dashboard", async () => {
+    getDashboardMock
+      .mockResolvedValueOnce(buildDashboard())
+      .mockResolvedValueOnce(buildPublicServiceDashboard());
+    const serviceInfo = {
+      serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c01",
+      serviceName: "MPGS Test Service",
+      serviceVersion: "0.1.0",
+      apiVersion: "v1",
+      publicCatalogStatus: "empty",
+      capabilities: ["public_catalog_read"],
+    };
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === "https://mpgs.example.test/api/v1/service-info") {
+        return Promise.resolve(
+          new Response(JSON.stringify(serviceInfo), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }
+      if (url === "https://mpgs.example.test/api/v1/discovery-home") {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              status: "empty",
+              totalGames: 0,
+              sections: {
+                newlyPublished: [],
+                highConfidence: [],
+                recentlyAdded: [],
+              },
+            }),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            },
+          ),
+        );
+      }
+
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "新游区" });
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: /公共发现服务连接/ }));
+    fireEvent.change(screen.getByLabelText("导入服务连接文件"), {
+      target: {
+        files: [
+          new File(
+            [
+              JSON.stringify({
+                serviceName: "MPGS Test Service",
+                serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c01",
+                apiVersion: "v1",
+                baseUrl: "https://mpgs.example.test",
+                serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
+                capabilities: ["public_catalog_read"],
+              }),
+            ],
+            "mpgs-service-connection.json",
+            { type: "application/json" },
+          ),
+        ],
+      },
+    });
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://mpgs.example.test/api/v1/service-info",
+        expect.objectContaining({ method: "GET" }),
+      ),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://mpgs.example.test/api/v1/discovery-home",
+      expect.objectContaining({ method: "GET" }),
+    );
+    await waitFor(() => expect(getDashboardMock).toHaveBeenCalledTimes(2));
+    expect(getCurrentServiceConnection()).toMatchObject({
+      baseUrl: "https://mpgs.example.test",
+      info: serviceInfo,
+    });
+    expect(screen.getAllByText("公共发现服务：MPGS Test Service").length).toBeGreaterThan(0);
   });
 
   it("returns to the discovery home when a refresh switches from local AI to public service mode", async () => {

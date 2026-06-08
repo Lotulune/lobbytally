@@ -5,6 +5,7 @@ import {
   evaluateServiceAddressPolicy,
   evaluateServiceInfoCompatibility,
   normalizeServiceBaseUrl,
+  validateServiceConnectionFileText,
   validateServiceAddress,
 } from "./serviceConnection";
 import type { ServiceInfo } from "../types";
@@ -140,6 +141,107 @@ describe("service connection validation model", () => {
       baseUrl: "https://mpgs.example.test",
       serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
       publicReadProbeUrl: "https://mpgs.example.test/api/v1/discovery-home",
+    });
+  });
+
+  it("validates an imported connection file against live service identity and public reads", async () => {
+    const seenUrls: string[] = [];
+    const result = await validateServiceConnectionFileText(
+      JSON.stringify({
+        serviceName: "MPGS Test Service",
+        serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c01",
+        apiVersion: "v1",
+        baseUrl: "https://mpgs.example.test",
+        serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
+        capabilities: ["public_catalog_read"],
+      }),
+      async (url) => {
+        seenUrls.push(url);
+        if (url.endsWith("/api/v1/discovery-home")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ status: "empty", totalGames: 0, sections: {} }),
+          };
+        }
+
+        return {
+          ok: true,
+          status: 200,
+          json: async () => compatibleInfo,
+        };
+      },
+    );
+
+    expect(seenUrls).toEqual([
+      "https://mpgs.example.test/api/v1/service-info",
+      "https://mpgs.example.test/api/v1/discovery-home",
+    ]);
+    expect(result).toMatchObject({
+      success: true,
+      baseUrl: "https://mpgs.example.test",
+      serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
+      info: compatibleInfo,
+    });
+  });
+
+  it("rejects imported connection files with secret-looking fields", async () => {
+    const result = await validateServiceConnectionFileText(
+      JSON.stringify({
+        serviceName: "MPGS Test Service",
+        serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c01",
+        apiVersion: "v1",
+        baseUrl: "https://mpgs.example.test",
+        serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
+        capabilities: ["public_catalog_read"],
+        adminToken: "must-not-import",
+      }),
+      async () => {
+        throw new Error("secret-bearing connection files must not be fetched");
+      },
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      message: "服务连接文件不能包含密钥或管理凭据。",
+    });
+  });
+
+  it("rejects imported connection files when service identity does not match", async () => {
+    const result = await validateServiceConnectionFileText(
+      JSON.stringify({
+        serviceName: "MPGS Test Service",
+        serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c01",
+        apiVersion: "v1",
+        baseUrl: "https://mpgs.example.test",
+        serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
+        capabilities: ["public_catalog_read"],
+      }),
+      async (url) => {
+        if (url.endsWith("/api/v1/discovery-home")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ status: "empty", totalGames: 0, sections: {} }),
+          };
+        }
+
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ...compatibleInfo,
+            serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c02",
+          }),
+        };
+      },
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      message: "服务身份与连接文件不一致。",
+      baseUrl: "https://mpgs.example.test",
+      serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
     });
   });
 });

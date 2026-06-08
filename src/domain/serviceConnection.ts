@@ -9,6 +9,15 @@ import type {
 
 const SUPPORTED_API_VERSION = "v1";
 const PUBLIC_READ_CAPABILITY = "public_catalog_read";
+const SECRET_CONNECTION_FILE_FIELDS = new Set([
+  "setupToken",
+  "adminToken",
+  "token",
+  "secret",
+  "steamApiKey",
+  "llmApiKey",
+  "apiKey",
+]);
 
 export interface ServiceAddressPolicyOptions {
   allowPrivateHttp?: boolean;
@@ -208,6 +217,78 @@ export async function validateServiceAddress(
   }
 }
 
+export async function validateServiceConnectionFileText(
+  fileText: string,
+  fetcher: ServiceInfoFetch = fetchServiceInfo,
+  options: ServiceAddressPolicyOptions = {},
+): Promise<ServiceAddressValidationResult> {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(fileText);
+  } catch {
+    return {
+      success: false,
+      message: "服务连接文件不是有效 JSON。",
+    };
+  }
+
+  if (containsSecretConnectionField(payload)) {
+    return {
+      success: false,
+      message: "服务连接文件不能包含密钥或管理凭据。",
+    };
+  }
+
+  if (!isServiceConnectionFile(payload)) {
+    return {
+      success: false,
+      message: "服务连接文件格式不兼容。",
+    };
+  }
+
+  const expectedServiceInfoUrl = buildServiceInfoUrl(payload.baseUrl);
+  const declaredServiceBaseUrl = normalizeServiceBaseUrl(
+    payload.serviceInfoUrl.replace(/\/api\/v1\/service-info$/, ""),
+  );
+  const normalizedBaseUrl = normalizeServiceBaseUrl(payload.baseUrl);
+  if (
+    normalizedBaseUrl !== declaredServiceBaseUrl ||
+    payload.serviceInfoUrl !== expectedServiceInfoUrl
+  ) {
+    return {
+      success: false,
+      message: "服务连接文件中的服务身份地址不一致。",
+      baseUrl: normalizedBaseUrl,
+      serviceInfoUrl: expectedServiceInfoUrl,
+    };
+  }
+
+  const result = await validateServiceAddress(payload.baseUrl, fetcher, options);
+  if (!result.success) {
+    return result;
+  }
+
+  if (
+    result.info.serviceInstanceId !== payload.serviceInstanceId ||
+    result.info.apiVersion !== payload.apiVersion ||
+    result.info.serviceName !== payload.serviceName ||
+    !payload.capabilities.every((capability) =>
+      result.info.capabilities.includes(capability),
+    )
+  ) {
+    return {
+      success: false,
+      message: "服务身份与连接文件不一致。",
+      baseUrl: result.baseUrl,
+      serviceInfoUrl: result.serviceInfoUrl,
+      publicReadProbeUrl: result.publicReadProbeUrl,
+      info: result.info,
+    };
+  }
+
+  return result;
+}
+
 async function fetchServiceInfo(
   url: string,
   init?: { method?: string },
@@ -236,6 +317,48 @@ function isServiceInfo(value: unknown): value is ServiceInfo {
     Array.isArray(candidate.capabilities) &&
     candidate.capabilities.every(isServiceCapability)
   );
+}
+
+function isServiceConnectionFile(value: unknown): value is {
+  serviceName: string;
+  serviceInstanceId: string;
+  apiVersion: string;
+  baseUrl: string;
+  serviceInfoUrl: string;
+  capabilities: ServiceCapability[];
+} {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.serviceName === "string" &&
+    typeof candidate.serviceInstanceId === "string" &&
+    candidate.apiVersion === SUPPORTED_API_VERSION &&
+    typeof candidate.baseUrl === "string" &&
+    typeof candidate.serviceInfoUrl === "string" &&
+    Array.isArray(candidate.capabilities) &&
+    candidate.capabilities.every(isServiceCapability)
+  );
+}
+
+function containsSecretConnectionField(value: unknown): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  if (Array.isArray(value)) {
+    return value.some(containsSecretConnectionField);
+  }
+
+  return Object.entries(value as Record<string, unknown>).some(([key, nested]) => {
+    if (SECRET_CONNECTION_FILE_FIELDS.has(key)) {
+      return true;
+    }
+
+    return containsSecretConnectionField(nested);
+  });
 }
 
 function isPublicCatalogStatus(value: unknown): value is PublicCatalogStatus {

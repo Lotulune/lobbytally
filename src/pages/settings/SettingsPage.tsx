@@ -18,6 +18,7 @@ import type {
 } from "../../types";
 
 export type SettingsSectionKey =
+  | "serviceConnection"
   | "onboarding"
   | "apiKeys"
   | "llmConfig"
@@ -28,6 +29,7 @@ export type SettingsExpandedState = Record<SettingsSectionKey, boolean>;
 const DEFAULT_CLASSIC_DISCOVERY_MAX_PAGES = 3;
 
 export const defaultSettingsExpandedState: SettingsExpandedState = {
+  serviceConnection: false,
   onboarding: false,
   apiKeys: false,
   llmConfig: false,
@@ -80,6 +82,7 @@ export function SettingsPage({
   aiAnalysisQueueFailures,
   onRefreshDashboard,
   onStatus,
+  onImportServiceConnectionFile,
   onSave,
   onSync,
   expandedSections,
@@ -96,6 +99,7 @@ export function SettingsPage({
   aiAnalysisQueueFailures: AiAnalysisQueueFailureItem[];
   onRefreshDashboard: () => Promise<unknown>;
   onStatus: (message: string) => void;
+  onImportServiceConnectionFile: (fileText: string) => Promise<void>;
   onSave: (request: SaveConfigRequest) => Promise<void>;
   onSync: (mode: SyncMode) => void;
   expandedSections?: SettingsExpandedState;
@@ -211,6 +215,7 @@ export function SettingsPage({
   const llmProviderChanged = llmProvider !== config.llmProvider;
   const canUseSavedLlmKey = config.llmApiKeyConfigured && !llmProviderChanged && !form.clearLlmApiKey;
   const canTestLlm = Boolean(llmDraftKey || canUseSavedLlmKey);
+  const serviceConnectionStatus = isPublicServiceMode ? "已连接" : "未连接";
 
   const onboardingSummary = useMemo(() => {
     const readyCount = Number(config.steamApiKeyValidated) + Number(config.llmConfigValidated);
@@ -344,6 +349,18 @@ export function SettingsPage({
     setForm(buildFormFromConfig({ ...config, ...nextRequest } as DashboardPayload["config"]));
   }
 
+  async function handleImportServiceConnectionFile(file: File | null) {
+    if (!file) {
+      return;
+    }
+
+    try {
+      await onImportServiceConnectionFile(await file.text());
+    } catch (error) {
+      onStatus(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   function handleProviderChange(provider: LlmProvider) {
     setForm((current) => ({
       ...current,
@@ -359,6 +376,34 @@ export function SettingsPage({
   return (
     <section className="settings-page">
       <h2>设置</h2>
+
+      <SettingsSection
+        title="公共发现服务连接"
+        status={serviceConnectionStatus}
+        expanded={expanded.serviceConnection}
+        onToggle={() => toggle("serviceConnection")}
+      >
+        <p className="settings-card-desc">
+          导入维护者提供的无密钥连接文件后，客户端仍会重新读取服务身份信息并验证匿名公共读取能力。
+        </p>
+        <div className="settings-form-stack">
+          <label>
+            导入服务连接文件
+            <input
+              accept="application/json,.json"
+              type="file"
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0] ?? null;
+                event.currentTarget.value = "";
+                void handleImportServiceConnectionFile(file);
+              }}
+            />
+          </label>
+        </div>
+        <p className="settings-hint">
+          连接文件不能包含引导令牌、管理员令牌或第三方 API Key；导入不会跳过服务身份验证。
+        </p>
+      </SettingsSection>
 
       <SettingsSection
         title="初始化向导"

@@ -47,6 +47,8 @@ import {
   SettingsPage,
   type SettingsExpandedState,
 } from "./pages/settings/SettingsPage";
+import { validateServiceConnectionFileText } from "./domain/serviceConnection";
+import { saveCurrentServiceConnection } from "./domain/serviceConnectionStorage";
 import { UpcomingPage } from "./pages/upcoming/UpcomingPage";
 import type { LibraryFilters, ViewId, LibrarySortMode } from "./pages/types";
 import type {
@@ -579,6 +581,30 @@ function App() {
     }
   }
 
+  async function handleImportServiceConnectionFile(fileText: string) {
+    setIsBusy(true);
+    setStatus("正在验证服务连接文件……");
+    try {
+      const result = await validateServiceConnectionFileText(fileText);
+      if (!result.success) {
+        setStatus(result.message);
+        return;
+      }
+
+      saveCurrentServiceConnection({
+        baseUrl: result.baseUrl,
+        info: result.info,
+        validatedAt: new Date().toISOString(),
+      });
+      setStatus(`已连接公共发现服务：${result.info.serviceName}。`);
+      await loadDashboard(false);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
   async function handleExitOnboarding(target: "app" | "settings") {
     autoOnboardingDismissedRef.current = true;
     await refreshDashboard();
@@ -982,6 +1008,7 @@ function App() {
             onRetryAiAnalysisJob={handleRetryAiAnalysisJob}
             onStartClassicDiscovery={handleStartClassicDiscovery}
             onRefreshDashboard={refreshDashboard}
+            onImportServiceConnectionFile={handleImportServiceConnectionFile}
             onSave={handleSaveConfig}
             onStatus={setStatus}
             onSync={handleSync}

@@ -25,6 +25,7 @@ function renderSettingsPage(
     onRefreshDashboard: vi.fn(async () => undefined),
     onSave: vi.fn(async () => undefined),
     onStatus: vi.fn(),
+    onImportServiceConnectionFile: vi.fn(async () => undefined),
     onSync: vi.fn(),
     status: "当前库已就绪。",
   };
@@ -69,6 +70,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={vi.fn()}
         status="配置已刷新。"
       />,
@@ -83,6 +85,7 @@ describe("Settings and About pages", () => {
 
   it("restores expanded sections supplied by the app session after remounting", () => {
     const settingsSessionExpanded = {
+      serviceConnection: false,
       onboarding: false,
       apiKeys: false,
       llmConfig: false,
@@ -131,6 +134,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={vi.fn()}
         status="当前库已就绪。"
       />,
@@ -170,6 +174,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={onStatus}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={vi.fn()}
         status="当前库已就绪。"
       />,
@@ -212,6 +217,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={onSave}
         onStatus={vi.fn()}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={vi.fn()}
         status="当前库已就绪。"
       />,
@@ -257,6 +263,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={onSync}
         status="当前库已就绪。"
       />,
@@ -313,6 +320,40 @@ describe("Settings and About pages", () => {
     expect(screen.queryByRole("heading", { name: "发现任务控制台" })).not.toBeInTheDocument();
   });
 
+  it("imports a service connection file from settings", async () => {
+    const onImportServiceConnectionFile = vi.fn(async () => undefined);
+    renderSettingsPage({
+      onImportServiceConnectionFile,
+      status: "等待导入服务连接。",
+    });
+
+    openSettingsSection("公共发现服务连接");
+    const connectionFile = new File(
+      [
+        JSON.stringify({
+          serviceName: "MPGS Public",
+          serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c01",
+          apiVersion: "v1",
+          baseUrl: "https://mpgs.example.test",
+          serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
+          capabilities: ["public_catalog_read"],
+        }),
+      ],
+      "mpgs-service-connection.json",
+      { type: "application/json" },
+    );
+
+    fireEvent.change(screen.getByLabelText("导入服务连接文件"), {
+      target: { files: [connectionFile] },
+    });
+
+    await waitFor(() => {
+      expect(onImportServiceConnectionFile).toHaveBeenCalledWith(
+        expect.stringContaining('"baseUrl":"https://mpgs.example.test"'),
+      );
+    });
+  });
+
   it("passes the selected batch refresh concurrency to the refresh action", () => {
     const onRefreshAllAnalyses = vi.fn(async (_concurrency: number) => undefined);
 
@@ -329,6 +370,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={vi.fn()}
         status="当前库已就绪。"
       />,
@@ -372,6 +414,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={vi.fn()}
         status="AI 批量重算进行中。"
       />,
@@ -401,6 +444,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={vi.fn()}
         status="当前库已就绪。"
       />,
@@ -429,6 +473,7 @@ describe("Settings and About pages", () => {
         onRefreshDashboard={vi.fn(async () => undefined)}
         onSave={vi.fn(async () => undefined)}
         onStatus={vi.fn()}
+        onImportServiceConnectionFile={vi.fn(async () => undefined)}
         onSync={vi.fn()}
         status="当前库已就绪。"
       />,
