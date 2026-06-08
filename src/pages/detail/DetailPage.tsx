@@ -24,6 +24,7 @@ export function DetailPage({
   onAnalysisUpdated,
   onToggleState,
   isBusy,
+  analysisReadOnly = false,
 }: {
   game: GameCard;
   relatedGames: GameCard[];
@@ -31,12 +32,17 @@ export function DetailPage({
   onAnalysisUpdated?: (report: GameAnalysisReport) => Promise<void> | void;
   onToggleState: (patch: UserGameStatePatch, message: string) => void;
   isBusy: boolean;
+  analysisReadOnly?: boolean;
 }) {
   const [activeTab, setActiveTab] = useState<DetailTab>("ai");
   const [backQueued, setBackQueued] = useState(false);
   const { report, loading, error, expanded, refresh, toggleExpanded } = useGameAnalysis(
     game,
     onAnalysisUpdated,
+    {
+      missingMessage: "公共发现服务暂未公开这款游戏的分析结果。",
+      readOnly: analysisReadOnly,
+    },
   );
   const scoreDisplay = getDisplayedGameScore(game);
   const analysisRefreshPromiseRef = useRef<Promise<void> | null>(null);
@@ -228,6 +234,7 @@ export function DetailPage({
                 error={error}
                 expanded={expanded}
                 loading={loading}
+                readOnly={analysisReadOnly}
                 report={report}
                 onRefresh={() => {
                   void handleAnalysisRefresh();
@@ -380,16 +387,18 @@ export function DetailPage({
             ))}
           </div>
 
-          <button
-            className="gold-button"
-            disabled={isBusy || loading}
-            type="button"
-            onClick={() => {
-              void handleAnalysisRefresh();
-            }}
-          >
-            {isBusy || loading ? "AI 评估中…" : "重新 AI 评估"}
-          </button>
+          {analysisReadOnly ? null : (
+            <button
+              className="gold-button"
+              disabled={isBusy || loading}
+              type="button"
+              onClick={() => {
+                void handleAnalysisRefresh();
+              }}
+            >
+              {isBusy || loading ? "AI 评估中…" : "重新 AI 评估"}
+            </button>
+          )}
         </aside>
       </div>
     </section>

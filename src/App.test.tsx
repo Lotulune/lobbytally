@@ -652,6 +652,33 @@ describe("App dashboard interactions", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("opens public service detail analysis as read-only without local AI generation controls", async () => {
+    const dashboard = buildPublicServiceDashboard();
+    const target = dashboard.newGames[0];
+    const scrollToMock = vi.fn();
+    Object.defineProperty(window, "scrollTo", {
+      configurable: true,
+      value: scrollToMock,
+      writable: true,
+    });
+    getDashboardMock.mockResolvedValue(dashboard);
+    getGameAnalysisMock.mockResolvedValue(null);
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "新游区" });
+    fireEvent.click(screen.getAllByRole("button", { name: new RegExp(target.name) })[0]);
+
+    await screen.findByRole("heading", { level: 1, name: target.name });
+
+    expect(getGameAnalysisMock).toHaveBeenCalledWith(target.appid);
+    expect(generateGameAnalysisMock).not.toHaveBeenCalled();
+    expect(screen.getByText("公共发现服务暂未公开这款游戏的分析结果。")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重新 AI 评估" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "刷新分析" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "重试生成" })).not.toBeInTheDocument();
+  });
+
   it("shows a toast when classic discovery finishes and dismisses it on click", async () => {
     vi.useFakeTimers();
     const runningDashboard = buildClassicDiscoveryDashboard();

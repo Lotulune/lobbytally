@@ -3,10 +3,15 @@ import { generateGameAnalysis, getGameAnalysis } from "../../api/client";
 import type { GameAnalysisReport, GameCard } from "../../types";
 
 type AnalysisUpdatedHandler = (report: GameAnalysisReport) => Promise<void> | void;
+type GameAnalysisOptions = {
+  readOnly?: boolean;
+  missingMessage?: string;
+};
 
 export function useGameAnalysis(
   game: GameCard,
   onAnalysisUpdated?: AnalysisUpdatedHandler,
+  options: GameAnalysisOptions = {},
 ) {
   const [report, setReport] = useState<GameAnalysisReport | null>(null);
   const [loading, setLoading] = useState(true);
@@ -16,9 +21,11 @@ export function useGameAnalysis(
   const mountedRef = useRef(true);
   const currentAppidRef = useRef(game.appid);
   const onAnalysisUpdatedRef = useRef(onAnalysisUpdated);
+  const optionsRef = useRef(options);
 
   currentAppidRef.current = game.appid;
   onAnalysisUpdatedRef.current = onAnalysisUpdated;
+  optionsRef.current = options;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -48,6 +55,17 @@ export function useGameAnalysis(
         return;
       }
 
+      if (optionsRef.current.readOnly) {
+        if (mountedRef.current) {
+          setError(
+            optionsRef.current.missingMessage ??
+              "当前还没有可展示的分析结果。",
+          );
+          setLoading(false);
+        }
+        return;
+      }
+
       const generatedReport = await generateGameAnalysis(appid, false);
       if (!isRequestLatest(requestId, appid)) {
         return;
@@ -70,6 +88,10 @@ export function useGameAnalysis(
 
   async function refresh() {
     const appid = game.appid;
+    if (optionsRef.current.readOnly) {
+      return null;
+    }
+
     const requestId = beginRequest();
 
     try {

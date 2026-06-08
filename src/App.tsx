@@ -878,6 +878,7 @@ function App() {
 
         {activeView === "detail" && selectedGame && (
           <DetailPage
+            analysisReadOnly={isPublicServiceMode}
             game={selectedGame}
             isBusy={isBusy}
             onBack={returnFromDetail}

@@ -5,6 +5,7 @@ export function GameAnalysisPanel({
   loading,
   error,
   expanded,
+  readOnly = false,
   onRefresh,
   onToggleExpanded,
 }: {
@@ -12,6 +13,7 @@ export function GameAnalysisPanel({
   loading: boolean;
   error: string | null;
   expanded: boolean;
+  readOnly?: boolean;
   onRefresh: () => void;
   onToggleExpanded: () => void;
 }) {
@@ -20,7 +22,11 @@ export function GameAnalysisPanel({
       return (
         <div className="detail-content-panel ai-analysis-report ai-analysis-state">
           <h3>AI 详细评估</h3>
-          <p>正在生成这款游戏的详细分析，请稍等片刻。</p>
+          <p>
+            {readOnly
+              ? "正在读取公共发现服务公开的分析结果，请稍等片刻。"
+              : "正在生成这款游戏的详细分析，请稍等片刻。"}
+          </p>
         </div>
       );
     }
@@ -30,9 +36,11 @@ export function GameAnalysisPanel({
         <div className="detail-content-panel ai-analysis-report ai-analysis-state">
           <h3>AI 详细评估</h3>
           <p>{error}</p>
-          <button className="gold-button" type="button" onClick={onRefresh}>
-            重试生成
-          </button>
+          {readOnly ? null : (
+            <button className="gold-button" type="button" onClick={onRefresh}>
+              重试生成
+            </button>
+          )}
         </div>
       );
     }
@@ -123,11 +131,17 @@ export function GameAnalysisPanel({
           >
             {expanded ? "收起完整报告" : "查看完整报告"}
           </button>
-          <button className="muted-button" disabled={loading} type="button" onClick={onRefresh}>
-            {loading ? "刷新中…" : "刷新分析"}
-          </button>
+          {readOnly ? null : (
+            <button className="muted-button" disabled={loading} type="button" onClick={onRefresh}>
+              {loading ? "刷新中…" : "刷新分析"}
+            </button>
+          )}
           <span className="analysis-action-hint">
-            {loading ? "正在更新分析结果…" : "可展开查看优势、风险与证据明细。"}
+            {readOnly
+              ? "公共服务分析为只读结果，可展开查看优势、风险与证据明细。"
+              : loading
+                ? "正在更新分析结果…"
+                : "可展开查看优势、风险与证据明细。"}
           </span>
         </div>
       </div>
