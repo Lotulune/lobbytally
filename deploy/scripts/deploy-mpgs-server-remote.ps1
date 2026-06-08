@@ -84,7 +84,7 @@ foreach ($file in $deployFiles) {
 }
 
 Invoke-Checked "scp" @((Join-Path $root "deploy/config/setup.toml.example"), (Format-RemoteTarget $RemoteHost "$RemotePath/deploy/config/"))
-Invoke-Checked "scp" @((Join-Path $root "deploy/config/active/service.toml"), (Format-RemoteTarget $RemoteHost "$RemotePath/deploy/config/active/"))
+Invoke-Checked "scp" @((Join-Path $root "deploy/config/active/service.toml"), (Format-RemoteTarget $RemoteHost "$RemotePath/deploy/config/active/service.toml.example"))
 Invoke-Checked "scp" @((Join-Path $root "deploy/config/active/secrets.toml.example"), (Format-RemoteTarget $RemoteHost "$RemotePath/deploy/config/active/"))
 Invoke-Checked "scp" @($imageTarPath, (Format-RemoteTarget $RemoteHost "$RemotePath/$remoteImageName"))
 
@@ -117,6 +117,10 @@ cd __REMOTE_PATH__
 if [ ! -f deploy/.env ]; then
   echo "deploy/.env is missing. Copy deploy/mpgs-server.env.example to deploy/.env and set real values on the server." >&2
   exit 2
+fi
+
+if [ ! -f deploy/config/active/service.toml ]; then
+  cp -n deploy/config/active/service.toml.example deploy/config/active/service.toml
 fi
 
 if [ ! -f deploy/config/active/secrets.toml ] && [ ! -f deploy/config/setup.toml ]; then

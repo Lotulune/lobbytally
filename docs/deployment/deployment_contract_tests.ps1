@@ -121,8 +121,15 @@ if ($remoteDeployScript -notmatch 'load -i' -or $remoteDeployScript -notmatch 'c
 if ($remoteDeployScript -notmatch 'UseSudoDocker' -or $remoteDeployScript -notmatch 'sudo -n docker') {
     throw "remote deploy script must support sudo Docker for hosts where the deploy user cannot access the Docker socket directly."
 }
-if ($remoteDeployScript -notmatch 'deploy/config/active/service.toml') {
-    throw "remote deploy script must upload the active service config example for first manual configuration."
+if ($remoteDeployScript -notmatch 'deploy/config/active/service.toml.example') {
+    throw "remote deploy script must upload the service config example without targeting the active service config path."
+}
+$unsafeServiceConfigUpload = $remoteDeployScript -match 'Join-Path\s+\$root\s+"deploy/config/active/service\.toml"\),\s+\(Format-RemoteTarget\s+\$RemoteHost\s+"\$RemotePath/deploy/config/active/(service\.toml)?"\)'
+if ($unsafeServiceConfigUpload) {
+    throw "remote deploy script must not scp service.toml directly into deploy/config/active where it can overwrite active service config."
+}
+if ($remoteDeployScript -notmatch 'cp -n deploy/config/active/service.toml.example deploy/config/active/service.toml') {
+    throw "remote deploy script must initialize missing active service config with cp -n from the uploaded example."
 }
 if ($remoteDeployScript -match 'cargo build|rustc|docker build|docker compose build|npm run|pnpm|yarn') {
     throw "remote deploy script must not compile or build artifacts on the VPS."
