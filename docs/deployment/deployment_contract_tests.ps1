@@ -52,6 +52,9 @@ if ($serviceConfigExample -notmatch '\[service_connection\]' -or $serviceConfigE
 if ($serviceConfigExample -notmatch '\[public_cors\]' -or $serviceConfigExample -notmatch 'allow_any_origin') {
     throw "active service config example must include the public read CORS setting."
 }
+if ($serviceConfigExample -notmatch '\[deployment\]' -or $serviceConfigExample -notmatch 'restart_policy = "compose:unless-stopped"') {
+    throw "active service config example must include the Compose restart policy metadata."
+}
 if ($deploymentDoc -notmatch 'service_connection\.public_base_url' -or $deploymentDoc -notmatch 'connection-share API') {
     throw "deployment docs must describe the public base URL used for keyless connection sharing."
 }
@@ -78,6 +81,9 @@ if ($deploymentDoc -notmatch 'validates pending service configuration before pro
 }
 if ($deploymentDoc -notmatch '/api/v1/admin/restart' -or $deploymentDoc -notmatch 'restart: unless-stopped') {
     throw "deployment docs must describe the managed restart API and Compose restart policy."
+}
+if ($deploymentDoc -notmatch '/api/v1/admin/diagnostics' -or $deploymentDoc -notmatch 'public base URL' -or $deploymentDoc -notmatch 'provider configuration presence') {
+    throw "deployment docs must describe admin diagnostics for deployment status."
 }
 if ($deploymentDoc -notmatch 'does not use the Docker socket' -or $deploymentDoc -notmatch 'restart-helper' -or $deploymentDoc -notmatch 'host commands') {
     throw "deployment docs must forbid Docker socket, restart-helper, and host command restart control."

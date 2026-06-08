@@ -38,6 +38,14 @@ pub struct AdminDiagnosticsResponse {
     pub postgres: String,
     pub active_config: String,
     pub safe_mode: bool,
+    pub public_base_url: Option<String>,
+    pub public_base_url_status: String,
+    pub https_status: String,
+    pub public_cors: String,
+    pub restart_policy: String,
+    pub steam: String,
+    pub llm: String,
+    pub r2: String,
 }
 
 impl AdminAuthConfig {

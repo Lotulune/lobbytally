@@ -72,6 +72,13 @@ Management configuration changes are written under `deploy/config/pending` first
 
 `/api/v1/admin/restart` validates pending service configuration, requires admin authentication and explicit confirmation, then gracefully exits the service process so Docker Compose can restart it. It does not use the Docker socket, a restart-helper container, or arbitrary host commands. On the next startup, the service validates pending service configuration before promoting it to active.
 
+The management diagnostics API reports the configured restart policy as deployment metadata rather than probing Docker from inside the container:
+
+```toml
+[deployment]
+restart_policy = "compose:unless-stopped"
+```
+
 For manual offline configuration instead, create the active secrets file:
 
 ```bash
@@ -100,6 +107,8 @@ allow_any_origin = true
 ```
 
 This only affects public read routes such as `/api/v1/service-info` and `/api/v1/discovery-home`. Management, setup, and restart routes stay same-origin and must be used through the served management surface.
+
+`/api/v1/admin/diagnostics` is admin-only and reports public base URL, HTTPS suitability, public CORS mode, restart policy metadata, and provider configuration presence using redacted statuses such as `configured` or `missing`. It must not return Steam, LLM, R2, setup, or admin token values.
 
 For the default Compose network, `deploy/config/active/secrets.toml` should use:
 

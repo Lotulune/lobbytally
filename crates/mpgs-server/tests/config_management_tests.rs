@@ -34,6 +34,9 @@ public_base_url = "https://mpgs.example.test"
 
 [public_cors]
 allow_any_origin = true
+
+[deployment]
+restart_policy = "compose:unless-stopped"
 "#,
     )
     .unwrap();
@@ -165,6 +168,8 @@ async fn admin_pending_service_identity_writes_pending_config_and_preserves_acti
     assert!(pending_service.contains("public_base_url = \"https://mpgs.example.test\""));
     assert!(pending_service.contains("[public_cors]"));
     assert!(pending_service.contains("allow_any_origin = true"));
+    assert!(pending_service.contains("[deployment]"));
+    assert!(pending_service.contains("restart_policy = \"compose:unless-stopped\""));
     assert!(active_secrets.contains("active-steam-key"));
     assert!(!temp_dir.path().join("pending/secrets.toml").exists());
 
@@ -234,6 +239,36 @@ async fn admin_connection_share_returns_keyless_service_connection_file() {
         "https://mpgs.example.test/api/v1/service-info"
     );
     assert_eq!(value["capabilities"][0], "public_catalog_read");
+    assert!(value.get("adminToken").is_none());
+    assert!(value.get("setupToken").is_none());
+}
+
+#[tokio::test]
+async fn admin_diagnostics_reports_deployment_status_without_secret_values() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    write_active_config(temp_dir.path());
+    let app = config_management_app(temp_dir.path());
+    let cookie = admin_cookie(app.clone()).await;
+
+    let (status, value, _headers) = request_json(
+        app,
+        Method::GET,
+        "/api/v1/admin/diagnostics",
+        json!({}),
+        Some(&cookie),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["publicBaseUrl"], "https://mpgs.example.test");
+    assert_eq!(value["publicBaseUrlStatus"], "configured");
+    assert_eq!(value["httpsStatus"], "ok");
+    assert_eq!(value["publicCors"], "allow_any_origin");
+    assert_eq!(value["restartPolicy"], "compose:unless-stopped");
+    assert_eq!(value["steam"], "configured");
+    assert_eq!(value["llm"], "missing");
+    assert_eq!(value["r2"], "missing");
+    assert!(value.get("steamApiKey").is_none());
     assert!(value.get("adminToken").is_none());
     assert!(value.get("setupToken").is_none());
 }

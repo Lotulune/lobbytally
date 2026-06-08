@@ -175,6 +175,10 @@ async fn admin_session_cookie_allows_overview_and_diagnostics() {
     assert_eq!(overview["publicCatalogStatus"], "empty");
     assert_eq!(diagnostics_status, StatusCode::OK);
     assert_eq!(diagnostics["postgres"], "ok");
+    assert_eq!(diagnostics["publicBaseUrlStatus"], "missing");
+    assert_eq!(diagnostics["httpsStatus"], "unknown");
+    assert_eq!(diagnostics["publicCors"], "disabled");
+    assert_eq!(diagnostics["restartPolicy"], "external_required");
     assert!(diagnostics.get("adminToken").is_none());
 }
 

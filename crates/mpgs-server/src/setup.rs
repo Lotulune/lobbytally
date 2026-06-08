@@ -77,6 +77,9 @@ public_base_url = "{public_base_url}"
 
 [public_cors]
 allow_any_origin = true
+
+[deployment]
+restart_policy = "compose:unless-stopped"
 "#,
             service_name = escape_toml_string(&request.service_name),
             public_base_url =

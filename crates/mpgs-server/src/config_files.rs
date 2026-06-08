@@ -44,12 +44,40 @@ pub struct ServiceConnectionFileResponse {
     pub capabilities: Vec<ServiceCapability>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDeploymentDiagnostics {
+    pub public_base_url: Option<String>,
+    pub public_base_url_status: String,
+    pub https_status: String,
+    pub public_cors: String,
+    pub restart_policy: String,
+    pub steam: String,
+    pub llm: String,
+    pub r2: String,
+}
+
+impl Default for ConfigDeploymentDiagnostics {
+    fn default() -> Self {
+        Self {
+            public_base_url: None,
+            public_base_url_status: "missing".to_string(),
+            https_status: "unknown".to_string(),
+            public_cors: "disabled".to_string(),
+            restart_policy: "external_required".to_string(),
+            steam: "unknown".to_string(),
+            llm: "unknown".to_string(),
+            r2: "unknown".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ActiveServiceConfig {
     bind_addr: Option<String>,
     service_identity: ActiveServiceIdentityConfig,
     service_connection: Option<ActiveServiceConnectionConfig>,
     public_cors: Option<ActivePublicCorsConfig>,
+    deployment: Option<ActiveDeploymentConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +95,11 @@ struct ActiveServiceConnectionConfig {
 #[derive(Debug, Deserialize)]
 struct ActivePublicCorsConfig {
     allow_any_origin: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ActiveDeploymentConfig {
+    restart_policy: Option<String>,
 }
 
 impl ConfigFileManager {
@@ -142,6 +175,21 @@ allow_any_origin = {allow_any_origin}
         } else {
             service_toml
         };
+        let service_toml = if let Some(deployment) = active_service.deployment.as_ref() {
+            if let Some(restart_policy) = deployment.restart_policy.as_deref() {
+                format!(
+                    r#"{service_toml}
+[deployment]
+restart_policy = "{restart_policy}"
+"#,
+                    restart_policy = escape_toml_string(restart_policy)
+                )
+            } else {
+                service_toml
+            }
+        } else {
+            service_toml
+        };
         atomic_write(&pending_service_path(&self.config_dir), &service_toml)?;
 
         Ok(PendingConfigResponse {
@@ -168,6 +216,46 @@ allow_any_origin = {allow_any_origin}
             base_url,
             capabilities: vec![ServiceCapability::PublicCatalogRead],
         })
+    }
+
+    pub fn deployment_diagnostics(&self) -> ConfigDeploymentDiagnostics {
+        let Ok(active_service) = read_service_config(&active_service_path(&self.config_dir)) else {
+            return ConfigDeploymentDiagnostics::default();
+        };
+
+        let public_base_url = active_service
+            .service_connection
+            .as_ref()
+            .map(|connection| normalize_public_base_url(&connection.public_base_url).to_string());
+        let secrets = read_secrets_toml(&active_secrets_path(&self.config_dir)).ok();
+
+        ConfigDeploymentDiagnostics {
+            public_base_url_status: public_base_url_status(public_base_url.as_deref()),
+            https_status: https_status(public_base_url.as_deref()),
+            public_cors: if active_service
+                .public_cors
+                .as_ref()
+                .and_then(|cors| cors.allow_any_origin)
+                .unwrap_or(false)
+            {
+                "allow_any_origin".to_string()
+            } else {
+                "disabled".to_string()
+            },
+            restart_policy: active_service
+                .deployment
+                .and_then(|deployment| deployment.restart_policy)
+                .filter(|restart_policy| !restart_policy.trim().is_empty())
+                .unwrap_or_else(|| "external_required".to_string()),
+            steam: provider_status(secrets.as_ref(), "steam", &["api_key"]),
+            llm: provider_status(secrets.as_ref(), "llm", &["api_key"]),
+            r2: provider_status(
+                secrets.as_ref(),
+                "r2",
+                &["access_key_id", "secret_access_key", "bucket"],
+            ),
+            public_base_url,
+        }
     }
 
     pub fn validate_pending_service_config(&self) -> io::Result<bool> {
@@ -201,6 +289,11 @@ fn read_service_config(path: &Path) -> io::Result<ActiveServiceConfig> {
     toml::from_str(&contents).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+fn read_secrets_toml(path: &Path) -> io::Result<toml::Value> {
+    let contents = fs::read_to_string(path)?;
+    toml::from_str(&contents).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 fn active_service_path(config_dir: &Path) -> PathBuf {
     config_dir.join("active").join("service.toml")
 }
@@ -225,4 +318,51 @@ fn escape_toml_string(value: &str) -> String {
 
 fn normalize_public_base_url(value: &str) -> &str {
     value.trim().trim_end_matches('/')
+}
+
+fn public_base_url_status(base_url: Option<&str>) -> String {
+    match base_url {
+        Some(value) if !value.trim().is_empty() => "configured".to_string(),
+        _ => "missing".to_string(),
+    }
+}
+
+fn https_status(base_url: Option<&str>) -> String {
+    let Some(base_url) = base_url else {
+        return "unknown".to_string();
+    };
+    let value = base_url.trim().to_ascii_lowercase();
+    if value.starts_with("https://") {
+        "ok".to_string()
+    } else if value.starts_with("http://localhost")
+        || value.starts_with("http://127.0.0.1")
+        || value.starts_with("http://[::1]")
+    {
+        "local_http_allowed".to_string()
+    } else if value.starts_with("http://") {
+        "public_http_rejected_by_clients".to_string()
+    } else {
+        "invalid_url".to_string()
+    }
+}
+
+fn provider_status(secrets: Option<&toml::Value>, section: &str, keys: &[&str]) -> String {
+    let Some(table) = secrets
+        .and_then(|value| value.get(section))
+        .and_then(toml::Value::as_table)
+    else {
+        return "missing".to_string();
+    };
+
+    if keys.iter().any(|key| {
+        table
+            .get(*key)
+            .and_then(toml::Value::as_str)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    }) {
+        "configured".to_string()
+    } else {
+        "missing".to_string()
+    }
 }

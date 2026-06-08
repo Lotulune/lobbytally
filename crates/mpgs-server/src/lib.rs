@@ -22,8 +22,8 @@ use axum::{
 };
 pub use config::{ConfigError, ConfigHealth, ServerConfig, StartupConfig};
 use config_files::{
-    ConfigFileManager, ConfigStateResponse, PendingConfigResponse, PendingServiceIdentityRequest,
-    ServiceConnectionFileResponse,
+    ConfigDeploymentDiagnostics, ConfigFileManager, ConfigStateResponse, PendingConfigResponse,
+    PendingServiceIdentityRequest, ServiceConnectionFileResponse,
 };
 pub use cors::PublicCorsConfig;
 use health::{HealthResponse, HealthStatus};
@@ -696,6 +696,12 @@ async fn admin_diagnostics(State(state): State<AppState>, headers: HeaderMap) ->
         return admin_session_required_response();
     }
 
+    let deployment = state
+        .config_file_manager
+        .as_ref()
+        .map(ConfigFileManager::deployment_diagnostics)
+        .unwrap_or_else(ConfigDeploymentDiagnostics::default);
+
     Json(AdminDiagnosticsResponse {
         postgres: if state.database_health.is_healthy().await {
             "ok".to_string()
@@ -708,6 +714,14 @@ async fn admin_diagnostics(State(state): State<AppState>, headers: HeaderMap) ->
             "unavailable".to_string()
         },
         safe_mode: state.database_health.is_safe_mode(),
+        public_base_url: deployment.public_base_url,
+        public_base_url_status: deployment.public_base_url_status,
+        https_status: deployment.https_status,
+        public_cors: deployment.public_cors,
+        restart_policy: deployment.restart_policy,
+        steam: deployment.steam,
+        llm: deployment.llm,
+        r2: deployment.r2,
     })
     .into_response()
 }

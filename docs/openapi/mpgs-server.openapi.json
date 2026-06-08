@@ -833,17 +833,51 @@
         "required": [
           "postgres",
           "activeConfig",
-          "safeMode"
+          "safeMode",
+          "publicBaseUrlStatus",
+          "httpsStatus",
+          "publicCors",
+          "restartPolicy",
+          "steam",
+          "llm",
+          "r2"
         ],
         "properties": {
           "activeConfig": {
             "type": "string"
           },
+          "httpsStatus": {
+            "type": "string"
+          },
+          "llm": {
+            "type": "string"
+          },
           "postgres": {
+            "type": "string"
+          },
+          "publicBaseUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "publicBaseUrlStatus": {
+            "type": "string"
+          },
+          "publicCors": {
+            "type": "string"
+          },
+          "r2": {
+            "type": "string"
+          },
+          "restartPolicy": {
             "type": "string"
           },
           "safeMode": {
             "type": "boolean"
+          },
+          "steam": {
+            "type": "string"
           }
         }
       },

@@ -113,6 +113,8 @@ async fn setup_complete_writes_active_config_without_storing_admin_token_plainte
     assert!(service_toml.contains("public_base_url = \"https://mpgs.example.test\""));
     assert!(service_toml.contains("[public_cors]"));
     assert!(service_toml.contains("allow_any_origin = true"));
+    assert!(service_toml.contains("[deployment]"));
+    assert!(service_toml.contains("restart_policy = \"compose:unless-stopped\""));
     assert!(secrets_toml.contains("postgres://mpgs:secret@postgres:5432/mpgs"));
     assert!(secrets_toml.contains("fake-steam-key"));
     assert!(!secrets_toml.contains("new-admin-token"));
