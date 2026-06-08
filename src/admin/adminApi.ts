@@ -1,4 +1,5 @@
 import type {
+  AdminAuditEventsResponse,
   AdminDiagnosticsResponse,
   AdminOverviewResponse,
   AdminSessionResponse,
@@ -58,6 +59,10 @@ export async function getAdminConfigState(): Promise<ConfigStateResponse> {
 
 export async function getAdminConnectionShare(): Promise<ServiceConnectionFileResponse> {
   return readAdminJson("/api/v1/admin/connection-share");
+}
+
+export async function getAdminAuditEvents(): Promise<AdminAuditEventsResponse> {
+  return readAdminJson("/api/v1/admin/audit-events");
 }
 
 export async function requestRestart(): Promise<RestartResponse> {

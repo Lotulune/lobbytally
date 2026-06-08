@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import type {
+  AdminAuditEventsResponse,
   AdminDiagnosticsResponse,
   AdminOverviewResponse,
   ConfigStateResponse,
@@ -8,6 +9,7 @@ import type {
 } from "../api/generated/mpgsServerApi";
 import {
   completeSetup,
+  getAdminAuditEvents,
   getAdminConfigState,
   getAdminConnectionShare,
   getAdminDiagnostics,
@@ -29,6 +31,7 @@ type AdminData = {
   diagnostics: AdminDiagnosticsResponse;
   configState: ConfigStateResponse;
   connectionShare: ServiceConnectionFileResponse;
+  auditEvents: AdminAuditEventsResponse;
 };
 
 const initialSetupForm: SetupCompleteRequest = {
@@ -107,14 +110,15 @@ export function AdminApp() {
   }
 
   async function refreshAdminData() {
-    const [overview, diagnostics, configState, connectionShare] =
+    const [overview, diagnostics, configState, connectionShare, auditEvents] =
       await Promise.all([
         getAdminOverview(),
         getAdminDiagnostics(),
         getAdminConfigState(),
         getAdminConnectionShare(),
+        getAdminAuditEvents(),
       ]);
-    setAdminData({ overview, diagnostics, configState, connectionShare });
+    setAdminData({ overview, diagnostics, configState, connectionShare, auditEvents });
   }
 
   async function handleRefresh() {
@@ -469,6 +473,26 @@ function OverviewPanel({
             />
           ) : (
             <p className="admin-muted">暂无审计事件</p>
+          )}
+        </div>
+
+        <div className="admin-panel">
+          <h2>运维日志</h2>
+          {data.auditEvents.events.length > 0 ? (
+            <div className="admin-log-list">
+              {data.auditEvents.events.map((event, index) => (
+                <div
+                  className="admin-log-row"
+                  key={`${event.eventType}-${event.actor}-${event.outcome}-${index}`}
+                >
+                  <strong>{event.eventType}</strong>
+                  <span>{event.actor}</span>
+                  <em>{event.outcome}</em>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="admin-muted">暂无运维日志</p>
           )}
         </div>
       </section>

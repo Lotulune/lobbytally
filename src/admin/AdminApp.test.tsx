@@ -106,6 +106,22 @@ describe("AdminApp", () => {
           serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
           capabilities: ["public_catalog_read"],
         }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          events: [
+            {
+              eventType: "admin.restart.requested",
+              actor: "admin",
+              outcome: "success",
+            },
+            {
+              eventType: "admin.session.login",
+              actor: "admin",
+              outcome: "success",
+            },
+          ],
+        }),
       );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -123,9 +139,11 @@ describe("AdminApp", () => {
     expect(screen.getByText("sha256:pending")).toBeInTheDocument();
     expect(screen.getByText("https://mpgs.example.test")).toBeInTheDocument();
     expect(screen.getByText("最近审计")).toBeInTheDocument();
-    expect(screen.getByText("admin.restart.requested")).toBeInTheDocument();
-    expect(screen.getByText("admin")).toBeInTheDocument();
-    expect(screen.getByText("success")).toBeInTheDocument();
+    expect(screen.getAllByText("admin.restart.requested").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("admin").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("success").length).toBeGreaterThan(0);
+    expect(screen.getByText("运维日志")).toBeInTheDocument();
+    expect(screen.getByText("admin.session.login")).toBeInTheDocument();
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith("/api/v1/admin/overview", {
@@ -204,7 +222,8 @@ describe("AdminApp", () => {
           lastStartupStatus: "ok",
         }),
       )
-      .mockResolvedValueOnce(jsonResponse(connectionShare));
+      .mockResolvedValueOnce(jsonResponse(connectionShare))
+      .mockResolvedValueOnce(jsonResponse({ events: [] }));
     vi.stubGlobal("fetch", fetchMock);
 
     render(<AdminApp />);

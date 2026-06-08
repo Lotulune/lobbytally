@@ -2,6 +2,10 @@
 // This file is generated. Do not edit by hand.
 // Generated from docs/openapi/mpgs-server.openapi.json.
 
+export interface AdminAuditEventsResponse {
+  events: AdminAuditEventSummary[];
+}
+
 export interface AdminAuditEventSummary {
   actor: string;
   eventType: string;

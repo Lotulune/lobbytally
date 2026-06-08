@@ -233,6 +233,33 @@ pub async fn latest_audit_event(
     .transpose()
 }
 
+pub async fn recent_audit_events(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<AuditEvent>, sqlx_core::error::Error> {
+    let rows = sqlx_core::query::query::<Postgres>(
+        r#"
+        SELECT event_type, actor, outcome
+        FROM ops.audit_events
+        ORDER BY id DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(AuditEvent {
+                event_type: row.try_get("event_type")?,
+                actor: row.try_get("actor")?,
+                outcome: row.try_get("outcome")?,
+            })
+        })
+        .collect()
+}
+
 pub async fn admin_overview_stats(
     pool: &PgPool,
 ) -> Result<AdminOverviewStats, sqlx_core::error::Error> {

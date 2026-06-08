@@ -328,6 +328,45 @@ p {
   overflow-wrap: anywhere;
 }
 
+.admin-log-list {
+  display: grid;
+  gap: 10px;
+}
+
+.admin-log-row {
+  align-items: center;
+  background: var(--admin-panel-strong);
+  border: 1px solid var(--admin-line);
+  border-radius: 7px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 80px 90px;
+  min-width: 0;
+  padding: 10px 12px;
+}
+
+.admin-log-row strong,
+.admin-log-row span,
+.admin-log-row em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-log-row strong {
+  color: var(--admin-ink);
+}
+
+.admin-log-row span {
+  color: var(--admin-muted);
+}
+
+.admin-log-row em {
+  color: var(--admin-green);
+  font-style: normal;
+  font-weight: 800;
+}
+
 @media (max-width: 1020px) {
   .admin-shell {
     grid-template-columns: 1fr;
@@ -370,6 +409,10 @@ p {
   }
 
   .admin-dl div {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-log-row {
     grid-template-columns: 1fr;
   }
 }

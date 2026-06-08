@@ -294,6 +294,48 @@ async fn admin_overview_reports_latest_audit_event_without_secret_values() {
 }
 
 #[tokio::test]
+async fn admin_audit_events_requires_session_cookie() {
+    let (status, value) = get_json("/api/v1/admin/audit-events", None).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(value["error"]["code"], "admin_session_required");
+}
+
+#[tokio::test]
+async fn admin_audit_events_lists_recent_records_without_secret_values() {
+    let audit = AuditSink::memory();
+    audit.record_for_test("admin.config.pending_service_identity", "admin", "success");
+    let app = build_router_with_state(admin_state().with_audit_sink(audit));
+    let cookie = admin_cookie_for(app.clone()).await;
+
+    let response = request_json_from(
+        app,
+        Method::GET,
+        "/api/v1/admin/audit-events",
+        json!({}),
+        Some(&cookie),
+    )
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["events"][0]["eventType"], "admin.session.login");
+    assert_eq!(
+        value["events"][1]["eventType"],
+        "admin.config.pending_service_identity"
+    );
+    assert_eq!(value["events"][0]["actor"], "admin");
+    assert_eq!(value["events"][0]["outcome"], "success");
+    assert!(value["events"][0].get("token").is_none());
+    assert!(value["events"][0].get("adminToken").is_none());
+    assert!(value["events"][0].get("secret").is_none());
+}
+
+#[tokio::test]
 async fn admin_routes_are_rate_limited() {
     let app = build_router_with_state(
         admin_state().with_rate_limits(RateLimiters::new(RateLimitConfig::for_tests(1))),

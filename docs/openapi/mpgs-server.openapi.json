@@ -9,6 +9,46 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/v1/admin/audit-events": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "admin_audit_events",
+        "responses": {
+          "200": {
+            "description": "Recent admin audit events",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAuditEventsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin session required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Request rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/admin/config-state": {
       "get": {
         "tags": [
@@ -844,6 +884,20 @@
           },
           "outcome": {
             "type": "string"
+          }
+        }
+      },
+      "AdminAuditEventsResponse": {
+        "type": "object",
+        "required": [
+          "events"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminAuditEventSummary"
+            }
           }
         }
       },

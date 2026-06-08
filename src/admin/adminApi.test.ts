@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   completeSetup,
+  getAdminAuditEvents,
   getAdminConnectionShare,
   getAdminDiagnostics,
   getAdminOverview,
@@ -122,6 +123,17 @@ describe("admin API client", () => {
         }),
       )
       .mockResolvedValueOnce(
+        jsonResponse({
+          events: [
+            {
+              eventType: "admin.session.login",
+              actor: "admin",
+              outcome: "success",
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(
         jsonResponse({ restartScheduled: true, mode: "self_exit" }, 202),
       );
     vi.stubGlobal("fetch", fetchMock);
@@ -130,6 +142,7 @@ describe("admin API client", () => {
     await getAdminDiagnostics();
     await getAdminConfigState();
     await getAdminConnectionShare();
+    await getAdminAuditEvents();
     await requestRestart();
 
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/admin/overview", {
@@ -152,7 +165,11 @@ describe("admin API client", () => {
         headers: { Accept: "application/json" },
       },
     );
-    expect(fetchMock).toHaveBeenNthCalledWith(5, "/api/v1/admin/restart", {
+    expect(fetchMock).toHaveBeenNthCalledWith(5, "/api/v1/admin/audit-events", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(6, "/api/v1/admin/restart", {
       body: JSON.stringify({ confirm: true }),
       credentials: "same-origin",
       headers: {

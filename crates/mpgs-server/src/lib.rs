@@ -11,8 +11,8 @@ pub mod setup;
 
 pub use admin::AdminAuthConfig;
 use admin::{
-    AdminAuditEventSummary, AdminDiagnosticsResponse, AdminOverviewResponse, AdminSessionRequest,
-    AdminSessionResponse,
+    AdminAuditEventSummary, AdminAuditEventsResponse, AdminDiagnosticsResponse,
+    AdminOverviewResponse, AdminSessionRequest, AdminSessionResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -258,6 +258,19 @@ impl AuditSink {
         }
     }
 
+    #[doc(hidden)]
+    pub fn record_for_test(&self, event_type: &str, actor: &str, outcome: &str) {
+        if let Self::Memory(records) = self {
+            if let Ok(mut records) = records.lock() {
+                records.push(AuditRecord {
+                    event_type: event_type.to_string(),
+                    actor: actor.to_string(),
+                    outcome: outcome.to_string(),
+                });
+            }
+        }
+    }
+
     async fn record(&self, event_type: &str, actor: &str, outcome: &str) {
         match self {
             Self::Noop => {}
@@ -292,6 +305,26 @@ impl AuditSink {
                 .lock()
                 .ok()
                 .and_then(|records| records.last().cloned()),
+        }
+    }
+
+    async fn recent(&self, limit: usize) -> Vec<AuditRecord> {
+        match self {
+            Self::Noop => Vec::new(),
+            Self::Pool(pool) => db::recent_audit_events(pool, limit as i64)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|event| AuditRecord {
+                    event_type: event.event_type,
+                    actor: event.actor,
+                    outcome: event.outcome,
+                })
+                .collect(),
+            Self::Memory(records) => records
+                .lock()
+                .map(|records| records.iter().rev().take(limit).cloned().collect())
+                .unwrap_or_default(),
         }
     }
 }
@@ -381,6 +414,7 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .route("/api/v1/admin/session", post(admin_session))
         .route("/api/v1/admin/overview", get(admin_overview))
         .route("/api/v1/admin/diagnostics", get(admin_diagnostics))
+        .route("/api/v1/admin/audit-events", get(admin_audit_events))
         .route("/api/v1/admin/config-state", get(admin_config_state))
         .route(
             "/api/v1/admin/connection-share",
@@ -759,6 +793,40 @@ async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Re
         latest_audit_event,
     })
     .into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/audit-events",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Recent admin audit events", body = AdminAuditEventsResponse),
+        (status = 429, description = "Request rate limited", body = ServiceErrorEnvelope),
+        (status = 401, description = "Admin session required", body = ServiceErrorEnvelope)
+    )
+)]
+async fn admin_audit_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.rate_limits.allow(RateLimitBucket::Admin) {
+        return rate_limited_response();
+    }
+
+    if !admin_session_is_valid(&state, &headers) {
+        return admin_session_required_response();
+    }
+
+    let events = state
+        .audit
+        .recent(20)
+        .await
+        .into_iter()
+        .map(|event| AdminAuditEventSummary {
+            event_type: event.event_type,
+            actor: event.actor,
+            outcome: event.outcome,
+        })
+        .collect();
+
+    Json(AdminAuditEventsResponse { events }).into_response()
 }
 
 #[utoipa::path(
@@ -1434,6 +1502,7 @@ fn content_type_for_path(path: &FsPath) -> HeaderValue {
         game_analysis,
         admin_session,
         admin_overview,
+        admin_audit_events,
         admin_diagnostics,
         admin_config_state,
         admin_connection_share,
@@ -1445,6 +1514,7 @@ fn content_type_for_path(path: &FsPath) -> HeaderValue {
     ),
     components(schemas(
         admin::AdminDiagnosticsResponse,
+        admin::AdminAuditEventsResponse,
         admin::AdminAuditEventSummary,
         admin::AdminOverviewResponse,
         admin::AdminSessionRequest,

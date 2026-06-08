@@ -47,6 +47,12 @@ pub struct AdminAuditEventSummary {
 
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct AdminAuditEventsResponse {
+    pub events: Vec<AdminAuditEventSummary>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AdminDiagnosticsResponse {
     pub postgres: String,
     pub active_config: String,
