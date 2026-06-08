@@ -57,6 +57,23 @@ fn database_health_checks_the_sqlx_migration_record() {
 }
 
 #[test]
+fn public_catalog_status_counts_only_anonymous_visible_public_games() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("db.rs");
+    let source = fs::read_to_string(&source_path).expect("db source should exist");
+
+    let status_fn = source
+        .split("pub async fn public_catalog_status")
+        .nth(1)
+        .and_then(|tail| tail.split("pub async fn public_catalog_revision").next())
+        .expect("public catalog status function should exist");
+
+    assert!(status_fn.contains("review_status = 'accepted'"));
+    assert!(status_fn.contains("visibility = 'public'"));
+}
+
+#[test]
 fn audit_migration_creates_ops_audit_events_without_secret_columns() {
     let migration_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("migrations")

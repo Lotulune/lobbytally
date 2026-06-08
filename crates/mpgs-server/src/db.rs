@@ -77,7 +77,12 @@ pub async fn public_catalog_status(
     pool: &PgPool,
 ) -> Result<PublicCatalogStatus, sqlx_core::error::Error> {
     let public_game_count: i64 = sqlx_core::query_scalar::query_scalar::<Postgres, i64>(
-        "SELECT COUNT(*) FROM public_catalog.games",
+        r#"
+        SELECT COUNT(*)
+        FROM public_catalog.games
+        WHERE review_status = 'accepted'
+          AND visibility = 'public'
+        "#,
     )
     .fetch_one(pool)
     .await?;
