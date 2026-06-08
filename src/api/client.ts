@@ -1,4 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentServiceConnection } from "../domain/serviceConnectionStorage";
+import { setStoredUserGameState } from "../domain/userGameStateStorage";
+import {
+  fetchPublicDashboard,
+  fetchPublicGameAnalysis,
+} from "./publicServiceClient";
 import { mockDashboard } from "../data/mockDashboard";
 import type {
   AiAssessment,
@@ -211,6 +217,11 @@ function upsertMockDiscoverySnapshot(snapshot: DiscoveryRunSnapshot) {
 }
 
 export async function getDashboard(): Promise<DashboardPayload> {
+  const serviceConnection = getCurrentServiceConnection();
+  if (serviceConnection) {
+    return fetchPublicDashboard(serviceConnection);
+  }
+
   if (!isTauriRuntime()) return mockDashboard;
   return invoke<DashboardPayload>("get_dashboard");
 }
@@ -466,6 +477,11 @@ export function getDefaultLlmModel(provider: LlmProvider): string {
 export async function getGameAnalysis(
   appid: number,
 ): Promise<GameAnalysisReport | null> {
+  const serviceConnection = getCurrentServiceConnection();
+  if (serviceConnection) {
+    return fetchPublicGameAnalysis(serviceConnection, appid);
+  }
+
   if (!isTauriRuntime()) {
     const cached = mockGameAnalysisCache.get(appid);
     return cached ? cloneGameAnalysisReport(cached) : null;
@@ -478,6 +494,15 @@ export async function generateGameAnalysis(
   appid: number,
   forceRefresh = false,
 ): Promise<GameAnalysisReport> {
+  const serviceConnection = getCurrentServiceConnection();
+  if (serviceConnection) {
+    const report = await fetchPublicGameAnalysis(serviceConnection, appid);
+    if (!report) {
+      throw new Error("公共发现服务暂未提供该游戏分析。");
+    }
+    return report;
+  }
+
   if (!isTauriRuntime()) {
     if (!forceRefresh) {
       const cached = mockGameAnalysisCache.get(appid);
@@ -506,6 +531,15 @@ export async function setGameUserState(
   appid: number,
   patch: UserGameStatePatch,
 ): Promise<UserGameState> {
+  const serviceConnection = getCurrentServiceConnection();
+  if (serviceConnection) {
+    return setStoredUserGameState(
+      serviceConnection.info.serviceInstanceId,
+      appid,
+      patch,
+    );
+  }
+
   if (!isTauriRuntime()) {
     const game = allMockGames().find((item) => item.appid === appid);
     if (!game) throw new Error(`未找到 Steam App ${appid}`);
