@@ -207,6 +207,14 @@ p {
   margin-top: 18px;
 }
 
+.admin-inline-form {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin-bottom: 14px;
+}
+
 .admin-panel-actions {
   margin-top: 16px;
 }
@@ -331,6 +339,45 @@ p {
 .admin-log-list {
   display: grid;
   gap: 10px;
+}
+
+.admin-task-list,
+.admin-failure-list {
+  display: grid;
+  gap: 10px;
+}
+
+.admin-task-row,
+.admin-failure-row {
+  background: var(--admin-panel-strong);
+  border: 1px solid var(--admin-line);
+  border-radius: 7px;
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 10px 12px;
+}
+
+.admin-task-row strong,
+.admin-task-row span,
+.admin-task-row p,
+.admin-failure-row strong,
+.admin-failure-row span,
+.admin-failure-row p {
+  overflow-wrap: anywhere;
+}
+
+.admin-task-row strong,
+.admin-failure-row strong {
+  color: var(--admin-ink);
+}
+
+.admin-task-row span,
+.admin-failure-row span,
+.admin-task-row p,
+.admin-failure-row p {
+  color: var(--admin-muted);
+  margin: 0;
 }
 
 .admin-review-list {
@@ -465,6 +512,10 @@ p {
   }
 
   .admin-dl div {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-inline-form {
     grid-template-columns: 1fr;
   }
 

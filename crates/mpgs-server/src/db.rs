@@ -1,4 +1,7 @@
-use crate::admin::AdminReviewAction;
+use crate::admin::{
+    AdminReviewAction, AdminTaskFailureItem, AdminTaskFailureSummary, AdminTaskKind,
+    AdminTaskSummary,
+};
 use crate::public_catalog::{
     AdminReviewCandidate, DiscoveryHomeResponse, DiscoveryHomeSections, PageMeta,
     PublicGameAnalysis, PublicGameDetail, PublicGameListItem, PublicGamesPage,
@@ -13,6 +16,7 @@ const INITIAL_MIGRATION_SQL: &str = include_str!("../migrations/0001_public_cata
 const AUDIT_EVENTS_MIGRATION_SQL: &str = include_str!("../migrations/0002_ops_audit_events.sql");
 const ADMIN_REVIEW_NOTES_MIGRATION_SQL: &str =
     include_str!("../migrations/0003_admin_review_notes.sql");
+const OPS_TASKS_MIGRATION_SQL: &str = include_str!("../migrations/0004_ops_tasks.sql");
 
 #[derive(Debug, Clone)]
 pub struct ServiceConfigState {
@@ -27,6 +31,13 @@ pub struct AuditEvent {
     pub event_type: String,
     pub actor: String,
     pub outcome: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminTaskControlState {
+    pub recent_tasks: Vec<AdminTaskSummary>,
+    pub failure_summary: AdminTaskFailureSummary,
+    pub failures: Vec<AdminTaskFailureItem>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -64,6 +75,13 @@ pub fn migrator() -> Migrator {
                 Cow::Borrowed("admin_review_notes"),
                 MigrationType::Simple,
                 Cow::Borrowed(ADMIN_REVIEW_NOTES_MIGRATION_SQL),
+                false,
+            ),
+            Migration::new(
+                4,
+                Cow::Borrowed("ops_tasks"),
+                MigrationType::Simple,
+                Cow::Borrowed(OPS_TASKS_MIGRATION_SQL),
                 false,
             ),
         ]),
@@ -132,6 +150,12 @@ pub async fn migration_health_check(pool: &PgPool) -> Result<bool, sqlx_core::er
             FROM _sqlx_migrations
             WHERE version = 3
               AND description = 'admin_review_notes'
+              AND success = TRUE
+        ) AND EXISTS (
+            SELECT 1
+            FROM _sqlx_migrations
+            WHERE version = 4
+              AND description = 'ops_tasks'
               AND success = TRUE
         )
         "#,
@@ -301,6 +325,103 @@ pub async fn admin_overview_stats(
     })
 }
 
+pub async fn admin_task_control_state(
+    pool: &PgPool,
+) -> Result<AdminTaskControlState, sqlx_core::error::Error> {
+    let recent_tasks = recent_admin_tasks(pool, 6).await?;
+    let failures = unresolved_task_failures(pool, 6).await?;
+    let failure_summary = task_failure_summary(pool).await?;
+
+    Ok(AdminTaskControlState {
+        recent_tasks,
+        failure_summary,
+        failures,
+    })
+}
+
+pub async fn create_admin_task(
+    pool: &PgPool,
+    task_type: AdminTaskKind,
+    target_appid: Option<u32>,
+) -> Result<AdminTaskSummary, sqlx_core::error::Error> {
+    let target = target_appid.map(|appid| format!("appid:{appid}"));
+    let row = sqlx_core::query::query::<Postgres>(
+        r#"
+        INSERT INTO ops.tasks (task_type, target, target_appid, created_by)
+        VALUES ($1, $2, $3, 'admin')
+        RETURNING id, task_type, status, target, target_appid, created_at::text AS created_at, updated_at::text AS updated_at
+        "#,
+    )
+    .bind(task_type.as_str())
+    .bind(target)
+    .bind(target_appid.map(|appid| appid as i32))
+    .fetch_one(pool)
+    .await?;
+
+    admin_task_from_row(row)
+}
+
+async fn recent_admin_tasks(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<AdminTaskSummary>, sqlx_core::error::Error> {
+    let rows = sqlx_core::query::query::<Postgres>(
+        r#"
+        SELECT id, task_type, status, target, target_appid, created_at::text AS created_at, updated_at::text AS updated_at
+        FROM ops.tasks
+        ORDER BY updated_at DESC, id DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(admin_task_from_row).collect()
+}
+
+async fn unresolved_task_failures(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<AdminTaskFailureItem>, sqlx_core::error::Error> {
+    let rows = sqlx_core::query::query::<Postgres>(
+        r#"
+        SELECT task_id, stage, target, provider, retryable, attempt, reason, created_at::text AS created_at
+        FROM ops.task_failures
+        WHERE resolved_at IS NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(admin_task_failure_from_row).collect()
+}
+
+async fn task_failure_summary(
+    pool: &PgPool,
+) -> Result<AdminTaskFailureSummary, sqlx_core::error::Error> {
+    let row = sqlx_core::query::query::<Postgres>(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE resolved_at IS NULL) AS open_failure_count,
+            COUNT(*) FILTER (WHERE resolved_at IS NULL AND retryable) AS retryable_failure_count
+        FROM ops.task_failures
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    let latest_failure = unresolved_task_failures(pool, 1).await?.into_iter().next();
+
+    Ok(AdminTaskFailureSummary {
+        open_failure_count: row.try_get("open_failure_count")?,
+        retryable_failure_count: row.try_get("retryable_failure_count")?,
+        latest_failure,
+    })
+}
+
 pub async fn admin_review_queue(
     pool: &PgPool,
 ) -> Result<Vec<AdminReviewCandidate>, sqlx_core::error::Error> {
@@ -404,6 +525,37 @@ fn admin_review_candidate_from_row(
         recommendation_score: row.try_get("recommendation_score")?,
         updated_at: row.try_get("updated_at")?,
         review_note: row.try_get("review_note")?,
+    })
+}
+
+fn admin_task_from_row(
+    row: sqlx_postgres::PgRow,
+) -> Result<AdminTaskSummary, sqlx_core::error::Error> {
+    let target_appid: Option<i32> = row.try_get("target_appid")?;
+
+    Ok(AdminTaskSummary {
+        id: row.try_get("id")?,
+        task_type: row.try_get("task_type")?,
+        status: row.try_get("status")?,
+        target: row.try_get("target")?,
+        target_appid: target_appid.map(|appid| appid as u32),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn admin_task_failure_from_row(
+    row: sqlx_postgres::PgRow,
+) -> Result<AdminTaskFailureItem, sqlx_core::error::Error> {
+    Ok(AdminTaskFailureItem {
+        task_id: row.try_get("task_id")?,
+        stage: row.try_get("stage")?,
+        target: row.try_get("target")?,
+        provider: row.try_get("provider")?,
+        retryable: row.try_get("retryable")?,
+        attempt: row.try_get("attempt")?,
+        reason: row.try_get("reason")?,
+        created_at: row.try_get("created_at")?,
     })
 }
 

@@ -6,6 +6,9 @@ import type {
   AdminReviewAction,
   AdminReviewCandidate,
   AdminReviewQueueResponse,
+  AdminTaskFailureItem,
+  AdminTaskSummary,
+  AdminTasksResponse,
   ConfigStateResponse,
   ServiceConnectionFileResponse,
   SetupCompleteRequest,
@@ -13,12 +16,14 @@ import type {
 import {
   applyAdminReviewAction,
   completeSetup,
+  createAdminTask,
   getAdminAuditEvents,
   getAdminConfigState,
   getAdminConnectionShare,
   getAdminDiagnostics,
   getAdminOverview,
   getAdminReviewQueue,
+  getAdminTasks,
   getSetupStatus,
   loginAdmin,
   requestRestart,
@@ -38,6 +43,7 @@ type AdminData = {
   connectionShare: ServiceConnectionFileResponse;
   auditEvents: AdminAuditEventsResponse;
   reviewQueue: AdminReviewQueueResponse;
+  tasks: AdminTasksResponse;
 };
 
 const initialSetupForm: SetupCompleteRequest = {
@@ -123,6 +129,7 @@ export function AdminApp() {
       connectionShare,
       auditEvents,
       reviewQueue,
+      tasks,
     ] = await Promise.all([
       getAdminOverview(),
       getAdminDiagnostics(),
@@ -130,6 +137,7 @@ export function AdminApp() {
       getAdminConnectionShare(),
       getAdminAuditEvents(),
       getAdminReviewQueue(),
+      getAdminTasks(),
     ]);
     setAdminData({
       overview,
@@ -138,6 +146,7 @@ export function AdminApp() {
       connectionShare,
       auditEvents,
       reviewQueue,
+      tasks,
     });
   }
 
@@ -225,6 +234,13 @@ export function AdminApp() {
             restartMessage={restartMessage}
             onReviewAction={async (appid, action) => {
               await applyAdminReviewAction(appid, { action });
+              await refreshAdminData();
+            }}
+            onTaskCreate={async (appid) => {
+              await createAdminTask({
+                taskType: "manual_appid_discovery",
+                appid,
+              });
               await refreshAdminData();
             }}
             onRefresh={handleRefresh}
@@ -352,6 +368,7 @@ function OverviewPanel({
   onRefresh,
   onRestart,
   onReviewAction,
+  onTaskCreate,
 }: {
   data: AdminData;
   isBusy: boolean;
@@ -359,9 +376,12 @@ function OverviewPanel({
   onRefresh: () => void;
   onRestart: () => void;
   onReviewAction: (appid: number, action: AdminReviewAction) => Promise<void>;
+  onTaskCreate: (appid: number) => Promise<void>;
 }) {
   const [shareMessage, setShareMessage] = useState<string | null>(null);
   const [reviewMessage, setReviewMessage] = useState<string | null>(null);
+  const [taskMessage, setTaskMessage] = useState<string | null>(null);
+  const [manualAppid, setManualAppid] = useState("");
 
   async function handleCopyServiceAddress() {
     try {
@@ -398,6 +418,24 @@ function OverviewPanel({
     }
   }
 
+  async function handleManualTaskSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setTaskMessage(null);
+    const appid = Number(manualAppid.trim());
+    if (!Number.isInteger(appid) || appid <= 0) {
+      setTaskMessage("请输入有效 AppID。");
+      return;
+    }
+
+    try {
+      await onTaskCreate(appid);
+      setManualAppid("");
+      setTaskMessage("手动 AppID 任务已入队。");
+    } catch (error) {
+      setTaskMessage(errorMessage(error));
+    }
+  }
+
   return (
     <div className="admin-overview">
       <header className="admin-section-head">
@@ -423,6 +461,10 @@ function OverviewPanel({
         />
         <Metric label="公开游戏" value={String(data.overview.publicGameCount)} />
         <Metric label="待审核" value={String(data.overview.pendingReviewCount)} />
+        <Metric
+          label="未处理失败"
+          value={String(data.overview.failureSummary.openFailureCount)}
+        />
       </section>
 
       <section className="admin-grid">
@@ -499,6 +541,52 @@ function OverviewPanel({
         </div>
 
         <div className="admin-panel">
+          <h2>任务控制</h2>
+          <form className="admin-inline-form" onSubmit={handleManualTaskSubmit}>
+            <label className="admin-field">
+              <span>手动 AppID</span>
+              <input
+                inputMode="numeric"
+                value={manualAppid}
+                onChange={(event) => setManualAppid(event.currentTarget.value)}
+              />
+            </label>
+            <button className="admin-primary" disabled={isBusy} type="submit">
+              加入发现队列
+            </button>
+          </form>
+          {data.tasks.recentTasks.length > 0 ? (
+            <div className="admin-task-list">
+              {data.tasks.recentTasks.map((task) => (
+                <TaskRow key={task.id} task={task} />
+              ))}
+            </div>
+          ) : (
+            <p className="admin-muted">暂无任务</p>
+          )}
+          {taskMessage && <p className="admin-success block">{taskMessage}</p>}
+        </div>
+
+        <div className="admin-panel">
+          <h2>失败摘要</h2>
+          <DefinitionList
+            items={[
+              ["未处理", String(data.tasks.failureSummary.openFailureCount)],
+              ["可重试", String(data.tasks.failureSummary.retryableFailureCount)],
+            ]}
+          />
+          {data.tasks.failures.length > 0 ? (
+            <div className="admin-failure-list">
+              {data.tasks.failures.map((failure, index) => (
+                <FailureRow key={`${failure.createdAt}-${index}`} failure={failure} />
+              ))}
+            </div>
+          ) : (
+            <p className="admin-muted">暂无失败摘要</p>
+          )}
+        </div>
+
+        <div className="admin-panel">
           <h2>待审核游戏</h2>
           {data.reviewQueue.items.length > 0 ? (
             <div className="admin-review-list">
@@ -553,6 +641,30 @@ function OverviewPanel({
         </div>
       </section>
     </div>
+  );
+}
+
+function TaskRow({ task }: { task: AdminTaskSummary }) {
+  return (
+    <article className="admin-task-row">
+      <strong>任务 #{task.id}</strong>
+      <span>
+        {task.taskType} · {task.status}
+      </span>
+      <p>{task.target ?? "无目标"} · {task.updatedAt}</p>
+    </article>
+  );
+}
+
+function FailureRow({ failure }: { failure: AdminTaskFailureItem }) {
+  return (
+    <article className="admin-failure-row">
+      <strong>{failure.stage}</strong>
+      <span>
+        {failure.target ?? "无目标"} · {failure.provider ?? "unknown"} · 尝试 {failure.attempt}
+      </span>
+      <p>{failure.reason}</p>
+    </article>
   );
 }
 

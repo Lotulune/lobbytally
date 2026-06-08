@@ -336,6 +336,112 @@ async fn admin_audit_events_lists_recent_records_without_secret_values() {
 }
 
 #[tokio::test]
+async fn admin_tasks_require_session_cookie() {
+    let (status, value) = get_json("/api/v1/admin/tasks", None).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(value["error"]["code"], "admin_session_required");
+}
+
+#[tokio::test]
+async fn admin_tasks_list_recent_tasks_and_sanitized_failures() {
+    let app = build_router_with_state(
+        admin_state()
+            .with_audit_sink(AuditSink::memory())
+            .with_admin_task_fixture(),
+    );
+    let cookie = admin_cookie_for(app.clone()).await;
+
+    let response = request_json_from(
+        app,
+        Method::GET,
+        "/api/v1/admin/tasks",
+        json!({}),
+        Some(&cookie),
+    )
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        value["recentTasks"][0]["taskType"],
+        "manual_appid_discovery"
+    );
+    assert_eq!(value["recentTasks"][0]["status"], "failed");
+    assert_eq!(value["failureSummary"]["openFailureCount"], 1);
+    assert_eq!(value["failureSummary"]["retryableFailureCount"], 1);
+    assert_eq!(value["failures"][0]["reason"], "Steam lookup timed out.");
+    assert!(value["failures"][0].get("apiKey").is_none());
+    assert!(value["failures"][0].get("secret").is_none());
+    assert!(value["failures"][0].get("requestJson").is_none());
+    assert!(value["failures"][0].get("responseJson").is_none());
+}
+
+#[tokio::test]
+async fn admin_create_task_queues_manual_appid_discovery_and_records_audit() {
+    let audit = AuditSink::memory();
+    let app = build_router_with_state(
+        admin_state()
+            .with_audit_sink(audit.clone())
+            .with_admin_task_fixture(),
+    );
+    let cookie = admin_cookie_for(app.clone()).await;
+
+    let response = request_json_from(
+        app,
+        Method::POST,
+        "/api/v1/admin/tasks",
+        json!({
+            "taskType": "manual_appid_discovery",
+            "appid": 730
+        }),
+        Some(&cookie),
+    )
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(value["task"]["taskType"], "manual_appid_discovery");
+    assert_eq!(value["task"]["status"], "queued");
+    assert_eq!(value["task"]["targetAppid"], 730);
+    assert!(audit.records_for_test().iter().any(|record| {
+        record.event_type == "admin.task.manual_appid_discovery.created"
+            && record.outcome == "success"
+    }));
+}
+
+#[tokio::test]
+async fn admin_create_task_requires_appid_for_manual_discovery() {
+    let app = build_router_with_state(admin_state().with_admin_task_fixture());
+    let cookie = admin_cookie_for(app.clone()).await;
+
+    let response = request_json_from(
+        app,
+        Method::POST,
+        "/api/v1/admin/tasks",
+        json!({ "taskType": "manual_appid_discovery" }),
+        Some(&cookie),
+    )
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(value["error"]["code"], "admin_task_appid_required");
+}
+
+#[tokio::test]
 async fn admin_review_queue_requires_session_cookie() {
     let (status, value) = get_json("/api/v1/admin/review-queue", None).await;
 

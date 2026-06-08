@@ -2,11 +2,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyAdminReviewAction,
   completeSetup,
+  createAdminTask,
   getAdminAuditEvents,
   getAdminConnectionShare,
   getAdminDiagnostics,
   getAdminOverview,
   getAdminReviewQueue,
+  getAdminTasks,
   getAdminConfigState,
   getSetupStatus,
   loginAdmin,
@@ -89,6 +91,12 @@ describe("admin API client", () => {
           publicCatalogStatus: "empty",
           publicGameCount: 0,
           pendingReviewCount: 0,
+          latestTask: null,
+          failureSummary: {
+            openFailureCount: 0,
+            retryableFailureCount: 0,
+            latestFailure: null,
+          },
           restartRequired: false,
           connectionShareConfigured: true,
         }),
@@ -137,6 +145,36 @@ describe("admin API client", () => {
       )
       .mockResolvedValueOnce(
         jsonResponse({
+          recentTasks: [
+            {
+              id: 7,
+              taskType: "manual_appid_discovery",
+              status: "failed",
+              target: "appid:440",
+              targetAppid: 440,
+              createdAt: "2026-06-08 03:00:00+00",
+              updatedAt: "2026-06-08 03:05:00+00",
+            },
+          ],
+          failureSummary: {
+            openFailureCount: 1,
+            retryableFailureCount: 1,
+            latestFailure: {
+              taskId: 7,
+              stage: "steam_lookup",
+              target: "appid:440",
+              provider: "steam",
+              retryable: true,
+              attempt: 2,
+              reason: "Steam lookup timed out.",
+              createdAt: "2026-06-08 03:05:00+00",
+            },
+          },
+          failures: [],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
           items: [
             {
               appid: 440,
@@ -164,6 +202,19 @@ describe("admin API client", () => {
         }),
       )
       .mockResolvedValueOnce(
+        jsonResponse({
+          task: {
+            id: 8,
+            taskType: "manual_appid_discovery",
+            status: "queued",
+            target: "appid:730",
+            targetAppid: 730,
+            createdAt: "2026-06-08 04:00:00+00",
+            updatedAt: "2026-06-08 04:00:00+00",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
         jsonResponse({ restartScheduled: true, mode: "self_exit" }, 202),
       );
     vi.stubGlobal("fetch", fetchMock);
@@ -173,10 +224,15 @@ describe("admin API client", () => {
     await getAdminConfigState();
     await getAdminConnectionShare();
     await getAdminAuditEvents();
+    await getAdminTasks();
     await getAdminReviewQueue();
     await applyAdminReviewAction(440, {
       action: "accept_public",
       note: "Looks good.",
+    });
+    await createAdminTask({
+      taskType: "manual_appid_discovery",
+      appid: 730,
     });
     await requestRestart();
 
@@ -204,12 +260,16 @@ describe("admin API client", () => {
       credentials: "same-origin",
       headers: { Accept: "application/json" },
     });
-    expect(fetchMock).toHaveBeenNthCalledWith(6, "/api/v1/admin/review-queue", {
+    expect(fetchMock).toHaveBeenNthCalledWith(6, "/api/v1/admin/tasks", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(7, "/api/v1/admin/review-queue", {
       credentials: "same-origin",
       headers: { Accept: "application/json" },
     });
     expect(fetchMock).toHaveBeenNthCalledWith(
-      7,
+      8,
       "/api/v1/admin/review-queue/440/action",
       {
         body: JSON.stringify({
@@ -224,7 +284,19 @@ describe("admin API client", () => {
         method: "POST",
       },
     );
-    expect(fetchMock).toHaveBeenNthCalledWith(8, "/api/v1/admin/restart", {
+    expect(fetchMock).toHaveBeenNthCalledWith(9, "/api/v1/admin/tasks", {
+      body: JSON.stringify({
+        taskType: "manual_appid_discovery",
+        appid: 730,
+      }),
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      method: "POST",
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(10, "/api/v1/admin/restart", {
       body: JSON.stringify({ confirm: true }),
       credentials: "same-origin",
       headers: {

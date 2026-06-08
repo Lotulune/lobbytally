@@ -1,11 +1,14 @@
 import type {
   AdminAuditEventsResponse,
+  AdminCreateTaskRequest,
+  AdminCreateTaskResponse,
   AdminDiagnosticsResponse,
   AdminOverviewResponse,
   AdminReviewActionRequest,
   AdminReviewActionResponse,
   AdminReviewQueueResponse,
   AdminSessionResponse,
+  AdminTasksResponse,
   ConfigStateResponse,
   RestartResponse,
   ServiceConnectionFileResponse,
@@ -66,6 +69,21 @@ export async function getAdminConnectionShare(): Promise<ServiceConnectionFileRe
 
 export async function getAdminAuditEvents(): Promise<AdminAuditEventsResponse> {
   return readAdminJson("/api/v1/admin/audit-events");
+}
+
+export async function getAdminTasks(): Promise<AdminTasksResponse> {
+  return readAdminJson("/api/v1/admin/tasks");
+}
+
+export async function createAdminTask(
+  request: AdminCreateTaskRequest,
+): Promise<AdminCreateTaskResponse> {
+  return readJson("/api/v1/admin/tasks", {
+    body: JSON.stringify(request),
+    credentials: "same-origin",
+    headers: jsonHeaders,
+    method: "POST",
+  });
 }
 
 export async function getAdminReviewQueue(): Promise<AdminReviewQueueResponse> {

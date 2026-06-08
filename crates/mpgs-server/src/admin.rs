@@ -32,6 +32,8 @@ pub struct AdminOverviewResponse {
     pub public_catalog_status: mpgs_core::models::PublicCatalogStatus,
     pub public_game_count: i64,
     pub pending_review_count: i64,
+    pub latest_task: Option<AdminTaskSummary>,
+    pub failure_summary: AdminTaskFailureSummary,
     pub restart_required: bool,
     pub connection_share_configured: bool,
     pub latest_audit_event: Option<AdminAuditEventSummary>,
@@ -49,6 +51,96 @@ pub struct AdminAuditEventSummary {
 #[serde(rename_all = "camelCase")]
 pub struct AdminAuditEventsResponse {
     pub events: Vec<AdminAuditEventSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminTaskKind {
+    ManualAppidDiscovery,
+}
+
+impl AdminTaskKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ManualAppidDiscovery => "manual_appid_discovery",
+        }
+    }
+
+    pub fn requires_appid(self) -> bool {
+        match self {
+            Self::ManualAppidDiscovery => true,
+        }
+    }
+
+    pub fn audit_event_type(self) -> &'static str {
+        match self {
+            Self::ManualAppidDiscovery => "admin.task.manual_appid_discovery.created",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminCreateTaskRequest {
+    pub task_type: AdminTaskKind,
+    pub appid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTaskSummary {
+    pub id: i64,
+    pub task_type: String,
+    pub status: String,
+    pub target: Option<String>,
+    pub target_appid: Option<u32>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTaskFailureItem {
+    pub task_id: Option<i64>,
+    pub stage: String,
+    pub target: Option<String>,
+    pub provider: Option<String>,
+    pub retryable: bool,
+    pub attempt: i32,
+    pub reason: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTaskFailureSummary {
+    pub open_failure_count: i64,
+    pub retryable_failure_count: i64,
+    pub latest_failure: Option<AdminTaskFailureItem>,
+}
+
+impl AdminTaskFailureSummary {
+    pub fn empty() -> Self {
+        Self {
+            open_failure_count: 0,
+            retryable_failure_count: 0,
+            latest_failure: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTasksResponse {
+    pub recent_tasks: Vec<AdminTaskSummary>,
+    pub failure_summary: AdminTaskFailureSummary,
+    pub failures: Vec<AdminTaskFailureItem>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminCreateTaskResponse {
+    pub task: AdminTaskSummary,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

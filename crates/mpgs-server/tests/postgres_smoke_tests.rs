@@ -1,5 +1,6 @@
 use mpgs_core::models::PublicCatalogStatus;
 use mpgs_server::admin::AdminReviewAction;
+use mpgs_server::admin::AdminTaskKind;
 use mpgs_server::{
     build_router_with_state, db, AppState, ConfigHealth, DatabaseHealth, ServiceInfoConfig,
 };
@@ -200,4 +201,54 @@ async fn public_review_action_advances_public_catalog_revision() {
     assert_eq!(reviewed.visibility, "public");
     assert_eq!(reviewed.review_note.as_deref(), Some("smoke approved"));
     assert_eq!(after, before + 1);
+}
+
+#[tokio::test]
+async fn admin_task_controls_use_ops_schema_in_postgres() {
+    let Ok(database_url) = std::env::var("MPGS_TEST_DATABASE_URL") else {
+        return;
+    };
+
+    let pool = db::connect_and_migrate(&database_url)
+        .await
+        .expect("connect to Postgres and run migrations");
+
+    let task = db::create_admin_task(&pool, AdminTaskKind::ManualAppidDiscovery, Some(730))
+        .await
+        .expect("create manual appid task");
+
+    sqlx_core::query::query::<sqlx_postgres::Postgres>(
+        r#"
+        INSERT INTO ops.task_failures (
+            task_id,
+            stage,
+            target,
+            provider,
+            retryable,
+            attempt,
+            reason
+        )
+        VALUES ($1, 'steam_lookup', 'appid:730', 'steam', TRUE, 1, 'Steam lookup timed out.')
+        "#,
+    )
+    .bind(task.id)
+    .execute(&pool)
+    .await
+    .expect("insert sanitized task failure");
+
+    let state = db::admin_task_control_state(&pool)
+        .await
+        .expect("read admin task control state");
+
+    assert!(state
+        .recent_tasks
+        .iter()
+        .any(|item| item.id == task.id && item.target_appid == Some(730)));
+    assert!(state.failure_summary.open_failure_count >= 1);
+    assert!(state.failure_summary.retryable_failure_count >= 1);
+    assert!(state.failures.iter().any(|failure| {
+        failure.task_id == Some(task.id)
+            && failure.stage == "steam_lookup"
+            && failure.reason == "Steam lookup timed out."
+    }));
 }

@@ -66,6 +66,29 @@ describe("AdminApp", () => {
           publicCatalogStatus: "empty",
           publicGameCount: 0,
           pendingReviewCount: 0,
+          latestTask: {
+            id: 7,
+            taskType: "manual_appid_discovery",
+            status: "failed",
+            target: "appid:440",
+            targetAppid: 440,
+            createdAt: "2026-06-08 03:00:00+00",
+            updatedAt: "2026-06-08 03:05:00+00",
+          },
+          failureSummary: {
+            openFailureCount: 1,
+            retryableFailureCount: 1,
+            latestFailure: {
+              taskId: 7,
+              stage: "steam_lookup",
+              target: "appid:440",
+              provider: "steam",
+              retryable: true,
+              attempt: 2,
+              reason: "Steam lookup timed out.",
+              createdAt: "2026-06-08 03:05:00+00",
+            },
+          },
           restartRequired: true,
           connectionShareConfigured: true,
           latestAuditEvent: {
@@ -137,6 +160,47 @@ describe("AdminApp", () => {
             },
           ],
         }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          recentTasks: [
+            {
+              id: 7,
+              taskType: "manual_appid_discovery",
+              status: "failed",
+              target: "appid:440",
+              targetAppid: 440,
+              createdAt: "2026-06-08 03:00:00+00",
+              updatedAt: "2026-06-08 03:05:00+00",
+            },
+          ],
+          failureSummary: {
+            openFailureCount: 1,
+            retryableFailureCount: 1,
+            latestFailure: {
+              taskId: 7,
+              stage: "steam_lookup",
+              target: "appid:440",
+              provider: "steam",
+              retryable: true,
+              attempt: 2,
+              reason: "Steam lookup timed out.",
+              createdAt: "2026-06-08 03:05:00+00",
+            },
+          },
+          failures: [
+            {
+              taskId: 7,
+              stage: "steam_lookup",
+              target: "appid:440",
+              provider: "steam",
+              retryable: true,
+              attempt: 2,
+              reason: "Steam lookup timed out.",
+              createdAt: "2026-06-08 03:05:00+00",
+            },
+          ],
+        }),
       );
     vi.stubGlobal("fetch", fetchMock);
 
@@ -162,6 +226,10 @@ describe("AdminApp", () => {
     expect(screen.getByText("待审核游戏")).toBeInTheDocument();
     expect(screen.getByText("Team Fortress 2")).toBeInTheDocument();
     expect(screen.getByText(/AppID 440/)).toBeInTheDocument();
+    expect(screen.getByText("任务控制")).toBeInTheDocument();
+    expect(screen.getByText("任务 #7")).toBeInTheDocument();
+    expect(screen.getByText("失败摘要")).toBeInTheDocument();
+    expect(screen.getByText("Steam lookup timed out.")).toBeInTheDocument();
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith("/api/v1/admin/overview", {
@@ -213,6 +281,12 @@ describe("AdminApp", () => {
           publicCatalogStatus: "empty",
           publicGameCount: 0,
           pendingReviewCount: 0,
+          latestTask: null,
+          failureSummary: {
+            openFailureCount: 0,
+            retryableFailureCount: 0,
+            latestFailure: null,
+          },
           restartRequired: false,
           connectionShareConfigured: true,
           latestAuditEvent: null,
@@ -242,7 +316,8 @@ describe("AdminApp", () => {
       )
       .mockResolvedValueOnce(jsonResponse(connectionShare))
       .mockResolvedValueOnce(jsonResponse({ events: [] }))
-      .mockResolvedValueOnce(jsonResponse({ items: [] }));
+      .mockResolvedValueOnce(jsonResponse({ items: [] }))
+      .mockResolvedValueOnce(jsonResponse(emptyTasksResponse()));
     vi.stubGlobal("fetch", fetchMock);
 
     render(<AdminApp />);
@@ -288,6 +363,12 @@ describe("AdminApp", () => {
           publicCatalogStatus: "empty",
           publicGameCount: 0,
           pendingReviewCount: 1,
+          latestTask: null,
+          failureSummary: {
+            openFailureCount: 0,
+            retryableFailureCount: 0,
+            latestFailure: null,
+          },
           restartRequired: false,
           connectionShareConfigured: true,
           latestAuditEvent: null,
@@ -341,6 +422,7 @@ describe("AdminApp", () => {
           ],
         }),
       )
+      .mockResolvedValueOnce(jsonResponse(emptyTasksResponse()))
       .mockResolvedValueOnce(
         jsonResponse({
           game: {
@@ -360,6 +442,12 @@ describe("AdminApp", () => {
           publicCatalogStatus: "ready",
           publicGameCount: 1,
           pendingReviewCount: 0,
+          latestTask: null,
+          failureSummary: {
+            openFailureCount: 0,
+            retryableFailureCount: 0,
+            latestFailure: null,
+          },
           restartRequired: false,
           connectionShareConfigured: true,
           latestAuditEvent: {
@@ -402,7 +490,8 @@ describe("AdminApp", () => {
         }),
       )
       .mockResolvedValueOnce(jsonResponse({ events: [] }))
-      .mockResolvedValueOnce(jsonResponse({ items: [] }));
+      .mockResolvedValueOnce(jsonResponse({ items: [] }))
+      .mockResolvedValueOnce(jsonResponse(emptyTasksResponse()));
     vi.stubGlobal("fetch", fetchMock);
 
     render(<AdminApp />);
@@ -431,6 +520,195 @@ describe("AdminApp", () => {
     });
     expect(await screen.findByText("审核动作已提交。")).toBeInTheDocument();
   });
+
+  it("queues manual AppID discovery tasks from the admin task controls", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ configured: true }))
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          serviceName: "MPGS Public",
+          publicCatalogStatus: "empty",
+          publicGameCount: 0,
+          pendingReviewCount: 0,
+          latestTask: null,
+          failureSummary: {
+            openFailureCount: 0,
+            retryableFailureCount: 0,
+            latestFailure: null,
+          },
+          restartRequired: false,
+          connectionShareConfigured: true,
+          latestAuditEvent: null,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          postgres: "ok",
+          activeConfig: "ok",
+          safeMode: false,
+          publicBaseUrlStatus: "configured",
+          httpsStatus: "ok",
+          publicCors: "disabled",
+          restartPolicy: "configured",
+          steam: "configured",
+          llm: "missing",
+          r2: "missing",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          activeConfigVersion: "sha256:active",
+          pendingConfigVersion: null,
+          restartRequired: false,
+          lastStartupStatus: "ok",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          serviceName: "MPGS Public",
+          serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c01",
+          apiVersion: "v1",
+          baseUrl: "https://mpgs.example.test",
+          serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
+          capabilities: ["public_catalog_read"],
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ events: [] }))
+      .mockResolvedValueOnce(jsonResponse({ items: [] }))
+      .mockResolvedValueOnce(jsonResponse(emptyTasksResponse()))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            task: {
+              id: 8,
+              taskType: "manual_appid_discovery",
+              status: "queued",
+              target: "appid:730",
+              targetAppid: 730,
+              createdAt: "2026-06-08 04:00:00+00",
+              updatedAt: "2026-06-08 04:00:00+00",
+            },
+          },
+          201,
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          serviceName: "MPGS Public",
+          publicCatalogStatus: "empty",
+          publicGameCount: 0,
+          pendingReviewCount: 0,
+          latestTask: {
+            id: 8,
+            taskType: "manual_appid_discovery",
+            status: "queued",
+            target: "appid:730",
+            targetAppid: 730,
+            createdAt: "2026-06-08 04:00:00+00",
+            updatedAt: "2026-06-08 04:00:00+00",
+          },
+          failureSummary: {
+            openFailureCount: 0,
+            retryableFailureCount: 0,
+            latestFailure: null,
+          },
+          restartRequired: false,
+          connectionShareConfigured: true,
+          latestAuditEvent: {
+            eventType: "admin.task.manual_appid_discovery.created",
+            actor: "admin",
+            outcome: "success",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          postgres: "ok",
+          activeConfig: "ok",
+          safeMode: false,
+          publicBaseUrlStatus: "configured",
+          httpsStatus: "ok",
+          publicCors: "disabled",
+          restartPolicy: "configured",
+          steam: "configured",
+          llm: "missing",
+          r2: "missing",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          activeConfigVersion: "sha256:active",
+          pendingConfigVersion: null,
+          restartRequired: false,
+          lastStartupStatus: "ok",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          serviceName: "MPGS Public",
+          serviceInstanceId: "018fb770-8998-7699-a6e4-b7b59f2f9c01",
+          apiVersion: "v1",
+          baseUrl: "https://mpgs.example.test",
+          serviceInfoUrl: "https://mpgs.example.test/api/v1/service-info",
+          capabilities: ["public_catalog_read"],
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ events: [] }))
+      .mockResolvedValueOnce(jsonResponse({ items: [] }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          recentTasks: [
+            {
+              id: 8,
+              taskType: "manual_appid_discovery",
+              status: "queued",
+              target: "appid:730",
+              targetAppid: 730,
+              createdAt: "2026-06-08 04:00:00+00",
+              updatedAt: "2026-06-08 04:00:00+00",
+            },
+          ],
+          failureSummary: {
+            openFailureCount: 0,
+            retryableFailureCount: 0,
+            latestFailure: null,
+          },
+          failures: [],
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<AdminApp />);
+
+    fireEvent.change(await screen.findByLabelText("管理员令牌"), {
+      target: { value: "admin-token" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "登录" }));
+
+    fireEvent.change(await screen.findByLabelText("手动 AppID"), {
+      target: { value: "730" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "加入发现队列" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith("/api/v1/admin/tasks", {
+        body: JSON.stringify({
+          taskType: "manual_appid_discovery",
+          appid: 730,
+        }),
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        method: "POST",
+      });
+    });
+    expect(await screen.findByText("手动 AppID 任务已入队。")).toBeInTheDocument();
+    expect(screen.getByText("任务 #8")).toBeInTheDocument();
+  });
 });
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -438,4 +716,16 @@ function jsonResponse(payload: unknown, status = 200): Response {
     headers: { "Content-Type": "application/json" },
     status,
   });
+}
+
+function emptyTasksResponse() {
+  return {
+    recentTasks: [],
+    failureSummary: {
+      openFailureCount: 0,
+      retryableFailureCount: 0,
+      latestFailure: null,
+    },
+    failures: [],
+  };
 }

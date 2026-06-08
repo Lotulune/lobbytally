@@ -11,8 +11,10 @@ pub mod setup;
 
 pub use admin::AdminAuthConfig;
 use admin::{
-    AdminAuditEventSummary, AdminAuditEventsResponse, AdminDiagnosticsResponse,
-    AdminOverviewResponse, AdminReviewActionRequest, AdminSessionRequest, AdminSessionResponse,
+    AdminAuditEventSummary, AdminAuditEventsResponse, AdminCreateTaskRequest,
+    AdminCreateTaskResponse, AdminDiagnosticsResponse, AdminOverviewResponse,
+    AdminReviewActionRequest, AdminSessionRequest, AdminSessionResponse, AdminTaskFailureItem,
+    AdminTaskFailureSummary, AdminTaskSummary, AdminTasksResponse,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -226,6 +228,32 @@ impl AppState {
         self
     }
 
+    #[doc(hidden)]
+    pub fn with_admin_task_fixture(mut self) -> Self {
+        self.database_health = DatabaseHealth::AdminTaskFixture {
+            tasks: Arc::new(Mutex::new(vec![AdminTaskSummary {
+                id: 7,
+                task_type: "manual_appid_discovery".to_string(),
+                status: "failed".to_string(),
+                target: Some("appid:440".to_string()),
+                target_appid: Some(440),
+                created_at: "2026-06-08 03:00:00+00".to_string(),
+                updated_at: "2026-06-08 03:05:00+00".to_string(),
+            }])),
+            failures: vec![AdminTaskFailureItem {
+                task_id: Some(7),
+                stage: "steam_lookup".to_string(),
+                target: Some("appid:440".to_string()),
+                provider: Some("steam".to_string()),
+                retryable: true,
+                attempt: 2,
+                reason: "Steam lookup timed out.".to_string(),
+                created_at: "2026-06-08 03:05:00+00".to_string(),
+            }],
+        };
+        self
+    }
+
     pub fn safe_mode(config: ServiceInfoConfig) -> Self {
         Self {
             service_info: config.service_info_with_catalog_status(PublicCatalogStatus::Unavailable),
@@ -365,6 +393,11 @@ pub enum DatabaseHealth {
     ReviewActionFixture {
         candidates: Arc<Mutex<Vec<AdminReviewCandidate>>>,
     },
+    #[doc(hidden)]
+    AdminTaskFixture {
+        tasks: Arc<Mutex<Vec<AdminTaskSummary>>>,
+        failures: Vec<AdminTaskFailureItem>,
+    },
     SafeMode,
     Unavailable,
 }
@@ -377,6 +410,7 @@ impl DatabaseHealth {
             | Self::PublicCatalogFixture { .. }
             | Self::ReviewQueueFixture { .. }
             | Self::ReviewActionFixture { .. }
+            | Self::AdminTaskFixture { .. }
             | Self::SafeMode => true,
             Self::Unavailable => false,
         }
@@ -422,6 +456,7 @@ impl DatabaseHealth {
                     pending_review_count,
                 }
             }
+            Self::AdminTaskFixture { .. } => db::AdminOverviewStats::default(),
             Self::HealthyForTest | Self::SafeMode | Self::Unavailable => {
                 db::AdminOverviewStats::default()
             }
@@ -466,6 +501,10 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .route("/api/v1/admin/overview", get(admin_overview))
         .route("/api/v1/admin/diagnostics", get(admin_diagnostics))
         .route("/api/v1/admin/audit-events", get(admin_audit_events))
+        .route(
+            "/api/v1/admin/tasks",
+            get(admin_tasks).post(admin_create_task),
+        )
         .route("/api/v1/admin/review-queue", get(admin_review_queue))
         .route(
             "/api/v1/admin/review-queue/{appid}/action",
@@ -838,12 +877,23 @@ async fn admin_overview(State(state): State<AppState>, headers: HeaderMap) -> Re
             actor: event.actor,
             outcome: event.outcome,
         });
+    let task_state = state
+        .database_health
+        .admin_task_control_state()
+        .await
+        .unwrap_or_else(|_| db::AdminTaskControlState {
+            recent_tasks: Vec::new(),
+            failure_summary: AdminTaskFailureSummary::empty(),
+            failures: Vec::new(),
+        });
 
     Json(AdminOverviewResponse {
         service_name: state.service_info.service_name,
         public_catalog_status: state.service_info.public_catalog_status,
         public_game_count: stats.public_game_count,
         pending_review_count: stats.pending_review_count,
+        latest_task: task_state.recent_tasks.into_iter().next(),
+        failure_summary: task_state.failure_summary,
         restart_required,
         connection_share_configured,
         latest_audit_event,
@@ -883,6 +933,97 @@ async fn admin_audit_events(State(state): State<AppState>, headers: HeaderMap) -
         .collect();
 
     Json(AdminAuditEventsResponse { events }).into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/tasks",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Admin task controls and failure summary", body = AdminTasksResponse),
+        (status = 429, description = "Request rate limited", body = ServiceErrorEnvelope),
+        (status = 401, description = "Admin session required", body = ServiceErrorEnvelope),
+        (status = 503, description = "Ops task state unavailable", body = ServiceErrorEnvelope)
+    )
+)]
+async fn admin_tasks(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.rate_limits.allow(RateLimitBucket::Admin) {
+        return rate_limited_response();
+    }
+
+    if !admin_session_is_valid(&state, &headers) {
+        return admin_session_required_response();
+    }
+
+    match state.database_health.admin_task_control_state().await {
+        Ok(task_state) => Json(AdminTasksResponse {
+            recent_tasks: task_state.recent_tasks,
+            failure_summary: task_state.failure_summary,
+            failures: task_state.failures,
+        })
+        .into_response(),
+        Err(error) if state.database_health.is_safe_mode() => safe_mode_error_response(),
+        Err(error) => service_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin_tasks_unavailable",
+            public_catalog_error_message(error),
+        ),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/tasks",
+    tag = "admin",
+    request_body = AdminCreateTaskRequest,
+    responses(
+        (status = 201, description = "Admin task queued", body = AdminCreateTaskResponse),
+        (status = 400, description = "Invalid task request", body = ServiceErrorEnvelope),
+        (status = 401, description = "Admin session required", body = ServiceErrorEnvelope),
+        (status = 429, description = "Request rate limited", body = ServiceErrorEnvelope),
+        (status = 503, description = "Ops task state unavailable", body = ServiceErrorEnvelope)
+    )
+)]
+async fn admin_create_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AdminCreateTaskRequest>,
+) -> Response {
+    if !state.rate_limits.allow(RateLimitBucket::Admin) {
+        return rate_limited_response();
+    }
+
+    if !admin_session_is_valid(&state, &headers) {
+        return admin_session_required_response();
+    }
+
+    if request.task_type.requires_appid() && request.appid.is_none() {
+        return service_error_response(
+            StatusCode::BAD_REQUEST,
+            "admin_task_appid_required",
+            "任务需要 AppID。",
+        );
+    }
+
+    match state
+        .database_health
+        .create_admin_task(request.task_type, request.appid)
+        .await
+    {
+        Ok(task) => {
+            state
+                .audit
+                .record(request.task_type.audit_event_type(), "admin", "success")
+                .await;
+            (StatusCode::CREATED, Json(AdminCreateTaskResponse { task })).into_response()
+        }
+        Err(error) if state.database_health.is_safe_mode() => safe_mode_error_response(),
+        Err(error) => service_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin_task_create_failed",
+            public_catalog_error_message(error),
+        ),
+    }
 }
 
 #[utoipa::path(
@@ -1347,7 +1488,9 @@ impl DatabaseHealth {
             Self::Pool(pool) => db::public_catalog_revision(pool).await,
             Self::HealthyForTest => Ok(0),
             Self::PublicCatalogFixture { revision, .. } => Ok(*revision),
-            Self::ReviewQueueFixture { .. } | Self::ReviewActionFixture { .. } => Ok(0),
+            Self::ReviewQueueFixture { .. }
+            | Self::ReviewActionFixture { .. }
+            | Self::AdminTaskFixture { .. } => Ok(0),
             Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
@@ -1373,7 +1516,8 @@ impl DatabaseHealth {
             Self::Pool(pool) => db::discovery_home(pool).await,
             Self::HealthyForTest
             | Self::ReviewQueueFixture { .. }
-            | Self::ReviewActionFixture { .. } => Ok(DiscoveryHomeResponse::empty()),
+            | Self::ReviewActionFixture { .. }
+            | Self::AdminTaskFixture { .. } => Ok(DiscoveryHomeResponse::empty()),
             Self::PublicCatalogFixture { detail, .. } => {
                 let item = detail.iter().map(|detail| detail.game.clone()).collect();
                 Ok(DiscoveryHomeResponse {
@@ -1404,7 +1548,8 @@ impl DatabaseHealth {
             Self::Pool(pool) => db::public_games_page(pool, limit, offset).await,
             Self::HealthyForTest
             | Self::ReviewQueueFixture { .. }
-            | Self::ReviewActionFixture { .. } => Ok(PublicGamesPage::empty(limit, offset)),
+            | Self::ReviewActionFixture { .. }
+            | Self::AdminTaskFixture { .. } => Ok(PublicGamesPage::empty(limit, offset)),
             Self::PublicCatalogFixture { detail, .. } => {
                 let items = detail
                     .iter()
@@ -1434,7 +1579,8 @@ impl DatabaseHealth {
             Self::Pool(pool) => db::public_game_detail(pool, appid).await,
             Self::HealthyForTest
             | Self::ReviewQueueFixture { .. }
-            | Self::ReviewActionFixture { .. } => Ok(None),
+            | Self::ReviewActionFixture { .. }
+            | Self::AdminTaskFixture { .. } => Ok(None),
             Self::PublicCatalogFixture { detail, .. } => {
                 Ok(detail.clone().filter(|detail| detail.game.appid == appid))
             }
@@ -1451,7 +1597,8 @@ impl DatabaseHealth {
             Self::Pool(pool) => db::public_game_analysis(pool, appid).await,
             Self::HealthyForTest
             | Self::ReviewQueueFixture { .. }
-            | Self::ReviewActionFixture { .. } => Ok(None),
+            | Self::ReviewActionFixture { .. }
+            | Self::AdminTaskFixture { .. } => Ok(None),
             Self::PublicCatalogFixture { analysis, .. } => {
                 Ok(analysis.clone().filter(|analysis| analysis.appid == appid))
             }
@@ -1470,7 +1617,9 @@ impl DatabaseHealth {
                 .lock()
                 .map(|candidates| candidates.clone())
                 .map_err(|_| sqlx_core::error::Error::PoolClosed),
-            Self::HealthyForTest | Self::PublicCatalogFixture { .. } => Ok(Vec::new()),
+            Self::HealthyForTest
+            | Self::PublicCatalogFixture { .. }
+            | Self::AdminTaskFixture { .. } => Ok(Vec::new()),
             Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
@@ -1504,7 +1653,77 @@ impl DatabaseHealth {
             }
             Self::HealthyForTest
             | Self::PublicCatalogFixture { .. }
-            | Self::ReviewQueueFixture { .. } => Ok(None),
+            | Self::ReviewQueueFixture { .. }
+            | Self::AdminTaskFixture { .. } => Ok(None),
+            Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
+            Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
+        }
+    }
+
+    async fn admin_task_control_state(
+        &self,
+    ) -> Result<db::AdminTaskControlState, sqlx_core::error::Error> {
+        match self {
+            Self::Pool(pool) => db::admin_task_control_state(pool).await,
+            Self::AdminTaskFixture { tasks, failures } => {
+                let recent_tasks = tasks
+                    .lock()
+                    .map(|tasks| tasks.clone())
+                    .map_err(|_| sqlx_core::error::Error::PoolClosed)?;
+                let latest_failure = failures.first().cloned();
+                Ok(db::AdminTaskControlState {
+                    recent_tasks,
+                    failure_summary: AdminTaskFailureSummary {
+                        open_failure_count: failures.len() as i64,
+                        retryable_failure_count: failures
+                            .iter()
+                            .filter(|failure| failure.retryable)
+                            .count() as i64,
+                        latest_failure,
+                    },
+                    failures: failures.clone(),
+                })
+            }
+            Self::HealthyForTest
+            | Self::PublicCatalogFixture { .. }
+            | Self::ReviewQueueFixture { .. }
+            | Self::ReviewActionFixture { .. } => Ok(db::AdminTaskControlState {
+                recent_tasks: Vec::new(),
+                failure_summary: AdminTaskFailureSummary::empty(),
+                failures: Vec::new(),
+            }),
+            Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
+            Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
+        }
+    }
+
+    async fn create_admin_task(
+        &self,
+        task_type: admin::AdminTaskKind,
+        target_appid: Option<u32>,
+    ) -> Result<AdminTaskSummary, sqlx_core::error::Error> {
+        match self {
+            Self::Pool(pool) => db::create_admin_task(pool, task_type, target_appid).await,
+            Self::AdminTaskFixture { tasks, .. } => {
+                let mut tasks = tasks
+                    .lock()
+                    .map_err(|_| sqlx_core::error::Error::PoolClosed)?;
+                let task = AdminTaskSummary {
+                    id: tasks.len() as i64 + 1,
+                    task_type: task_type.as_str().to_string(),
+                    status: "queued".to_string(),
+                    target: target_appid.map(|appid| format!("appid:{appid}")),
+                    target_appid,
+                    created_at: "2026-06-08 04:00:00+00".to_string(),
+                    updated_at: "2026-06-08 04:00:00+00".to_string(),
+                };
+                tasks.insert(0, task.clone());
+                Ok(task)
+            }
+            Self::HealthyForTest
+            | Self::PublicCatalogFixture { .. }
+            | Self::ReviewQueueFixture { .. }
+            | Self::ReviewActionFixture { .. } => Err(sqlx_core::error::Error::PoolClosed),
             Self::SafeMode => Err(sqlx_core::error::Error::PoolClosed),
             Self::Unavailable => Err(sqlx_core::error::Error::PoolClosed),
         }
@@ -1707,6 +1926,8 @@ fn content_type_for_path(path: &FsPath) -> HeaderValue {
         admin_session,
         admin_overview,
         admin_audit_events,
+        admin_tasks,
+        admin_create_task,
         admin_review_queue,
         admin_review_action,
         admin_diagnostics,
@@ -1722,11 +1943,18 @@ fn content_type_for_path(path: &FsPath) -> HeaderValue {
         admin::AdminDiagnosticsResponse,
         admin::AdminAuditEventsResponse,
         admin::AdminAuditEventSummary,
+        admin::AdminCreateTaskRequest,
+        admin::AdminCreateTaskResponse,
         admin::AdminOverviewResponse,
         admin::AdminReviewAction,
         admin::AdminReviewActionRequest,
         admin::AdminSessionRequest,
         admin::AdminSessionResponse,
+        admin::AdminTaskFailureItem,
+        admin::AdminTaskFailureSummary,
+        admin::AdminTaskKind,
+        admin::AdminTasksResponse,
+        admin::AdminTaskSummary,
         config_files::ConfigStateResponse,
         config_files::PendingConfigResponse,
         config_files::PendingServiceIdentityRequest,

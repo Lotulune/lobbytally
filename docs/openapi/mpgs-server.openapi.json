@@ -551,6 +551,124 @@
         }
       }
     },
+    "/api/v1/admin/tasks": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "admin_tasks",
+        "responses": {
+          "200": {
+            "description": "Admin task controls and failure summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminTasksResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin session required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Request rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Ops task state unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "admin_create_task",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminCreateTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Admin task queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminCreateTaskResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid task request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Admin session required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Request rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Ops task state unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/discovery-home": {
       "get": {
         "tags": [
@@ -1033,6 +1151,36 @@
           }
         }
       },
+      "AdminCreateTaskRequest": {
+        "type": "object",
+        "required": [
+          "taskType"
+        ],
+        "properties": {
+          "appid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "taskType": {
+            "$ref": "#/components/schemas/AdminTaskKind"
+          }
+        }
+      },
+      "AdminCreateTaskResponse": {
+        "type": "object",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "$ref": "#/components/schemas/AdminTaskSummary"
+          }
+        }
+      },
       "AdminDiagnosticsResponse": {
         "type": "object",
         "required": [
@@ -1093,12 +1241,16 @@
           "publicCatalogStatus",
           "publicGameCount",
           "pendingReviewCount",
+          "failureSummary",
           "restartRequired",
           "connectionShareConfigured"
         ],
         "properties": {
           "connectionShareConfigured": {
             "type": "boolean"
+          },
+          "failureSummary": {
+            "$ref": "#/components/schemas/AdminTaskFailureSummary"
           },
           "latestAuditEvent": {
             "oneOf": [
@@ -1107,6 +1259,16 @@
               },
               {
                 "$ref": "#/components/schemas/AdminAuditEventSummary"
+              }
+            ]
+          },
+          "latestTask": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AdminTaskSummary"
               }
             ]
           },
@@ -1241,6 +1403,153 @@
         "properties": {
           "authenticated": {
             "type": "boolean"
+          }
+        }
+      },
+      "AdminTaskFailureItem": {
+        "type": "object",
+        "required": [
+          "stage",
+          "retryable",
+          "attempt",
+          "reason",
+          "createdAt"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "taskId": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
+      "AdminTaskFailureSummary": {
+        "type": "object",
+        "required": [
+          "openFailureCount",
+          "retryableFailureCount"
+        ],
+        "properties": {
+          "latestFailure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AdminTaskFailureItem"
+              }
+            ]
+          },
+          "openFailureCount": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "retryableFailureCount": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "AdminTaskKind": {
+        "type": "string",
+        "enum": [
+          "manual_appid_discovery"
+        ]
+      },
+      "AdminTaskSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "taskType",
+          "status",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "createdAt": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "targetAppid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "taskType": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        }
+      },
+      "AdminTasksResponse": {
+        "type": "object",
+        "required": [
+          "recentTasks",
+          "failureSummary",
+          "failures"
+        ],
+        "properties": {
+          "failureSummary": {
+            "$ref": "#/components/schemas/AdminTaskFailureSummary"
+          },
+          "failures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminTaskFailureItem"
+            }
+          },
+          "recentTasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdminTaskSummary"
+            }
           }
         }
       },

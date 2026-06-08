@@ -30,7 +30,7 @@ fn initial_migration_is_embedded_for_binary_startup() {
     let migrator = db::migrator();
     let migrations: Vec<_> = migrator.iter().collect();
 
-    assert_eq!(migrations.len(), 3);
+    assert_eq!(migrations.len(), 4);
     assert_eq!(migrations[0].version, 1);
     assert_eq!(migrations[0].description, "public_catalog_ops");
     assert!(migrations[0]
@@ -46,6 +46,14 @@ fn initial_migration_is_embedded_for_binary_startup() {
     assert!(migrations[2]
         .sql
         .contains("ADD COLUMN IF NOT EXISTS review_note TEXT"));
+    assert_eq!(migrations[3].version, 4);
+    assert_eq!(migrations[3].description, "ops_tasks");
+    assert!(migrations[3]
+        .sql
+        .contains("CREATE TABLE IF NOT EXISTS ops.tasks"));
+    assert!(migrations[3]
+        .sql
+        .contains("CREATE TABLE IF NOT EXISTS ops.task_failures"));
 }
 
 #[test]
@@ -59,6 +67,7 @@ fn database_health_checks_the_sqlx_migration_record() {
     assert!(source.contains("description = 'public_catalog_ops'"));
     assert!(source.contains("description = 'ops_audit_events'"));
     assert!(source.contains("description = 'admin_review_notes'"));
+    assert!(source.contains("description = 'ops_tasks'"));
     assert!(source.contains("success = TRUE"));
 }
 
@@ -127,4 +136,23 @@ fn review_notes_migration_extends_public_games_without_secret_columns() {
     assert!(!sql.to_lowercase().contains("token"));
     assert!(!sql.to_lowercase().contains("api_key"));
     assert!(!sql.to_lowercase().contains("secret"));
+}
+
+#[test]
+fn ops_tasks_migration_tracks_tasks_and_sanitized_failures() {
+    let migration_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations")
+        .join("0004_ops_tasks.sql");
+    let sql = fs::read_to_string(&migration_path).expect("ops tasks migration should exist");
+    let lowercase = sql.to_lowercase();
+
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS ops.tasks"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS ops.task_runs"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS ops.task_failures"));
+    assert!(sql.contains("retryable BOOLEAN NOT NULL DEFAULT FALSE"));
+    assert!(sql.contains("attempt INTEGER NOT NULL DEFAULT 1"));
+    assert!(!lowercase.contains("api_key"));
+    assert!(!lowercase.contains("secret"));
+    assert!(!lowercase.contains("request_json"));
+    assert!(!lowercase.contains("response_json"));
 }

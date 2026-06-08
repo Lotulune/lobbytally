@@ -12,6 +12,15 @@ export interface AdminAuditEventSummary {
   outcome: string;
 }
 
+export interface AdminCreateTaskRequest {
+  appid?: number | null;
+  taskType: AdminTaskKind;
+}
+
+export interface AdminCreateTaskResponse {
+  task: AdminTaskSummary;
+}
+
 export interface AdminDiagnosticsResponse {
   activeConfig: string;
   httpsStatus: string;
@@ -28,7 +37,9 @@ export interface AdminDiagnosticsResponse {
 
 export interface AdminOverviewResponse {
   connectionShareConfigured: boolean;
+  failureSummary: AdminTaskFailureSummary;
   latestAuditEvent?: null | AdminAuditEventSummary;
+  latestTask?: null | AdminTaskSummary;
   pendingReviewCount: number;
   publicCatalogStatus: PublicCatalogStatus;
   publicGameCount: number;
@@ -67,6 +78,41 @@ export interface AdminSessionRequest {
 
 export interface AdminSessionResponse {
   authenticated: boolean;
+}
+
+export interface AdminTaskFailureItem {
+  attempt: number;
+  createdAt: string;
+  provider?: string | null;
+  reason: string;
+  retryable: boolean;
+  stage: string;
+  target?: string | null;
+  taskId?: number | null;
+}
+
+export interface AdminTaskFailureSummary {
+  latestFailure?: null | AdminTaskFailureItem;
+  openFailureCount: number;
+  retryableFailureCount: number;
+}
+
+export type AdminTaskKind = "manual_appid_discovery";
+
+export interface AdminTasksResponse {
+  failures: AdminTaskFailureItem[];
+  failureSummary: AdminTaskFailureSummary;
+  recentTasks: AdminTaskSummary[];
+}
+
+export interface AdminTaskSummary {
+  createdAt: string;
+  id: number;
+  status: string;
+  target?: string | null;
+  targetAppid?: number | null;
+  taskType: string;
+  updatedAt: string;
 }
 
 export interface ConfigStateResponse {
