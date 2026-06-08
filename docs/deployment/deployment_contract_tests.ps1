@@ -140,6 +140,9 @@ if ($remotePreflightScript -notmatch 'UseSudoDocker' -or $remotePreflightScript 
 if ($remotePreflightScript -notmatch 'docker compose version' -or $remotePreflightScript -notmatch 'CADDY_DOMAIN' -or $remotePreflightScript -notmatch '/healthz') {
     throw "remote preflight script must check compose, Caddy/public URL inputs, and health probe targets."
 }
+if ($remotePreflightScript -notmatch 'docker_ps_output="\$\(__DOCKER_COMMAND__ ps' -or $remotePreflightScript -match 'if __DOCKER_COMMAND__ ps') {
+    throw "remote preflight script must fail on docker ps access errors instead of treating them as available public ports."
+}
 if ($remotePreflightScript -match 'cargo build|rustc|docker build|docker compose build|npm run|pnpm|yarn|docker load|up -d') {
     throw "remote preflight script must be read-only and must not build, load, or start services."
 }

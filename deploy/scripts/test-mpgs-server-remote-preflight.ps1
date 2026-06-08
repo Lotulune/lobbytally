@@ -143,9 +143,14 @@ else
 fi
 
 public_port_pattern='(^| )caddy|(^|[^0-9]):(80|443)->'
-if __DOCKER_COMMAND__ ps --format '{{.Names}} {{.Ports}}' | grep -E "$public_port_pattern" >/dev/null 2>&1; then
+if ! docker_ps_output="$(__DOCKER_COMMAND__ ps --format '{{.Names}} {{.Ports}}' 2>&1)"; then
+  echo "$docker_ps_output" >&2
+  exit 2
+fi
+
+if printf '%s\n' "$docker_ps_output" | grep -E "$public_port_pattern" >/dev/null 2>&1; then
   echo "public_ports=occupied"
-  __DOCKER_COMMAND__ ps --format '{{.Names}} {{.Ports}}' | grep -E "$public_port_pattern"
+  printf '%s\n' "$docker_ps_output" | grep -E "$public_port_pattern"
 else
   echo "public_ports=available"
 fi
