@@ -48,10 +48,66 @@ function configureServiceConnection() {
   });
 }
 
-function fetchJson(value: unknown, status = 200) {
+const publicHomePayload = {
+  status: "ready",
+  totalGames: 2,
+  sections: {
+    newlyPublished: [
+      {
+        appid: 3744430,
+        name: "Together Moon Escape",
+        recommendationScore: 92,
+        updatedAt: "2026-06-08T00:00:00Z",
+      },
+    ],
+    highConfidence: [
+      {
+        appid: 548430,
+        name: "Deep Rock Galactic",
+        recommendationScore: 95,
+        updatedAt: "2026-06-08T00:00:00Z",
+      },
+    ],
+    recentlyAdded: [],
+  },
+};
+
+const publicGamesPayload = {
+  items: [
+    {
+      appid: 3744430,
+      name: "Together Moon Escape",
+      recommendationScore: 92,
+      updatedAt: "2026-06-08T00:00:00Z",
+    },
+    {
+      appid: 548430,
+      name: "Deep Rock Galactic",
+      recommendationScore: 95,
+      updatedAt: "2026-06-08T00:00:00Z",
+    },
+  ],
+  page: { limit: 100, offset: 0, total: 2 },
+};
+
+function fetchJson(
+  value: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+) {
+  const normalizedHeaders = new Map(
+    Object.entries(headers).map(([key, headerValue]) => [
+      key.toLowerCase(),
+      headerValue,
+    ]),
+  );
+
   return Promise.resolve({
     ok: status >= 200 && status < 300,
     status,
+    headers: {
+      get: (name: string) => normalizedHeaders.get(name.toLowerCase()) ?? null,
+    },
     json: async () => value,
   } as Response);
 }
@@ -60,49 +116,11 @@ function installPublicServiceFetch(report?: GameAnalysisReport) {
   const fetchMock = vi.fn((input: RequestInfo | URL) => {
     const url = String(input);
     if (url === "https://mpgs.example.test/api/v1/discovery-home") {
-      return fetchJson({
-        status: "ready",
-        totalGames: 2,
-        sections: {
-          newlyPublished: [
-            {
-              appid: 3744430,
-              name: "Together Moon Escape",
-              recommendationScore: 92,
-              updatedAt: "2026-06-08T00:00:00Z",
-            },
-          ],
-          highConfidence: [
-            {
-              appid: 548430,
-              name: "Deep Rock Galactic",
-              recommendationScore: 95,
-              updatedAt: "2026-06-08T00:00:00Z",
-            },
-          ],
-          recentlyAdded: [],
-        },
-      });
+      return fetchJson(publicHomePayload);
     }
 
     if (url === "https://mpgs.example.test/api/v1/games?limit=100&offset=0") {
-      return fetchJson({
-        items: [
-          {
-            appid: 3744430,
-            name: "Together Moon Escape",
-            recommendationScore: 92,
-            updatedAt: "2026-06-08T00:00:00Z",
-          },
-          {
-            appid: 548430,
-            name: "Deep Rock Galactic",
-            recommendationScore: 95,
-            updatedAt: "2026-06-08T00:00:00Z",
-          },
-        ],
-        page: { limit: 100, offset: 0, total: 2 },
-      });
+      return fetchJson(publicGamesPayload);
     }
 
     if (url === "https://mpgs.example.test/api/v1/games/548430/analysis" && report) {
@@ -138,6 +156,7 @@ function setTauriRuntime(enabled: boolean) {
 describe("game analysis client", () => {
   beforeEach(() => {
     __resetMockGameAnalysisCacheForTests();
+    window.localStorage.clear();
     clearCurrentServiceConnection();
     invokeMock.mockReset();
     setTauriRuntime(false);
@@ -207,6 +226,76 @@ describe("game analysis client", () => {
       dataSource: "公共发现服务：MPGS Test Service",
     });
     expect(dashboard.config.onboardingCompleted).toBe(true);
+  });
+
+  it("uses ETags and cached public dashboard bodies for 304 responses", async () => {
+    configureServiceConnection();
+    let homeRequests = 0;
+    let gamesRequests = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "https://mpgs.example.test/api/v1/discovery-home") {
+        homeRequests += 1;
+        if (homeRequests === 1) {
+          return fetchJson(publicHomePayload, 200, { ETag: '"home-rev-1"' });
+        }
+
+        expect(init?.headers).toMatchObject({
+          "If-None-Match": '"home-rev-1"',
+        });
+        return fetchJson(null, 304);
+      }
+
+      if (url === "https://mpgs.example.test/api/v1/games?limit=100&offset=0") {
+        gamesRequests += 1;
+        if (gamesRequests === 1) {
+          return fetchJson(publicGamesPayload, 200, { ETag: '"games-rev-1"' });
+        }
+
+        expect(init?.headers).toMatchObject({
+          "If-None-Match": '"games-rev-1"',
+        });
+        return fetchJson(null, 304);
+      }
+
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const firstDashboard = await getDashboard();
+    const secondDashboard = await getDashboard();
+
+    expect(firstDashboard.newGames[0].name).toBe("Together Moon Escape");
+    expect(secondDashboard.newGames[0].name).toBe("Together Moon Escape");
+    expect(secondDashboard.classics[0].name).toBe("Deep Rock Galactic");
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("falls back to the cached public dashboard snapshot when the service is unreachable", async () => {
+    configureServiceConnection();
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(() =>
+        fetchJson(publicHomePayload, 200, { ETag: '"home-rev-1"' }),
+      )
+      .mockImplementationOnce(() =>
+        fetchJson(publicGamesPayload, 200, { ETag: '"games-rev-1"' }),
+      )
+      .mockRejectedValue(new Error("offline"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(getDashboard()).resolves.toMatchObject({
+      stats: { totalGames: 2 },
+    });
+
+    await expect(getDashboard()).resolves.toMatchObject({
+      stats: {
+        totalGames: 2,
+        dataSource: "公共发现服务：MPGS Test Service",
+      },
+      classics: [{ appid: 548430, name: "Deep Rock Galactic" }],
+    });
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("keeps the old Tauri dashboard command as a fallback when no service is configured", async () => {

@@ -29,10 +29,12 @@ export async function fetchPublicDashboard(
   const baseUrl = normalizeServiceBaseUrl(connection.baseUrl);
   const [home, gamesPage] = await Promise.all([
     fetchJson<DiscoveryHomeResponse>(
+      connection,
       `${baseUrl}/api/v1/discovery-home`,
       options.fetcher,
     ),
     fetchJson<PublicGamesPage>(
+      connection,
       `${baseUrl}/api/v1/games?limit=${PUBLIC_GAMES_LIMIT}&offset=0`,
       options.fetcher,
     ),
@@ -168,15 +170,130 @@ function buildCollections(games: GameCard[]): UserCollections {
 }
 
 async function fetchJson<T>(
+  connection: CurrentServiceConnection,
   url: string,
   fetcher: typeof fetch = fetch,
 ): Promise<T> {
-  const response = await fetcher(url, { method: "GET" });
-  if (!response.ok) {
-    throw new Error(`公共发现服务读取失败：HTTP ${response.status}。`);
+  const cached = readPublicReadCacheEntry(connection.info.serviceInstanceId, url);
+  const init: RequestInit = { method: "GET" };
+  if (cached?.etag) {
+    init.headers = { "If-None-Match": cached.etag };
   }
 
-  return (await response.json()) as T;
+  try {
+    const response = await fetcher(url, init);
+    if (response.status === 304) {
+      if (cached) {
+        return cached.body as T;
+      }
+      throw new Error("公共发现服务返回未变更，但本地缓存不存在。");
+    }
+
+    if (!response.ok) {
+      throw new Error(`公共发现服务读取失败：HTTP ${response.status}。`);
+    }
+
+    const body = (await response.json()) as T;
+    writePublicReadCacheEntry(connection.info.serviceInstanceId, url, {
+      body,
+      cachedAt: new Date().toISOString(),
+      etag: response.headers.get("ETag"),
+    });
+    return body;
+  } catch (error) {
+    if (cached) {
+      return cached.body as T;
+    }
+    throw error;
+  }
+}
+
+interface PublicReadCacheEntry {
+  body: unknown;
+  cachedAt: string;
+  etag: string | null;
+}
+
+type PublicReadCache = Record<string, PublicReadCacheEntry>;
+
+function readPublicReadCacheEntry(
+  serviceInstanceId: string,
+  url: string,
+): PublicReadCacheEntry | null {
+  return readPublicReadCache(serviceInstanceId)[url] ?? null;
+}
+
+function writePublicReadCacheEntry(
+  serviceInstanceId: string,
+  url: string,
+  entry: PublicReadCacheEntry,
+) {
+  const storage = getStorage();
+  if (!storage) {
+    return;
+  }
+
+  const cache = readPublicReadCache(serviceInstanceId);
+  cache[url] = entry;
+  storage.setItem(publicReadCacheStorageKey(serviceInstanceId), JSON.stringify(cache));
+}
+
+function readPublicReadCache(serviceInstanceId: string): PublicReadCache {
+  const storage = getStorage();
+  if (!storage) {
+    return {};
+  }
+
+  const rawValue = storage.getItem(publicReadCacheStorageKey(serviceInstanceId));
+  if (!rawValue) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (!parsed || typeof parsed !== "object") {
+      return {};
+    }
+
+    const cache: PublicReadCache = {};
+    for (const [url, value] of Object.entries(parsed)) {
+      if (isPublicReadCacheEntry(value)) {
+        cache[url] = value;
+      }
+    }
+    return cache;
+  } catch {
+    return {};
+  }
+}
+
+function isPublicReadCacheEntry(value: unknown): value is PublicReadCacheEntry {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<PublicReadCacheEntry>;
+  return (
+    Object.prototype.hasOwnProperty.call(candidate, "body") &&
+    typeof candidate.cachedAt === "string" &&
+    (candidate.etag === null || typeof candidate.etag === "string")
+  );
+}
+
+function publicReadCacheStorageKey(serviceInstanceId: string) {
+  return `mpgs.publicReadCache.v1.${serviceInstanceId}`;
+}
+
+function getStorage(): Storage | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
 }
 
 function buildPublicDashboardStats(
