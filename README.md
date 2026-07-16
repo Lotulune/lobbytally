@@ -2,7 +2,7 @@
 
 MPGS（Multiplayer Game Scout）是一款面向熟人联机的 Steam 游戏发现工具。它优先推荐私人房间、合作模式、P2P 或可自建服务器的游戏，而不是简单复制 Steam 热门榜。
 
-当前状态：`MVP 0.1 / M3+M4 验收关闭` — 确定性推荐与公开 API、Tauri 桌面客户端、Win/Linux 原生 E2E 与三平台 bundle CI 已通过（见 [M4_CI_RUN](docs/M4_CI_RUN.md)）。真实多人候选约 2,000+ 条；数据富化与 AI Provider（M5）仍为后续门禁。
+当前状态：`MVP 0.1 / M3+M4 关闭、M5 进行中` — 确定性推荐与公开 API、Tauri 桌面客户端已验收（见 [M4_CI_RUN](docs/M4_CI_RUN.md)）。M5 已落地 `mpgs-ai` Provider/Gateway、FTS/向量表与自然语言 AI 回退路径；真实 Provider 与语义检索仍在扩展中。
 ## MVP 能力
 
 - 最近发售、即将发售/Demo、人气老游、经典老游四类推荐。

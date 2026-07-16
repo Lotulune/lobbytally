@@ -11,7 +11,7 @@
 - `mpgs-server`：公开 API（会话/偏好/四分区/日历/搜索/详情/证据/反馈/游玩意愿投票/自然语言确定性 fallback）、生成式 OpenAPI、限流、`x-request-id`、ETag、CORS 白名单；管理/内部 jobs。
 - `mpgs-dbtool`：migrate / Steam 候选采集 / integrity / m3-audit / backup / restore。
 - 桌面：`web/`（Vite + React + TS，多主题/离线缓存/自然语言 UI）+ `apps/desktop/src-tauri/`（Tauri 2）+ `e2e-tests/`（Windows/Linux `tauri-driver`）。
-- 尚未接入外部 AI Provider（M5）。
+- M5 起步：`mpgs-ai` Provider/Gateway 已接入；默认 `MPGS_AI_PROVIDER=disabled`。可选 `openai_compat` + `MPGS_AI_API_KEY`（及 `MPGS_AI_BASE_URL`/`MPGS_AI_MODEL`/`MPGS_AI_TIMEOUT_SECS`）。关闭或失败时自然语言仍返回确定性结果与 `ai_status=fallback`。
 
 M4 关闭证据：本机验收与 E2E 见 [`M4_ACCEPTANCE.md`](M4_ACCEPTANCE.md)；跨平台 CI 全绿见 [`M4_CI_RUN.md`](M4_CI_RUN.md)（[run 29497583493](https://github.com/Lotulune/mpgs/actions/runs/29497583493)，commit `5e0274b`）。
 ### Git
@@ -214,7 +214,7 @@ request -> raw response validation -> source DTO -> normalized proposal
 
 ## 10. AI 开发
 
-- 测试默认使用 Fake 或 Disabled Provider，不消耗真实额度。
+- 测试默认使用 Fake 或 Disabled Provider，不消耗真实额度。单元：`cargo test -p mpgs-ai`；集成：`cargo test -p mpgs-server natural_language`。
 - 模型输出先经过 JSON Schema 和语义校验，再进入推荐器。
 - 不提供通用 SQL、任意 URL 或文件工具。
 - 所有模型可见外部文本均标记为数据，并进行大小/字符清洗。

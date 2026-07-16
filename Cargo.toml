@@ -2,6 +2,7 @@
 members = [
     "apps/server",
     "apps/dbtool",
+    "crates/ai",
     "crates/domain",
     "crates/recommender",
     "crates/steam-source",

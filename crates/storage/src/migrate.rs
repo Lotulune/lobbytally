@@ -34,6 +34,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0006_play_intent_votes",
         include_str!("../../../migrations/0006_play_intent_votes.sql"),
     ),
+    (
+        7,
+        "0007_m5_ai_retrieval",
+        include_str!("../../../migrations/0007_m5_ai_retrieval.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {

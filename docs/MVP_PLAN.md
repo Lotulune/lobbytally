@@ -174,6 +174,14 @@ flowchart LR
 - 候选外 AppID、无效分数和伪造证据无法穿过服务端验证。
 - 在线 AI 在总超时内成功或回退。
 
+实现状态（2026-07-16 起步切片）：
+
+- 新增 `crates/ai`：`AiProvider` / `EmbeddingProvider`、`DisabledProvider`、`FakeProvider`、OpenAI-compatible HTTP 适配器、超时/预算/熔断 `AiGateway`、非可信文本包装、排序输出校验（候选外 AppID / 分数范围 / 伪造 evidence 拒绝）、float32 向量编解码、余弦相似度与 RRF。
+- 迁移 `0007_m5_ai_retrieval`：`game_documents`、`game_fts`、`game_embeddings`、`ai_analyses`、`ai_analysis_cache`；`storage::retrieval` 支持文档/FTS/向量/缓存读写。
+- 服务端：`MPGS_AI_PROVIDER=disabled|openai_compat`（及 Key/Base URL/Model/Timeout）；`/v1/meta.ai_available` 反映网关；自然语言推荐在 Provider 可用时做 Top-N AI 分析并返回 `ai_status=used|fallback`，失败时确定性结果仍可用。
+- 测试：`mpgs-ai` 单元测试、FTS/embedding/cache 存储测试、NL fallback 与 Fake AI `used` 集成测试。
+- 待办：离线特征提取流水线、真实 Embedding Provider、目录批量文档同步、生产 Key 下的端到端 AI 验收、UI `used/cached/disabled/fallback` 全态展示（UI-007）。
+
 ### M6：发布加固
 
 交付：

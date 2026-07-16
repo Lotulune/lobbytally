@@ -24,7 +24,7 @@ pub const PRICE_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct Repository {
-    db: Database,
+    pub(crate) db: Database,
 }
 
 impl Repository {

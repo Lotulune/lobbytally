@@ -156,7 +156,7 @@ web/                      React/TypeScript UI
 docs/                     规格与决策
 ```
 
-当前已建立 `domain`、`recommender`、`steam-source`、`storage`、`server` 与 `dbtool`。M4 起新增桌面客户端：前端在 `web/`（Vite + React + TypeScript，pnpm workspace），Tauri 2 壳在 `apps/desktop/src-tauri/`。`retrieval`、`ai`、`api-contract` 按 [MVP 开发计划](MVP_PLAN.md) 在后续里程碑增量加入，避免先生成大量无实现空包。
+当前已建立 `domain`、`recommender`、`steam-source`、`storage`、`ai`、`server` 与 `dbtool`。M4 起新增桌面客户端：前端在 `web/`（Vite + React + TypeScript，pnpm workspace），Tauri 2 壳在 `apps/desktop/src-tauri/`。M5 将 AI Gateway 落在 `crates/ai`，检索文档/FTS/向量表落在 `storage` 迁移 `0007`；独立 `retrieval`/`api-contract` crate 仍可按需要再拆。
 
 `apps/desktop/src-tauri` 是一个独立的 Cargo workspace（其 `Cargo.toml` 带空 `[workspace]`），不进入根 Rust workspace，使根 `cargo test --workspace` 与 CI 不依赖平台 WebView 工具链。前端构建产物 `web/dist` 由 Tauri `frontendDist` 加载；开发时 `devUrl` 指向 Vite。
 

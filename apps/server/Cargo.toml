@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 axum = { workspace = true, features = ["macros"] }
 getrandom = { workspace = true }
+mpgs-ai = { path = "../../crates/ai" }
 mpgs-domain = { path = "../../crates/domain", features = ["openapi"] }
 mpgs-recommender = { path = "../../crates/recommender" }
 mpgs-storage = { path = "../../crates/storage" }

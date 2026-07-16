@@ -6,6 +6,7 @@ mod rate_limit;
 
 use std::{env, error::Error, io, net::SocketAddr};
 
+use mpgs_ai::gateway_from_env;
 use mpgs_storage::{Database, Repository};
 use tokio::net::TcpListener;
 use tracing::info;
@@ -62,11 +63,16 @@ fn build_state() -> Result<AppState, Box<dyn Error>> {
             Some(repo)
         }
     };
+    let ai = gateway_from_env().map_err(|error| {
+        io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+    })?;
+    info!(provider = ai.provider_name(), available = ai.is_available(), "AI gateway ready");
     Ok(AppState {
         repo,
         admin_token,
         rate_limits: RateLimitConfig::from_env()?,
         cors: CorsConfig::from_env()?,
+        ai,
     })
 }
 
@@ -115,6 +121,7 @@ mod tests {
             admin_token: Some("secret".into()),
             rate_limits,
             cors: CorsConfig::default(),
+            ai: mpgs_ai::AiGateway::disabled(),
         });
         (repo, app)
     }
@@ -820,6 +827,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn natural_language_uses_fake_ai_when_available_and_valid() {
+        use mpgs_ai::{AiGateway, AiPolicy, FakeProvider};
+        use std::sync::Arc;
+
+        let db = Database::open_in_memory().unwrap();
+        let repo = Repository::new(db);
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        repo.seed_demo_if_empty().unwrap();
+
+        // Probe deterministic ranking first to learn a real app_id + evidence.
+        let probe = build_router(AppState {
+            repo: Some(repo.clone()),
+            admin_token: Some("secret".into()),
+            rate_limits: RateLimitConfig {
+                enabled: false,
+                ..RateLimitConfig::default()
+            },
+            cors: CorsConfig::default(),
+            ai: AiGateway::disabled(),
+        });
+        let probe_resp = probe
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/recommendations/natural-language")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"query":"3 people casual coop replayable","limit":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let probe_body = axum::body::to_bytes(probe_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let probe_json: serde_json::Value = serde_json::from_slice(&probe_body).unwrap();
+        let items = probe_json["items"].as_array().unwrap();
+        let first = items
+            .iter()
+            .find(|item| {
+                item["evidence_ids"]
+                    .as_array()
+                    .map(|ids| !ids.is_empty())
+                    .unwrap_or(false)
+            })
+            .expect("expected at least one item with evidence_ids");
+        let app_id = first["app_id"].as_u64().unwrap();
+        let evidence = first["evidence_ids"].as_array().unwrap()[0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let fake = FakeProvider {
+            response: serde_json::json!({
+                "recommendations": [{
+                    "app_id": app_id,
+                    "fit_score": 0.95,
+                    "confidence": 0.9,
+                    "reason_evidence_ids": [evidence],
+                    "reasons": ["AI validated private coop fit"],
+                    "cautions": []
+                }],
+                "summary": "Prefer private cooperative sessions."
+            }),
+            fail_with: None,
+            available: true,
+        };
+        let app = build_router(AppState {
+            repo: Some(repo),
+            admin_token: Some("secret".into()),
+            rate_limits: RateLimitConfig {
+                enabled: false,
+                ..RateLimitConfig::default()
+            },
+            cors: CorsConfig::default(),
+            ai: AiGateway::new(Arc::new(fake), AiPolicy::default()),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/recommendations/natural-language")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"query":"3 people casual coop replayable","limit":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ai_status"], "used");
+        assert!(json["fallback_reason"].is_null());
+        assert_eq!(json["ai_summary"], "Prefer private cooperative sessions.");
+        assert_eq!(json["items"][0]["app_id"], app_id);
+        assert_eq!(
+            json["items"][0]["ai_reasons"][0],
+            "AI validated private coop fit"
+        );
+
+        let meta = build_router(AppState {
+            repo: None,
+            admin_token: None,
+            rate_limits: RateLimitConfig {
+                enabled: false,
+                ..RateLimitConfig::default()
+            },
+            cors: CorsConfig::default(),
+            ai: AiGateway::new(Arc::new(FakeProvider::default()), AiPolicy::default()),
+        })
+        .oneshot(Request::builder().uri("/v1/meta").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+        let meta_body = axum::body::to_bytes(meta.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let meta_json: serde_json::Value = serde_json::from_slice(&meta_body).unwrap();
+        assert_eq!(meta_json["ai_available"], true);
+    }
+
+    #[tokio::test]
     async fn calendar_can_switch_between_recent_and_upcoming() {
         let app = test_app();
         let recent = app
@@ -1284,6 +1418,7 @@ mod tests {
                 ..RateLimitConfig::default()
             },
             cors: CorsConfig::default(),
+            ai: mpgs_ai::AiGateway::disabled(),
         });
 
         let first = app

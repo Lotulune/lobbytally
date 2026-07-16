@@ -20,6 +20,7 @@ pub mod play_intent;
 pub mod quality;
 pub mod query;
 pub mod repo;
+pub mod retrieval;
 pub mod seed;
 pub mod source_state;
 pub mod users;
@@ -32,6 +33,9 @@ pub use migrate::{MIGRATIONS, latest_version};
 pub use models::*;
 pub use quality::QualityFinding;
 pub use repo::Repository;
+pub use retrieval::{
+    AiCacheEntry, FtsHit, GameDocument, PutEmbedding, StoredEmbedding, UpsertGameDocument,
+};
 
 #[cfg(test)]
 mod tests;

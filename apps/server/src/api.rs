@@ -9,10 +9,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use mpgs_ai::{
+    AiGateway, AiStatus, AiTaskType, CandidateEvidence, StructuredRequest, rank_analysis_schema,
+    rank_analysis_system_prompt, validate_rank_result, wrap_untrusted_data_block,
+};
 use mpgs_domain::{
     FeedSection, FeedbackType, RankingSignals, RecommendationConfig, UserPreferences,
 };
-use mpgs_recommender::{ALGORITHM_VERSION, RankingInput, friend_fit, rank_feed_configured};
+use mpgs_recommender::{
+    ALGORITHM_VERSION, AiAdjustment, RankingInput, blend_ai, friend_fit, rank_feed_configured,
+};
 use mpgs_storage::{CreateOverrideRequest, EnqueueJob, Repository, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -34,6 +40,7 @@ pub struct AppState {
     pub admin_token: Option<String>,
     pub rate_limits: RateLimitConfig,
     pub cors: CorsConfig,
+    pub ai: AiGateway,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -165,6 +172,7 @@ struct NaturalLanguageResponseSchema {
     items: Vec<FeedItemSchema>,
     ai_status: String,
     fallback_reason: Option<String>,
+    ai_summary: Option<String>,
     algorithm_version: String,
     data_updated_at_ms: i64,
 }
@@ -553,7 +561,7 @@ async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl In
             .into_iter()
             .map(FeedSection::as_str)
             .collect(),
-        ai_available: false,
+        ai_available: state.ai.is_available(),
         storage_enabled: state.repo.is_some(),
     };
     let etag = weak_etag(&format!(
@@ -1039,7 +1047,7 @@ async fn natural_language_recommendations(
         demo_only: Some(interpreted.demo_only),
     };
     let feed_response = get_feed(
-        State(state),
+        State(state.clone()),
         headers,
         Path(interpreted.selected_section.as_str().to_owned()),
         Query(feed_query),
@@ -1073,16 +1081,194 @@ async fn natural_language_recommendations(
             );
         }
     };
+    let mut items = feed
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let (ai_status, fallback_reason, ai_summary) =
+        enhance_natural_language_with_ai(&state.ai, query, &mut items).await;
     Json(json!({
         "query": query,
         "interpreted": interpreted,
-        "items": feed.get("items").cloned().unwrap_or_else(|| json!([])),
-        "ai_status": "fallback",
-        "fallback_reason": "AI provider is not configured; deterministic recommendations are shown",
+        "items": items,
+        "ai_status": ai_status.as_str(),
+        "fallback_reason": fallback_reason,
+        "ai_summary": ai_summary,
         "algorithm_version": feed.get("algorithm_version").cloned().unwrap_or(json!(ALGORITHM_VERSION)),
         "data_updated_at_ms": feed.get("data_updated_at_ms").cloned().unwrap_or(json!(0)),
     }))
     .into_response()
+}
+
+/// Apply optional AI Top-N analysis. Always preserves deterministic items on failure.
+async fn enhance_natural_language_with_ai(
+    gateway: &AiGateway,
+    query: &str,
+    items: &mut Vec<serde_json::Value>,
+) -> (AiStatus, Option<String>, Option<String>) {
+    if items.is_empty() {
+        if gateway.is_available() {
+            return (AiStatus::Used, None, None);
+        }
+        return (
+            AiStatus::Fallback,
+            Some(mpgs_ai::AiError::Disabled.fallback_reason().to_owned()),
+            None,
+        );
+    }
+    if !gateway.is_available() {
+        return (
+            AiStatus::Fallback,
+            Some(mpgs_ai::AiError::Disabled.fallback_reason().to_owned()),
+            None,
+        );
+    }
+
+    let mut candidates = Vec::new();
+    let mut compact = Vec::new();
+    for item in items.iter() {
+        let Some(app_id) = item.get("app_id").and_then(|v| v.as_u64()).map(|v| v as u32) else {
+            continue;
+        };
+        let evidence_ids = item
+            .get("evidence_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        compact.push(json!({
+            "app_id": app_id,
+            "name": item.get("name").cloned().unwrap_or(json!("")),
+            "score": item.get("score").cloned().unwrap_or(json!(0.0)),
+            "reasons": item.get("reasons").cloned().unwrap_or(json!([])),
+            "cautions": item.get("cautions").cloned().unwrap_or(json!([])),
+            "evidence_ids": evidence_ids.iter().cloned().collect::<Vec<_>>(),
+        }));
+        candidates.push(CandidateEvidence {
+            app_id,
+            evidence_ids,
+        });
+    }
+    if candidates.is_empty() {
+        return (
+            AiStatus::Fallback,
+            Some("no valid candidates for AI analysis".into()),
+            None,
+        );
+    }
+
+    let data_prompt = format!(
+        "{}\n\n{}",
+        wrap_untrusted_data_block("user_query", query, 500),
+        wrap_untrusted_data_block(
+            "candidates_json",
+            &serde_json::to_string(&compact).unwrap_or_else(|_| "[]".into()),
+            12_000
+        )
+    );
+    let request = StructuredRequest {
+        task: AiTaskType::RankAnalysis,
+        system_prompt: rank_analysis_system_prompt().to_owned(),
+        data_prompt,
+        json_schema_name: "rank_analysis".into(),
+        json_schema: rank_analysis_schema(),
+        max_output_tokens: 1_200,
+        temperature: 0.2,
+    };
+
+    let response = match gateway.structured_completion(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            return (
+                AiStatus::Fallback,
+                Some(error.fallback_reason().to_owned()),
+                None,
+            );
+        }
+    };
+
+    let validated = match validate_rank_result(&response.content, &candidates, items.len().max(1)) {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                AiStatus::Fallback,
+                Some(error.fallback_reason().to_owned()),
+                None,
+            );
+        }
+    };
+
+    // Reorder: AI-ranked first (with blended score), then remaining deterministic order.
+    let mut by_id: std::collections::HashMap<u32, serde_json::Value> = items
+        .drain(..)
+        .filter_map(|item| {
+            let app_id = item.get("app_id").and_then(|v| v.as_u64()).map(|v| v as u32)?;
+            Some((app_id, item))
+        })
+        .collect();
+
+    let mut reordered = Vec::new();
+    for ai_item in &validated.recommendations {
+        let Some(mut item) = by_id.remove(&ai_item.app_id) else {
+            continue;
+        };
+        let base = item
+            .get("components")
+            .and_then(|c| c.get("personalized_score"))
+            .and_then(|v| v.as_f64())
+            .or_else(|| item.get("score").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        let blended = blend_ai(
+            base,
+            Some(AiAdjustment {
+                fit: ai_item.fit_score,
+                confidence: ai_item.confidence,
+            }),
+        );
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("score".into(), json!(blended));
+            obj.insert("ai_fit".into(), json!(ai_item.fit_score));
+            obj.insert("ai_confidence".into(), json!(ai_item.confidence));
+            if !ai_item.reasons.is_empty() {
+                obj.insert("ai_reasons".into(), json!(ai_item.reasons));
+            }
+            if !ai_item.cautions.is_empty() {
+                let mut cautions = obj
+                    .get("cautions")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for caution in &ai_item.cautions {
+                    cautions.push(json!(caution));
+                }
+                obj.insert("cautions".into(), json!(cautions));
+            }
+            if let Some(components) = obj.get_mut("components").and_then(|v| v.as_object_mut()) {
+                components.insert("final_score".into(), json!(blended));
+            }
+        }
+        reordered.push(item);
+    }
+    // Preserve remaining deterministic candidates after AI picks.
+    let mut rest: Vec<_> = by_id.into_values().collect();
+    rest.sort_by(|a, b| {
+        let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    reordered.extend(rest);
+    *items = reordered;
+
+    let summary = if validated.summary.is_empty() {
+        None
+    } else {
+        Some(validated.summary)
+    };
+    (AiStatus::Used, None, summary)
 }
 
 fn interpret_natural_language(query: &str) -> NaturalLanguageInterpretation {
