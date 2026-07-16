@@ -1,0 +1,29 @@
+[Unit]
+Description=MPGS recommendation server
+Documentation=https://github.com/Lotulune/mpgs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mpgs
+Group=mpgs
+# Override these paths in a drop-in or EnvironmentFile.
+EnvironmentFile=-/etc/mpgs/mpgs.env
+WorkingDirectory=/var/lib/mpgs
+ExecStart=/usr/local/bin/mpgs-server
+Restart=on-failure
+RestartSec=3
+# Hardening (adjust if reverse proxy / extra mounts are required)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mpgs /var/log/mpgs
+# Graceful stop: server listens for SIGTERM via Tokio.
+TimeoutStopSec=20
+KillSignal=SIGTERM
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

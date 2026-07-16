@@ -168,10 +168,11 @@ docs/                     规格与决策
 
 推荐运行方式：
 
-- Windows：Windows Service。
-- Linux：systemd service。
-- 数据目录、日志目录和密钥目录与可执行文件分离。
+- Windows：WinSW 托管的 Windows Service（模板 `packaging/windows/`）。
+- Linux：systemd service（单元文件 `packaging/linux/mpgs-server.service`）。
+- 数据目录、日志目录和密钥目录与可执行文件分离；环境模板见 `packaging/common/mpgs.env.example`。
 - 监听地址默认仅本机；正式部署由 HTTPS 反向代理或内建 TLS 终止层暴露。
+- 发布布局由 `scripts/package_server.ps1` 生成，含 `PROVENANCE.json` 与 `SHA256SUMS.txt`（见 [OPERATIONS.md](OPERATIONS.md)）。
 
 ### 6.2 可选采集节点
 

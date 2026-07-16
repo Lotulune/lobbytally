@@ -1,0 +1,28 @@
+<!--
+  WinSW service definition for mpgs-server.
+  1. Download WinSW (https://github.com/winsw/winsw) as mpgs-server-service.exe
+     next to this file and rename/copy the XML to match: mpgs-server-service.xml
+  2. Edit envFile / arguments paths for the install host.
+  3. Run elevated: mpgs-server-service.exe install && mpgs-server-service.exe start
+
+  Native SCM integration is intentionally delegated to WinSW so the console
+  binary stays portable. See docs/OPERATIONS.md and docs/SIGNING_AND_UPDATES.md.
+-->
+<service>
+  <id>mpgs-server</id>
+  <name>MPGS Server</name>
+  <description>MPGS Steam multiplayer recommendation API (local SQLite authority)</description>
+  <executable>%BASE%\bin\mpgs-server.exe</executable>
+  <workingdirectory>%BASE%</workingdirectory>
+  <env name="MPGS_DATABASE_PATH" value="%BASE%\data\mpgs.db"/>
+  <env name="MPGS_BIND_ADDR" value="127.0.0.1:8080"/>
+  <!-- Prefer EnvironmentFile-style secrets via a host-local env file and set:
+       <env name="MPGS_ADMIN_TOKEN" value="..."/> only on the private host. -->
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+  <onfailure action="restart" delay="5 sec"/>
+  <stoptimeout>20 sec</stoptimeout>
+  <startmode>Automatic</startmode>
+</service>

@@ -65,9 +65,20 @@ struct MetaResponse {
     api_version: &'static str,
     service_version: &'static str,
     algorithm_version: String,
+    /// SQLite schema migration version when storage is enabled.
+    schema_version: Option<i64>,
+    /// Compile-time git SHA from `MPGS_BUILD_GIT_SHA`, or `unknown` for local builds.
+    build_git_sha: &'static str,
+    /// Latest catalog / snapshot freshness marker from storage, when available.
+    data_updated_at_ms: Option<i64>,
     supported_sections: Vec<&'static str>,
     ai_available: bool,
     storage_enabled: bool,
+}
+
+/// Git commit stamped into release binaries via `MPGS_BUILD_GIT_SHA` (see `build.rs`).
+pub fn build_git_sha() -> &'static str {
+    env!("MPGS_BUILD_GIT_SHA")
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -554,17 +565,29 @@ async fn health_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     tag = "public"
 )]
 async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let algorithm_version = match state.repo.as_ref() {
-        Some(repo) => match storage_result(repo, |repo| repo.active_algorithm_config()).await {
-            Ok(active) => active.version,
-            Err(error) => return map_storage_error(error, None),
-        },
-        None => ALGORITHM_VERSION.to_owned(),
+    let (algorithm_version, schema_version, data_updated_at_ms) = match state.repo.as_ref() {
+        Some(repo) => {
+            match storage_result(repo, |repo| {
+                let algorithm = repo.active_algorithm_config()?.version;
+                let schema = repo.database().schema_version()?;
+                let data_updated = repo.data_updated_at_ms().ok();
+                Ok((algorithm, Some(schema), data_updated))
+            })
+            .await
+            {
+                Ok(values) => values,
+                Err(error) => return map_storage_error(error, None),
+            }
+        }
+        None => (ALGORITHM_VERSION.to_owned(), None, None),
     };
     let body = MetaResponse {
         api_version: "v1",
         service_version: env!("CARGO_PKG_VERSION"),
         algorithm_version,
+        schema_version,
+        build_git_sha: build_git_sha(),
+        data_updated_at_ms,
         supported_sections: FeedSection::ALL
             .into_iter()
             .map(FeedSection::as_str)
@@ -573,8 +596,13 @@ async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl In
         storage_enabled: state.repo.is_some(),
     };
     let etag = weak_etag(&format!(
-        "{}:{}:{}",
-        body.service_version, body.algorithm_version, body.storage_enabled
+        "{}:{}:{}:{}:{}:{}",
+        body.service_version,
+        body.algorithm_version,
+        body.schema_version.unwrap_or(-1),
+        body.build_git_sha,
+        body.data_updated_at_ms.unwrap_or(0),
+        body.storage_enabled
     ));
     if_none_match_ok(&headers, &etag)
         .unwrap_or_else(|| ([(header::ETAG, etag)], Json(body)).into_response())

@@ -2,7 +2,7 @@
 
 ## 1. 当前基线
 
-仓库当前 **M3–M5 已验收关闭**；M5 审查修复的干净提交验收记录见 [`M5_ACCEPTANCE_RUN.md`](M5_ACCEPTANCE_RUN.md)。下一工程主线可进入 [M6 发布加固](MVP_PLAN.md#m6发布加固)；发布前数据富化仍须并行推进。
+仓库当前 **M3–M5 已验收关闭**；M6 发布加固工程基线见 [`M6_ACCEPTANCE.md`](M6_ACCEPTANCE.md)。M5 审查修复记录见 [`M5_ACCEPTANCE_RUN.md`](M5_ACCEPTANCE_RUN.md)。发布前数据富化、合规签字与真实签名仍须并行/人工完成。
 
 - `mpgs-domain`：分区、偏好、反馈类型与推荐信号。
 - `mpgs-recommender`：评分、个性化、硬过滤、MMR、解释与 `rank_feed`。
@@ -268,3 +268,21 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 - 新外部事实附官方来源与核验日期。
 
 GitHub Actions 构建 CI 已获负责人确认并创建于 `.github/workflows/ci.yml`：质量门禁运行在 Linux x64，发布构建使用 Windows/Linux 的 x64/ARM64 原生 runner，构建产物保留 14 天。发布、签名和部署仍需单独确认。
+
+## 14. M6 发布加固
+
+```powershell
+# 离线验收（干净工作树才 PASS）
+.\scripts\m6_acceptance.ps1
+# 可选：再打带 PROVENANCE 的 release 服务包
+.\scripts\m6_acceptance.ps1 -Package
+
+# 单独打服务端包（注入 git SHA）
+$env:MPGS_BUILD_GIT_SHA = (git rev-parse HEAD)
+.\scripts\package_server.ps1
+
+# 刷新第三方许可表
+.\scripts\generate_third_party_licenses.ps1
+```
+
+运维与合规文档：`docs/OPERATIONS.md`、`ROLLBACK.md`、`KNOWN_LIMITATIONS.md`、`PRIVACY.md`、`SIGNING_AND_UPDATES.md`、`STEAM_BRAND_REVIEW.md`。Linux systemd 与 Windows WinSW 模板在 `packaging/`。

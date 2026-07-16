@@ -112,6 +112,9 @@ AI 失败通常不返回 5xx，而是以成功响应中的 `ai_status=fallback` 
   "api_version": "v1",
   "service_version": "0.1.0",
   "algorithm_version": "rules-0.2.0",
+  "schema_version": 7,
+  "build_git_sha": "unknown",
+  "data_updated_at_ms": 1783936800000,
   "supported_sections": [
     "recent_release",
     "upcoming",
@@ -122,6 +125,8 @@ AI 失败通常不返回 5xx，而是以成功响应中的 `ai_status=fallback` 
   "storage_enabled": true
 }
 ```
+
+M6 起 `schema_version` / `build_git_sha` / `data_updated_at_ms` 用于发布物可追溯：`build_git_sha` 来自编译期 `MPGS_BUILD_GIT_SHA`（见 `apps/server/build.rs` 与 `scripts/package_server.ps1`）；本地未注入时为 `unknown`。
 
 ## 7. 偏好
 

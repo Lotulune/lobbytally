@@ -805,6 +805,36 @@ fn backup_restore_and_integrity() {
     restored_repo.assert_ready().unwrap();
     let app = restored_repo.get_app(570).unwrap().unwrap();
     assert_eq!(app.canonical_name, "Dota 2");
+    // Restored DBs remain upgradeable: migrate is idempotent at latest.
+    assert_eq!(restored_repo.migrate().unwrap(), latest_version());
+    assert_eq!(
+        restored_repo.database().schema_version().unwrap(),
+        latest_version()
+    );
+}
+
+/// M6: empty DB upgrades through every shipped migration in order.
+#[test]
+fn m6_upgrade_path_from_each_intermediate_version() {
+    for from in 0..latest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("from_{from}.db"));
+        {
+            let db = Database::open(&path).unwrap();
+            if from > 0 {
+                db.with_conn_mut(|conn| {
+                    migrate::migrate_to(conn, from, 1_000)?;
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(db.schema_version().unwrap(), from);
+            }
+        }
+        let db = Database::open(&path).unwrap();
+        let version = db.migrate().unwrap();
+        assert_eq!(version, latest_version(), "upgrade from {from}");
+        db.assert_ready().unwrap();
+    }
 }
 
 #[test]

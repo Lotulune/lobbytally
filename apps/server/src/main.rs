@@ -107,8 +107,34 @@ fn init_tracing() {
 }
 
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::error!(%error, "failed to install Ctrl+C handler");
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to install Ctrl+C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {
+            tracing::info!("shutdown signal received (ctrl_c)");
+        }
+        () = terminate => {
+            tracing::info!("shutdown signal received (terminate)");
+        }
     }
 }
 
@@ -1590,5 +1616,128 @@ mod tests {
         eprintln!("uncached_p95={uncached_p95:?}, cached_p95={cached_p95:?}");
         assert!(cached_p95 < std::time::Duration::from_millis(500));
         assert!(uncached_p95 < std::time::Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn m6_meta_includes_release_provenance_fields() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/meta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["api_version"], "v1");
+        assert_eq!(json["service_version"], env!("CARGO_PKG_VERSION"));
+        assert!(json["algorithm_version"].as_str().is_some_and(|v| !v.is_empty()));
+        assert!(json["schema_version"].as_i64().is_some_and(|v| v > 0));
+        assert!(json["build_git_sha"].as_str().is_some());
+        assert!(json["data_updated_at_ms"].as_i64().is_some());
+        assert_eq!(json["storage_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn m6_soak_repeated_reads_stay_healthy() {
+        let app = test_app();
+        for i in 0..80 {
+            let uri = match i % 4 {
+                0 => "/health/live",
+                1 => "/health/ready",
+                2 => "/v1/meta",
+                _ => "/v1/feeds/classic_legacy?limit=5",
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("x-device-id", "m6-soak-device")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "request {i} to {uri} must remain healthy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn m6_fault_ai_unavailable_does_not_break_deterministic_paths() {
+        let (repo, app) = test_repo_and_app(RateLimitConfig {
+            enabled: false,
+            ..RateLimitConfig::default()
+        });
+        // Force AI off (test helper already uses disabled; re-assert feed + NL fallback).
+        let _ = repo;
+        let feed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/feeds/classic_legacy?limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(feed.status(), StatusCode::OK);
+
+        let nl = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/recommendations/natural-language")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"query":"4人合作自建服 不想太竞技","limit":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nl.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(nl.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ai_status"], "fallback");
+        assert!(json["items"].as_array().is_some_and(|items| !items.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn m6_fault_admin_without_token_stays_denied() {
+        let (_, app) = test_repo_and_app(RateLimitConfig {
+            enabled: false,
+            ..RateLimitConfig::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/v1/games/570/overrides")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"feature_name":"self_hosted_server","value":true,"reason":"m6 fault","operator":"m6"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "admin write without token must be 401"
+        );
     }
 }
