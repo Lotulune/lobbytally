@@ -279,7 +279,16 @@ Embedding 或 AI 意图解析不可用时回退到 FTS 和当前偏好。
 }
 ```
 
-`query` 长度为 3–500 个字符，`limit` 为 3–10。当前实现从自然语言中确定性解析人数、时长、合作/竞技倾向、平台、Demo 和自建服意愿，再复用候选检索与硬约束排序。默认无外部 AI 时返回 `ai_status=fallback` 和非空 `fallback_reason`（HTTP 200）。配置 `MPGS_AI_PROVIDER=openai_compat`（及 API Key）后，服务端会对候选做结构化二次分析：校验通过则 `ai_status=used`，并可能附加 `ai_summary` / `ai_reasons`；超时、预算、熔断、坏 JSON 或候选外 AppID 时仍回退确定性结果。
+`query` 长度为 3–500 个字符，`limit` 为 3–10。当前实现从自然语言中确定性解析人数、时长、合作/竞技倾向、平台、Demo 和自建服意愿，再复用候选检索与硬约束排序，并可用 hybrid 检索重排（`hybrid_score`）。`ai_status` 取值：
+
+| 值 | 含义 |
+| --- | --- |
+| `used` | 本次调用了 Provider 且校验通过 |
+| `cached` | 命中服务端 AI 分析缓存 |
+| `fallback` | Provider 失败/未配置等，确定性结果仍返回 |
+| `disabled` | 空结果等边界下明确标记未启用路径 |
+
+默认无外部 AI 时返回 `fallback` 与非空 `fallback_reason`（HTTP 200，兼容既有验收）。配置 `MPGS_AI_PROVIDER=openai_compat` 后，校验通过则 `used`/`cached`，并可能附加 `ai_summary` / `ai_reasons`。
 
 ## 12. 游戏详情与证据
 

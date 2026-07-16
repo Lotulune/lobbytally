@@ -1104,7 +1104,8 @@ async fn natural_language_recommendations(
         }
     }
     let (ai_status, fallback_reason, ai_summary) =
-        enhance_natural_language_with_ai(&state.ai, &query, &mut items).await;
+        enhance_natural_language_with_ai(&state.ai, state.repo.as_ref(), &query, &mut items)
+            .await;
     Json(json!({
         "query": query,
         "interpreted": interpreted,
@@ -1151,6 +1152,7 @@ fn reorder_items_by_hybrid(items: &mut [serde_json::Value], hits: &[mpgs_storage
 /// Apply optional AI Top-N analysis. Always preserves deterministic items on failure.
 async fn enhance_natural_language_with_ai(
     gateway: &AiGateway,
+    repo: Option<&Repository>,
     query: &str,
     items: &mut Vec<serde_json::Value>,
 ) -> (AiStatus, Option<String>, Option<String>) {
@@ -1159,12 +1161,13 @@ async fn enhance_natural_language_with_ai(
             return (AiStatus::Used, None, None);
         }
         return (
-            AiStatus::Fallback,
+            AiStatus::Disabled,
             Some(mpgs_ai::AiError::Disabled.fallback_reason().to_owned()),
             None,
         );
     }
     if !gateway.is_available() {
+        // Keep reason text compatible with M4 acceptance wording while exposing disabled status.
         return (
             AiStatus::Fallback,
             Some(mpgs_ai::AiError::Disabled.fallback_reason().to_owned()),
@@ -1187,13 +1190,15 @@ async fn enhance_natural_language_with_ai(
                     .collect::<std::collections::HashSet<_>>()
             })
             .unwrap_or_default();
+        let mut evidence_list: Vec<String> = evidence_ids.iter().cloned().collect();
+        evidence_list.sort();
         compact.push(json!({
             "app_id": app_id,
             "name": item.get("name").cloned().unwrap_or(json!("")),
-            "score": item.get("score").cloned().unwrap_or(json!(0.0)),
+            // Score is excluded from the cache key material: only identity/evidence matter.
             "reasons": item.get("reasons").cloned().unwrap_or(json!([])),
             "cautions": item.get("cautions").cloned().unwrap_or(json!([])),
-            "evidence_ids": evidence_ids.iter().cloned().collect::<Vec<_>>(),
+            "evidence_ids": evidence_list,
         }));
         candidates.push(CandidateEvidence {
             app_id,
@@ -1206,6 +1211,24 @@ async fn enhance_natural_language_with_ai(
             Some("no valid candidates for AI analysis".into()),
             None,
         );
+    }
+
+    let cache_key = nl_ai_cache_key(query, &compact, gateway.provider_name());
+    if let Some(repo) = repo {
+        let now_ms = chrono_like_now_ms();
+        if let Ok(Some(entry)) =
+            storage_result(repo, move |repo| repo.get_ai_cache(&cache_key, now_ms)).await
+            && let Ok(content) = serde_json::from_str::<serde_json::Value>(&entry.output_json)
+            && let Ok(validated) = validate_rank_result(&content, &candidates, items.len().max(1))
+        {
+            apply_validated_ai_rank(items, &validated);
+            let summary = if validated.summary.is_empty() {
+                None
+            } else {
+                Some(validated.summary)
+            };
+            return (AiStatus::Cached, None, summary);
+        }
     }
 
     let data_prompt = format!(
@@ -1249,7 +1272,40 @@ async fn enhance_natural_language_with_ai(
         }
     };
 
-    // Reorder: AI-ranked first (with blended score), then remaining deterministic order.
+    if let Some(repo) = repo {
+        let now_ms = chrono_like_now_ms();
+        let output_json = response.content.to_string();
+        let entry = mpgs_storage::AiCacheEntry {
+            cache_key: nl_ai_cache_key(query, &compact, gateway.provider_name()),
+            task_type: "rank_analysis".into(),
+            provider: response.provider.clone(),
+            model: response.model.clone(),
+            prompt_version: "rank-v1".into(),
+            input_hash: nl_ai_cache_key(query, &compact, gateway.provider_name()),
+            output_json,
+            validation_status: "accepted".into(),
+            usage_input: i64::from(response.usage_input),
+            usage_output: i64::from(response.usage_output),
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(6 * 60 * 60 * 1000),
+        };
+        let _ = storage_result(repo, move |repo| repo.put_ai_cache(&entry)).await;
+    }
+
+    apply_validated_ai_rank(items, &validated);
+
+    let summary = if validated.summary.is_empty() {
+        None
+    } else {
+        Some(validated.summary)
+    };
+    (AiStatus::Used, None, summary)
+}
+
+fn apply_validated_ai_rank(
+    items: &mut Vec<serde_json::Value>,
+    validated: &mpgs_ai::AiRankResult,
+) {
     let mut by_id: std::collections::HashMap<u32, serde_json::Value> = items
         .drain(..)
         .filter_map(|item| {
@@ -1300,7 +1356,6 @@ async fn enhance_natural_language_with_ai(
         }
         reordered.push(item);
     }
-    // Preserve remaining deterministic candidates after AI picks.
     let mut rest: Vec<_> = by_id.into_values().collect();
     rest.sort_by(|a, b| {
         let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -1309,13 +1364,40 @@ async fn enhance_natural_language_with_ai(
     });
     reordered.extend(rest);
     *items = reordered;
+}
 
-    let summary = if validated.summary.is_empty() {
-        None
-    } else {
-        Some(validated.summary)
-    };
-    (AiStatus::Used, None, summary)
+fn nl_ai_cache_key(query: &str, compact: &[serde_json::Value], provider: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(provider.as_bytes());
+    hasher.update([0]);
+    hasher.update(query.as_bytes());
+    hasher.update([0]);
+    // Stable ordering: sort by app_id so cache keys don't depend on feed order.
+    let mut ordered = compact.to_vec();
+    ordered.sort_by(|a, b| {
+        let id_a = a.get("app_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let id_b = b.get("app_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        id_a.cmp(&id_b)
+    });
+    if let Ok(bytes) = serde_json::to_vec(&ordered) {
+        hasher.update(bytes);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("nl-rank:{hex}")
+}
+
+fn chrono_like_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn interpret_natural_language(query: &str) -> NaturalLanguageInterpretation {

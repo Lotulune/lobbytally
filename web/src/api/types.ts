@@ -60,6 +60,8 @@ export interface MetaResponse {
   storage_enabled: boolean;
 }
 
+export type AiStatus = "used" | "cached" | "fallback" | "disabled";
+
 export interface FeedItem {
   app_id: number;
   name: string;
@@ -84,6 +86,10 @@ export interface FeedItem {
     final_score: number;
   };
   algorithm_version: string;
+  hybrid_score?: number;
+  ai_fit?: number;
+  ai_confidence?: number;
+  ai_reasons?: string[];
 }
 
 export interface FeedResponse {
@@ -140,8 +146,9 @@ export interface NaturalLanguageRecommendationResponse {
     self_hosting_willingness?: number | null;
   };
   items: FeedItem[];
-  ai_status: "ai" | "fallback";
+  ai_status: AiStatus;
   fallback_reason: string | null;
+  ai_summary?: string | null;
   algorithm_version: string;
   data_updated_at_ms: number;
 }

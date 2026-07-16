@@ -881,7 +881,7 @@ mod tests {
             .unwrap()
             .to_owned();
 
-        let fake = FakeProvider {
+        let fake = Arc::new(FakeProvider {
             response: serde_json::json!({
                 "recommendations": [{
                     "app_id": app_id,
@@ -895,16 +895,16 @@ mod tests {
             }),
             fail_with: None,
             available: true,
-        };
+        });
         let app = build_router(AppState {
-            repo: Some(repo),
+            repo: Some(repo.clone()),
             admin_token: Some("secret".into()),
             rate_limits: RateLimitConfig {
                 enabled: false,
                 ..RateLimitConfig::default()
             },
             cors: CorsConfig::default(),
-            ai: AiGateway::new(Arc::new(fake), AiPolicy::default()),
+            ai: AiGateway::new(fake.clone(), AiPolicy::default()),
         });
         let response = app
             .oneshot(
@@ -932,6 +932,35 @@ mod tests {
             json["items"][0]["ai_reasons"][0],
             "AI validated private coop fit"
         );
+
+        // Second identical request should hit the AI analysis cache.
+        let cached = build_router(AppState {
+            repo: Some(repo.clone()),
+            admin_token: Some("secret".into()),
+            rate_limits: RateLimitConfig {
+                enabled: false,
+                ..RateLimitConfig::default()
+            },
+            cors: CorsConfig::default(),
+            ai: AiGateway::new(fake, AiPolicy::default()),
+        })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/recommendations/natural-language")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"query":"3 people casual coop replayable","limit":5}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let cached_body = axum::body::to_bytes(cached.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let cached_json: serde_json::Value = serde_json::from_slice(&cached_body).unwrap();
+        assert_eq!(cached_json["ai_status"], "cached");
 
         let meta = build_router(AppState {
             repo: None,

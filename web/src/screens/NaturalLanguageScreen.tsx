@@ -79,10 +79,17 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
       {result && !error && (
         <>
           <div className="statusline">
-            {result.ai_status === "fallback" ? (
-              <span className="chip warn" title={result.fallback_reason ?? undefined}>规则解析模式</span>
-            ) : (
-              <span className="chip accent">AI 解析</span>
+            {result.ai_status === "used" && <span className="chip accent">AI 已增强</span>}
+            {result.ai_status === "cached" && <span className="chip accent">AI 缓存命中</span>}
+            {result.ai_status === "fallback" && (
+              <span className="chip warn" title={result.fallback_reason ?? undefined}>
+                确定性回退
+              </span>
+            )}
+            {result.ai_status === "disabled" && (
+              <span className="chip warn" title={result.fallback_reason ?? undefined}>
+                AI 未启用
+              </span>
             )}
             {result.interpreted.party_size !== null && <span className="chip">{result.interpreted.party_size} 人</span>}
             {result.interpreted.session_minutes_max !== null && <span className="chip">最长 {result.interpreted.session_minutes_max} 分钟</span>}
@@ -97,8 +104,14 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
               数据更新于 {formatAgo(result.data_updated_at_ms)}
             </span>
           </div>
-          {result.ai_status === "fallback" && (
-            <p className="cal-note">当前由确定性规则理解输入；无法识别的条件不会被伪造成已理解。</p>
+          {(result.ai_status === "fallback" || result.ai_status === "disabled") && (
+            <p className="cal-note">
+              {result.fallback_reason ??
+                "当前由确定性规则理解输入；无法识别的条件不会被伪造成已理解。"}
+            </p>
+          )}
+          {(result.ai_status === "used" || result.ai_status === "cached") && result.ai_summary && (
+            <p className="cal-note">{result.ai_summary}</p>
           )}
           {result.items.length === 0 ? (
             <div className="state-box"><span className="big">∅</span><span>没有找到满足已识别条件的候选。</span></div>

@@ -16,7 +16,7 @@ pub mod vector;
 
 pub use error::AiError;
 pub use gateway::{AiGateway, AiPolicy};
-pub use openai_compat::OpenAiCompatProvider;
+pub use openai_compat::{OpenAiCompatEmbeddingProvider, OpenAiCompatProvider};
 pub use provider::{
     AiProvider, DisabledProvider, EmbeddingProvider, FakeProvider, HashEmbeddingProvider,
 };
@@ -70,6 +70,58 @@ pub fn gateway_from_env() -> Result<AiGateway, AiError> {
         }
         other => Err(AiError::Config(format!(
             "unknown MPGS_AI_PROVIDER '{other}' (expected disabled|openai_compat)"
+        ))),
+    }
+}
+
+/// Build an embedding provider from environment variables.
+///
+/// - `MPGS_AI_EMBED_PROVIDER=disabled|hash|openai_compat` (default `hash`)
+/// - For `openai_compat`: reuses `MPGS_AI_API_KEY` / `MPGS_AI_BASE_URL`,
+///   model from `MPGS_AI_EMBED_MODEL` (default `text-embedding-3-small`),
+///   dimensions from `MPGS_AI_EMBED_DIMENSIONS` (default `1536`).
+pub fn embedding_provider_from_env() -> Result<Arc<dyn EmbeddingProvider>, AiError> {
+    let kind = env::var("MPGS_AI_EMBED_PROVIDER")
+        .unwrap_or_else(|_| "hash".into())
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "" | "disabled" | "off" | "none" => Ok(Arc::new(DisabledProvider)),
+        "hash" | "hash-embed" | "local" => {
+            let dimensions = env::var("MPGS_AI_EMBED_DIMENSIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64)
+                .clamp(8, 1024);
+            Ok(Arc::new(HashEmbeddingProvider { dimensions }))
+        }
+        "openai_compat" | "openai" => {
+            let api_key = env::var("MPGS_AI_API_KEY").map_err(|_| {
+                AiError::Config("MPGS_AI_API_KEY is required for openai_compat embeddings".into())
+            })?;
+            let base_url = env::var("MPGS_AI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+            let model = env::var("MPGS_AI_EMBED_MODEL")
+                .unwrap_or_else(|_| "text-embedding-3-small".into());
+            let dimensions = env::var("MPGS_AI_EMBED_DIMENSIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1536)
+                .clamp(8, 4096);
+            let timeout_secs: u64 = env::var("MPGS_AI_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30)
+                .clamp(1, 120);
+            Ok(Arc::new(OpenAiCompatEmbeddingProvider::new(
+                base_url,
+                api_key,
+                model,
+                dimensions,
+                Duration::from_secs(timeout_secs),
+            )?))
+        }
+        other => Err(AiError::Config(format!(
+            "unknown MPGS_AI_EMBED_PROVIDER '{other}' (expected disabled|hash|openai_compat)"
         ))),
     }
 }
