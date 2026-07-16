@@ -2,18 +2,18 @@
 
 ## 1. 当前基线
 
-仓库当前已完成 M3 验收（确定性推荐与公开 API 完成），可以开始 M4：
+仓库当前 **M3 + M4 已验收关闭**（确定性推荐/公开 API + Tauri 桌面客户端）。下一工程主线可进入 [M5 AI 增强](MVP_PLAN.md#m5ai-与语义检索)；发布前数据富化仍须并行推进。
 
 - `mpgs-domain`：分区、偏好、反馈类型与推荐信号。
 - `mpgs-recommender`：评分、个性化、硬过滤、MMR、解释与 `rank_feed`。
 - `mpgs-steam-source`：Steam 源规范化适配器、多人搜索页 HTML 解析器与黄金集。
 - `mpgs-storage`：SQLite 迁移（含用户/偏好/反馈/可用性/游玩意愿票）、单写与并发只读连接、Repository、种子目录、查询与备份。
-- `mpgs-server`：公开 API（会话/偏好/四分区/日历/搜索/详情/证据/反馈/游玩意愿投票）、生成式 OpenAPI、限流、`x-request-id`、ETag、CORS 白名单；管理/内部 jobs。
+- `mpgs-server`：公开 API（会话/偏好/四分区/日历/搜索/详情/证据/反馈/游玩意愿投票/自然语言确定性 fallback）、生成式 OpenAPI、限流、`x-request-id`、ETag、CORS 白名单；管理/内部 jobs。
 - `mpgs-dbtool`：migrate / Steam 候选采集 / integrity / m3-audit / backup / restore。
-- 尚未接入 AI Provider。M4 桌面客户端已建立首个垂直切片：`web/` 前端（五主题 + 动态特效 + 四分区/详情/反馈）与 `apps/desktop/src-tauri/` Tauri 壳，详见 [web/README.md](../web/README.md)。
+- 桌面：`web/`（Vite + React + TS，多主题/离线缓存/自然语言 UI）+ `apps/desktop/src-tauri/`（Tauri 2）+ `e2e-tests/`（Windows/Linux `tauri-driver`）。
+- 尚未接入外部 AI Provider（M5）。
 
-2026-07-14 已用 2,071 条真实 Steam 多人分类候选通过 `m3-audit`；同日 [GitHub Actions 构建](https://github.com/Lotulune/mpgs/actions/workflows/ci.yml) 的 Windows/Linux x64/ARM64 四个目标与质量门禁全部通过，并生成四套制品。M4 可以进入 [Tauri 桌面客户端](MVP_PLAN.md#m4tauri-桌面客户端) 开发；真实候选的数据富化仍是发布门禁，应与客户端开发并行推进。
-
+M4 关闭证据：本机验收与 E2E 见 [`M4_ACCEPTANCE.md`](M4_ACCEPTANCE.md)；跨平台 CI 全绿见 [`M4_CI_RUN.md`](M4_CI_RUN.md)（[run 29497583493](https://github.com/Lotulune/mpgs/actions/runs/29497583493)，commit `5e0274b`）。
 ### Git
 
 本机已使用 Git for Windows。新终端若找不到 `git`，将 `C:\Program Files\Git\cmd` 加入 PATH，或在当前会话执行：

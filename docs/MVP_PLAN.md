@@ -144,9 +144,9 @@ flowchart LR
 - 服务端：新增 CORS 白名单层（零新依赖手写中间件，默认覆盖 Tauri webview 源，预检短路），含 preflight/echo/拒绝三项测试。
 - 前端测试（vitest）：粒子池边界、五主题特效完整性、API 会话刷新/ETag/离线回退/清缓存、反馈队列离线重放与撤销、格式化未知值、日历分组、偏好变更检测、防抖。
 - 验收门禁（2026-07-16 加固）：[`scripts/m4_acceptance.ps1`](../scripts/m4_acceptance.ps1) + [`docs/M4_ACCEPTANCE.md`](M4_ACCEPTANCE.md) 严格检查每条推荐理由、反馈与撤销、非空搜索、日历早期数据字段、ETag `304`、指定离线契约测试和构建；失败也生成带 Git/版本/SHA-256 的最新报告。旧版 `21/21` 结果作废。
-- 跨平台门禁：CI 新增 Web test/build 以及 Linux DEB、Windows NSIS、macOS APP 的 Tauri 原生构建矩阵。只有对应 CI 实际成功后才能记录平台通过。
-- 原生 E2E：Windows/Linux `tauri-driver` 套件已覆盖 SQLite 跨进程重启、PRD 7.1/7.2/7.3、反馈刷新、真实断服务离线快照和 1024×640 / 1280×800 截图。2026-07-16 Windows 本机在匹配的 WebView2/EdgeDriver `150.0.4078.65` 上实际运行 `7/7` 通过，证据见 [`M4_DESKTOP_E2E_RUN.md`](M4_DESKTOP_E2E_RUN.md)；Linux 仍须 CI 实际验证。macOS 仅能做原生 APP/启动冒烟。
-- 待办（M4 正式关闭前）：Linux 原生 E2E 成功记录、安装器安装后启动证据、Linux/Windows/macOS 原生 bundle 结果和 macOS 启动记录。目标尺寸 Windows 截图、最小权限和无服务端 Key 复核已通过。退出条件不延期、不缩减。
+- 跨平台门禁：CI Web test/build + Linux DEB / Windows NSIS / macOS APP 的 Tauri 原生构建矩阵。**2026-07-16 commit `5e0274b` 全绿**，证据 [`M4_CI_RUN.md`](M4_CI_RUN.md)（run [29497583493](https://github.com/Lotulune/mpgs/actions/runs/29497583493)）。
+- 原生 E2E：Windows/Linux `tauri-driver` 覆盖 SQLite 跨进程重启、PRD 7.1/7.2/7.3、反馈刷新、真实断服务离线快照和 1024×640 / 1280×800 截图。Windows 本机 `7/7` 见 [`M4_DESKTOP_E2E_RUN.md`](M4_DESKTOP_E2E_RUN.md)；CI 上 Linux/Windows E2E 均 success。macOS 以 APP bundle 构建冒烟为证据（无桌面 WebDriver）。
+- **M4 正式关闭（2026-07-16）**：四层证据齐备——API 严格验收、客户端测试/构建、三平台 bundle smoke、Win/Linux 原生 E2E；另含 Windows 安装器安装后启动 [`M4_INSTALLER_LAUNCH_RUN.md`](M4_INSTALLER_LAUNCH_RUN.md)。目标尺寸截图、最小权限和无服务端 Key 复核已通过。发布前数据富化与签名等仍属后续门禁，不回退 M4 退出条件。
 - 真实候选自动富化（2026-07-16 本地审计）：`m3-real.db` 候选 2091、平台/评价/CCU 2091、语言 2090、有效价格 2081；ready 画像 50、trusted 画像 14（黄金集）。历史 `US/USD` 快照需继续刷新为默认 `CN/schinese` 区域数据；深度联机画像扩量与典型局时长仍为发布门禁。
 
 后续阶段功能——游玩意愿投票（2026-07-15 已实现）：

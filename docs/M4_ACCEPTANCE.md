@@ -64,13 +64,28 @@ macOS WKWebView 没有 Tauri 桌面 WebDriver 客户端，因此 macOS 只做原
 
 ## 当前状态
 
-2026-07-16 本机证据：严格验收 `30/30` 通过；根工作区测试、根/桌面 Clippy、Web 测试/构建、桌面 SQLite 重开测试通过；调试版桌面进程启动后保持存活，并在显式 `MPGS_CLIENT_DATA_DIR` 中创建私有 SQLite。当前代码已重新生成 unsigned Windows NSIS（SHA-256 `912ff3ee4d31632b90944b999b4895125e97225bc9c949089e1effb9e9569662`）和 MSI（SHA-256 `c4cf9db8253026f0446c4ba2c7986a9752c10dd9090f36891711037fd2050d85`）。capability 仅含 core 默认权限和限定 Steam URL 的 opener，构建产物未发现服务端管理令牌或常见 Provider Key 标识。
+**M4 四层证据已齐（commit `5e0274b`，2026-07-16）。** 正式关闭条件按本节与下表，不再以“待 CI”占位。
 
-Windows 原生桌面 E2E 已在 WebView2/EdgeDriver `150.0.4078.65` 上实际执行并以 `7/7` 通过；目标尺寸截图已按原始分辨率复核，成功退出后隔离数据库和 WebView2 运行目录均被清理。版本、覆盖项和 SHA-256 见 [`M4_DESKTOP_E2E_RUN.md`](M4_DESKTOP_E2E_RUN.md)。Linux E2E、Linux/macOS 原生 bundle 和 macOS 启动仍需对应系统或 CI 的实际结果，当前仓库不预先宣称这些平台通过。最新 API 结果只认 `M4_ACCEPTANCE_RUN.md`，历史 `21/21` 结果因旧脚本允许 ETag `200`、反馈撤销跳过和搜索零结果而作废。
+| 层次 | 证据 | 状态 |
+| --- | --- | --- |
+| API 契约 | [`M4_ACCEPTANCE_RUN.md`](M4_ACCEPTANCE_RUN.md) 本机 `30/30` | 通过 |
+| 客户端逻辑 | 同脚本内 Vitest + production build；CI `Web test and build` | 通过 |
+| 原生打包 | CI `desktop-smoke` Linux DEB / Windows NSIS / macOS APP | 通过，见 [`M4_CI_RUN.md`](M4_CI_RUN.md) |
+| 桌面 E2E | 本机 Windows `7/7` + CI Linux/Windows E2E | 通过，见 [`M4_DESKTOP_E2E_RUN.md`](M4_DESKTOP_E2E_RUN.md)、[`M4_CI_RUN.md`](M4_CI_RUN.md) |
 
-仍需单独留存的最终证据：
+附加本机证据：
 
-- Linux 原生 E2E 的实际成功记录（PRD 7.1、7.2、7.3、断网和目标尺寸截图）；
-- 安装器安装后启动证据；
-- Linux/Windows/macOS 原生 bundle CI 成功链接或运行记录；
-- macOS APP 的原生启动冒烟或人工 GUI 记录。
+- 严格验收 `30/30`；根工作区测试、根/桌面 Clippy、Web 测试/构建、桌面 SQLite 重开测试通过。
+- unsigned Windows NSIS（SHA-256 `912ff3ee4d31632b90944b999b4895125e97225bc9c949089e1effb9e9569662`）和 MSI（SHA-256 `c4cf9db8253026f0446c4ba2c7986a9752c10dd9090f36891711037fd2050d85`）。
+- 安装器静默安装 → 进程启动并创建 `client-state.sqlite3` → 静默卸载：[`M4_INSTALLER_LAUNCH_RUN.md`](M4_INSTALLER_LAUNCH_RUN.md)。
+- capability 仅含 core 默认权限和限定 Steam URL 的 opener；构建产物未发现服务端管理令牌或常见 Provider Key 标识。
+
+跨平台 CI（全绿）：https://github.com/Lotulune/mpgs/actions/runs/29497583493 — 11/11 jobs success，含 Linux/Windows 原生 E2E 与三平台 bundle smoke。macOS 无桌面 WebDriver，以 APP bundle 构建冒烟为该平台证据，不声称 GUI 自动点选。
+
+最新 API 结果只认 `M4_ACCEPTANCE_RUN.md`，历史 `21/21` 结果因旧脚本允许 ETag `200`、反馈撤销跳过和搜索零结果而作废。
+
+### 明确不在 M4 关闭范围内的项
+
+- 真实候选深度富化与 `recommendation_ready` 扩量（发布门禁，可与 M5 并行）。
+- 代码签名、自动更新、安装器公证（属 M6）。
+- macOS 人工 GUI 全流程点选（无官方桌面 WebDriver 时不强制虚构）。
