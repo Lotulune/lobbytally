@@ -74,6 +74,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0014_device_local_ai_mode",
         include_str!("../../../migrations/0014_device_local_ai_mode.sql"),
     ),
+    (
+        15,
+        "0015_m8_ai_routing",
+        include_str!("../../../migrations/0015_m8_ai_routing.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {

@@ -125,6 +125,8 @@ docker login ghcr.io
 
 `deploy/update.sh` 在源码目录是 Git checkout 时只允许 fast-forward 拉取；压缩包部署则跳过源码更新、直接拉镜像。它使用 `docker compose pull` 与 `up --no-build`，随后运行数据库完整性和 HTTP 健康检查。运行时密钥只保存在 `deploy/mpgs.env`，不得放入 `deploy/.env`、GitHub workflow 或镜像标签。
 
+内置 AI 使用 OpenAI-compatible Provider 时配置 `MPGS_AI_PROVIDER=openai_compat`、`MPGS_AI_BASE_URL`、`MPGS_AI_API_KEY`、`MPGS_AI_MODEL` 和 `MPGS_AI_TIMEOUT_SECS`。Embedding 默认使用本地 `hash`，只有确认上游提供兼容 Embedding 接口时才切换为 `openai_compat`。AI 失败会回退到确定性推荐；更换模型后需重启 `mpgs-server`，并应先用 `/v1/meta` 和一条自然语言推荐请求验证 `ai_available`、`ai_status` 与延迟。
+
 VPS 使用仓库提供的 systemd 单元主动检查更新，无需向 GitHub 上传 VPS SSH 私钥。当前部署目录为 `/home/ubuntu/mpgs/src`；如果目录或运行用户不同，先修改 `deploy/mpgs-update.service`。安装后会立即执行一次，并在每次任务结束 5 分钟后再次检查：
 
 ```bash

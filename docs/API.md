@@ -292,6 +292,7 @@ Embedding 或 AI 意图解析不可用时回退到 FTS 和当前偏好。
 
 | 值 | 含义 |
 | --- | --- |
+| `pending` | 基础结果已返回，AI 增强仍在进行（渐进式搜索） |
 | `used` | 本次调用了 Provider 且校验通过 |
 | `cached` | 命中服务端 AI 分析缓存 |
 | `fallback` | Provider 失败/未配置等，确定性结果仍返回 |
@@ -300,6 +301,38 @@ Embedding 或 AI 意图解析不可用时回退到 FTS 和当前偏好。
 响应还可包含 `ai_provider` 与 `ai_latency_ms`，用于显示本次 AI 阶段实际选择的 Provider 和耗时。`cached` 可能近乎即时返回；`fallback` 表示模型请求或输出校验失败，页面仍保留确定性推荐。
 
 默认无外部 AI 时返回 `fallback` 与非空 `fallback_reason`（HTTP 200，兼容既有验收）。配置 `MPGS_AI_PROVIDER=openai_compat` 后，校验通过则 `used`/`cached`，并可能附加 `ai_summary`、`ai_summary_evidence_ids` / `ai_reasons`；用户可见 AI 文本缺少合法 evidence 时整次增强回退。
+
+内置 Provider 走 M8 多模型任务路由（`intent_parse` / `rank_explain` 等）：主模型与回退链由配置与 `/v1/models` 发现决定，支持 Chat Completions 与 Responses 双协议；用户自定义 Key 仍为单模型，不写入服务端路由表。
+
+### `POST /v1/ai/search`
+
+渐进式自然语言搜索。请求体：
+
+```json
+{
+  "query": "三个人私密合作、Windows、预算 100 元",
+  "limit": 6,
+  "async": true
+}
+```
+
+响应在自然语言推荐基础上增加 `analysis_id`。`async=true` 时客户端可轮询增强状态；基础候选始终可用。
+
+### `GET /v1/ai/analyses/{analysis_id}`
+
+读取渐进式分析状态与缓存结果。过期或不存在返回 `404`。
+
+### `POST /v1/ai/compare`
+
+输入 2–4 个候选 `app_ids`，服务端生成事实矩阵；模型解释为可选增强，失败时只返回事实矩阵。
+
+```json
+{ "app_ids": [548430, 632360] }
+```
+
+### `GET /v1/games/{app_id}/ai-summary`
+
+读取离线六段式游戏总结。批任务未生成时返回 `ai_status=disabled` 与空段落，不编造内容。
 
 ## 12. 游戏详情与证据
 

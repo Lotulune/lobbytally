@@ -209,13 +209,15 @@ mod tests {
 
     fn request() -> StructuredRequest {
         StructuredRequest {
-            task: AiTaskType::RankAnalysis,
+            task: AiTaskType::RankExplain,
             system_prompt: "sys".into(),
             data_prompt: "data".into(),
             json_schema_name: "rank".into(),
             json_schema: json!({"type":"object"}),
             max_output_tokens: 100,
             temperature: 0.0,
+            model: None,
+            protocol: None,
         }
     }
 

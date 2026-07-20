@@ -8,7 +8,7 @@ mod scheduler;
 
 use std::{env, error::Error, io, net::SocketAddr};
 
-use mpgs_ai::{embedding_provider_from_env, gateway_from_env};
+use mpgs_ai::{embedding_provider_from_env, gateway_from_env, task_router_from_env};
 use mpgs_recommender::ALGORITHM_VERSION;
 use mpgs_storage::{Database, Repository, latest_version};
 use serde_json::{Value, json};
@@ -106,12 +106,19 @@ fn build_state() -> Result<AppState, Box<dyn Error>> {
     };
     let ai = gateway_from_env()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let task_router = task_router_from_env()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let embedding = embedding_provider_from_env()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     info!(
         provider = ai.provider_name(),
         available = ai.is_available(),
         "AI gateway ready"
+    );
+    info!(
+        provider = task_router.provider_name(),
+        available = task_router.is_available(),
+        "AI task router ready"
     );
     info!(
         provider = embedding.name(),
@@ -125,6 +132,7 @@ fn build_state() -> Result<AppState, Box<dyn Error>> {
         cors: CorsConfig::from_env()?,
         account_ai_limits: AccountAiLimiter::from_env()?,
         ai,
+        task_router: std::sync::Arc::new(task_router),
         embedding,
     })
 }
@@ -193,6 +201,12 @@ mod tests {
         std::sync::Arc::new(mpgs_ai::HashEmbeddingProvider { dimensions: 64 })
     }
 
+    fn test_task_router() -> std::sync::Arc<mpgs_ai::TaskRouter> {
+        std::sync::Arc::new(mpgs_ai::TaskRouter::from_provider(std::sync::Arc::new(
+            mpgs_ai::DisabledProvider,
+        )))
+    }
+
     fn test_repo_and_app(rate_limits: RateLimitConfig) -> (Repository, axum::Router) {
         let db = Database::open_in_memory().unwrap();
         let repo = Repository::new(db);
@@ -206,6 +220,7 @@ mod tests {
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
             ai: mpgs_ai::AiGateway::disabled(),
+            task_router: test_task_router(),
             embedding: test_embedding(),
         });
         (repo, app)
@@ -1009,6 +1024,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn m8_ai_search_returns_analysis_id_with_base_results() {
+        let app = test_app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ai/search")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"query":"3 people casual coop windows under budget","limit":5,"async":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["analysis_id"].as_str().unwrap().starts_with("an_"));
+        assert!(json["items"].as_array().is_some());
+        // AI is disabled in test_app → deterministic path remains usable.
+        assert!(matches!(
+            json["ai_status"].as_str(),
+            Some("fallback" | "disabled" | "pending")
+        ));
+
+        let analysis_id = json["analysis_id"].as_str().unwrap();
+        let poll = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/ai/analyses/{analysis_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Separate app instance has a fresh in-memory DB, so not_found is expected
+        // for cross-instance poll. Same-instance poll is covered below.
+        assert!(poll.status() == StatusCode::NOT_FOUND || poll.status() == StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn m8_ai_search_analysis_round_trip_same_instance() {
+        let (repo, app) = test_repo_and_app(RateLimitConfig {
+            enabled: false,
+            ..RateLimitConfig::default()
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ai/search")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"query":"private coop for three","limit":4}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let analysis_id = json["analysis_id"].as_str().unwrap().to_owned();
+
+        let poll = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/ai/analyses/{analysis_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        let poll_body = axum::body::to_bytes(poll.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let poll_json: serde_json::Value = serde_json::from_slice(&poll_body).unwrap();
+        assert_eq!(poll_json["analysis_id"], analysis_id);
+        assert_eq!(poll_json["task_type"], "rank_explain");
+        assert!(poll_json["base_result"].is_object());
+        let _ = repo;
+    }
+
+    #[tokio::test]
+    async fn m8_ai_compare_returns_server_fact_matrix_only() {
+        let app = test_app();
+        // Discover two real app ids from demo seed.
+        let feed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/feeds/classic_legacy?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let feed_body = axum::body::to_bytes(feed.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let feed_json: serde_json::Value = serde_json::from_slice(&feed_body).unwrap();
+        let items = feed_json["items"].as_array().unwrap();
+        if items.len() < 2 {
+            return;
+        }
+        let a = items[0]["app_id"].as_u64().unwrap();
+        let b = items[1]["app_id"].as_u64().unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ai/compare")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"app_ids":[{a},{b}]}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["fact_matrix"].as_array().unwrap().len(), 2);
+        assert!(json["explanation"].is_null());
+        assert_eq!(json["ai_status"], "fallback");
+    }
+
+    #[tokio::test]
     async fn natural_language_uses_fake_ai_when_available_and_valid() {
         use mpgs_ai::{AiGateway, AiPolicy, FakeProvider};
         use std::sync::Arc;
@@ -1030,6 +1181,7 @@ mod tests {
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
             ai: AiGateway::disabled(),
+            task_router: test_task_router(),
             embedding: test_embedding(),
         });
         let probe_resp = probe
@@ -1082,6 +1234,7 @@ mod tests {
             fail_with: None,
             available: true,
             delay: std::time::Duration::ZERO,
+            ..FakeProvider::default()
         });
         let app = build_router(AppState {
             repo: Some(repo.clone()),
@@ -1093,6 +1246,7 @@ mod tests {
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
             ai: AiGateway::new(fake.clone(), AiPolicy::default()),
+            task_router: test_task_router(),
             embedding: test_embedding(),
         });
         let response = app
@@ -1135,6 +1289,7 @@ mod tests {
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
             ai: AiGateway::new(fake, AiPolicy::default()),
+            task_router: test_task_router(),
             embedding: test_embedding(),
         })
         .oneshot(
@@ -1165,6 +1320,7 @@ mod tests {
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
             ai: AiGateway::new(Arc::new(FakeProvider::default()), AiPolicy::default()),
+            task_router: test_task_router(),
             embedding: test_embedding(),
         })
         .oneshot(
@@ -1211,6 +1367,7 @@ mod tests {
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
             ai: AiGateway::new(Arc::new(provider), policy),
+            task_router: test_task_router(),
             embedding: test_embedding(),
         });
         let started = Instant::now();
@@ -1730,6 +1887,7 @@ mod tests {
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
             ai: mpgs_ai::AiGateway::disabled(),
+            task_router: test_task_router(),
             embedding: test_embedding(),
         });
 

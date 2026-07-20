@@ -1324,4 +1324,67 @@ impl Repository {
         self.db
             .with_conn_mut(|conn| crate::community::previews_for_game(conn, app_id, user_id))
     }
+
+    // --- M8 progressive AI + dual-channel storage ---
+
+    pub fn insert_progressive_analysis(
+        &self,
+        row: &crate::ai_m8::InsertProgressiveAnalysis,
+    ) -> StorageResult<()> {
+        self.db
+            .with_conn_mut(|conn| crate::ai_m8::insert_progressive_analysis(conn, row))
+    }
+
+    pub fn get_progressive_analysis(
+        &self,
+        analysis_id: &str,
+        now_ms: i64,
+    ) -> StorageResult<Option<crate::ai_m8::ProgressiveAnalysis>> {
+        self.db
+            .with_conn(|conn| crate::ai_m8::get_progressive_analysis(conn, analysis_id, now_ms))
+    }
+
+    pub fn complete_progressive_analysis(
+        &self,
+        update: &crate::ai_m8::CompleteProgressiveAnalysis,
+    ) -> StorageResult<()> {
+        self.db
+            .with_conn_mut(|conn| crate::ai_m8::complete_progressive_analysis(conn, update))
+    }
+
+    pub fn insert_web_discovery_evidence(
+        &self,
+        row: &crate::ai_m8::InsertWebDiscoveryEvidence,
+    ) -> StorageResult<bool> {
+        self.db
+            .with_conn_mut(|conn| crate::ai_m8::insert_web_discovery_evidence(conn, row))
+    }
+
+    pub fn list_web_discovery_for_app(
+        &self,
+        app_id: u32,
+        limit: i64,
+    ) -> StorageResult<Vec<crate::ai_m8::WebDiscoveryEvidence>> {
+        self.db
+            .with_conn(|conn| crate::ai_m8::list_web_discovery_for_app(conn, app_id, limit))
+    }
+
+    pub fn insert_field_proposal(
+        &self,
+        row: &crate::ai_m8::InsertFieldProposal,
+    ) -> StorageResult<()> {
+        self.db
+            .with_conn_mut(|conn| crate::ai_m8::insert_field_proposal(conn, row))
+    }
+
+    pub fn put_bootstrap_state(&self, key: &str, value_json: &str) -> StorageResult<()> {
+        let now = self.db.now_ms();
+        self.db
+            .with_conn_mut(|conn| crate::ai_m8::put_bootstrap_state(conn, key, value_json, now))
+    }
+
+    pub fn get_bootstrap_state(&self, key: &str) -> StorageResult<Option<String>> {
+        self.db
+            .with_conn(|conn| crate::ai_m8::get_bootstrap_state(conn, key))
+    }
 }

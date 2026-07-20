@@ -1,9 +1,12 @@
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::error::AiError;
 use crate::types::{
-    Embedding, EmbeddingInput, ProviderCapabilities, StructuredRequest, StructuredResponse,
+    ApiProtocol, Embedding, EmbeddingInput, ProviderCapabilities, StructuredRequest,
+    StructuredResponse,
 };
 
 #[async_trait]
@@ -80,12 +83,20 @@ impl EmbeddingProvider for DisabledProvider {
 }
 
 /// Deterministic fake provider for unit/integration tests.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FakeProvider {
     pub response: serde_json::Value,
     pub fail_with: Option<AiError>,
     pub available: bool,
     pub delay: Duration,
+    /// Default model name reported on success when request.model is unset.
+    pub default_model: String,
+    /// Fail specific models before the global `fail_with`.
+    pub fail_models: Mutex<HashMap<String, AiError>>,
+    /// Fail specific (model, protocol) pairs — used to test protocol fallback.
+    pub protocol_failures: Mutex<HashMap<(String, ApiProtocol), AiError>>,
+    /// Record of models that were attempted (for assertions).
+    pub attempted_models: Mutex<Vec<String>>,
 }
 
 impl Default for FakeProvider {
@@ -99,6 +110,25 @@ impl Default for FakeProvider {
             fail_with: None,
             available: true,
             delay: Duration::ZERO,
+            default_model: "fake-model".into(),
+            fail_models: Mutex::new(HashMap::new()),
+            protocol_failures: Mutex::new(HashMap::new()),
+            attempted_models: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Clone for FakeProvider {
+    fn clone(&self) -> Self {
+        Self {
+            response: self.response.clone(),
+            fail_with: self.fail_with.clone(),
+            available: self.available,
+            delay: self.delay,
+            default_model: self.default_model.clone(),
+            fail_models: Mutex::new(self.fail_models.lock().expect("lock").clone()),
+            protocol_failures: Mutex::new(self.protocol_failures.lock().expect("lock").clone()),
+            attempted_models: Mutex::new(self.attempted_models.lock().expect("lock").clone()),
         }
     }
 }
@@ -120,7 +150,7 @@ impl AiProvider for FakeProvider {
     }
 
     fn cache_identity(&self) -> String {
-        "fake:fake-model".into()
+        format!("fake:{}", self.default_model)
     }
 
     fn is_available(&self) -> bool {
@@ -134,21 +164,46 @@ impl AiProvider for FakeProvider {
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }
-        if let Some(error) = &self.fail_with {
-            return Err(error.clone());
-        }
         if !self.available {
             return Err(AiError::Disabled);
         }
+
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.default_model.clone());
+        let protocol = request.protocol.unwrap_or(ApiProtocol::ChatCompletions);
+
+        self.attempted_models
+            .lock()
+            .expect("lock")
+            .push(model.clone());
+
+        if let Some(error) = self
+            .protocol_failures
+            .lock()
+            .expect("lock")
+            .get(&(model.clone(), protocol))
+        {
+            return Err(error.clone());
+        }
+        if let Some(error) = self.fail_models.lock().expect("lock").get(&model) {
+            return Err(error.clone());
+        }
+        if let Some(error) = &self.fail_with {
+            return Err(error.clone());
+        }
+
         Ok(StructuredResponse {
             provider: "fake".into(),
-            model: "fake-model".into(),
+            model,
             content: self.response.clone(),
             usage_input: request.system_prompt.len() as u32,
             usage_output: 32,
             prompt_cache_hit_tokens: None,
             prompt_cache_miss_tokens: None,
             latency_ms: 1,
+            protocol: Some(protocol),
         })
     }
 }
@@ -203,6 +258,8 @@ impl EmbeddingProvider for HashEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AiTaskType;
+    use serde_json::json;
 
     #[tokio::test]
     async fn hash_embedding_uses_the_shared_v2_mapping() {
@@ -223,5 +280,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn fake_provider_honors_model_and_protocol_override() {
+        let provider = FakeProvider::default();
+        let response = provider
+            .structured_completion(StructuredRequest {
+                task: AiTaskType::RankExplain,
+                system_prompt: "s".into(),
+                data_prompt: "d".into(),
+                json_schema_name: "t".into(),
+                json_schema: json!({}),
+                max_output_tokens: 10,
+                temperature: 0.0,
+                model: Some("grok-4.5".into()),
+                protocol: Some(ApiProtocol::Responses),
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.model, "grok-4.5");
+        assert_eq!(response.protocol, Some(ApiProtocol::Responses));
     }
 }

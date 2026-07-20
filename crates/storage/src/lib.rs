@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod accounts;
+pub mod ai_m8;
 pub mod backup;
 pub mod catalog;
 pub mod clock;
@@ -29,6 +30,11 @@ pub mod source_state;
 pub mod users;
 pub mod util;
 
+pub use ai_m8::{
+    AUTHORITY_FIELDS, CompleteProgressiveAnalysis, FieldProposal, InsertFieldProposal,
+    InsertProgressiveAnalysis, InsertWebDiscoveryEvidence, ProgressiveAnalysis,
+    WebDiscoveryEvidence,
+};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use db::Database;
 pub use error::{StorageError, StorageResult};

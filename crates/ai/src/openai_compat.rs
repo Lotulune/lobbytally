@@ -8,9 +8,11 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::error::AiError;
+use crate::model_registry::{capabilities_from_model_ids, parse_models_list};
 use crate::provider::{AiProvider, EmbeddingProvider};
 use crate::types::{
-    Embedding, EmbeddingInput, ProviderCapabilities, StructuredRequest, StructuredResponse,
+    ApiProtocol, Embedding, EmbeddingInput, ModelCapabilities, ProviderCapabilities,
+    StructuredRequest, StructuredResponse,
 };
 use crate::vector::l2_normalize;
 
@@ -317,26 +319,23 @@ impl AiProvider for OpenAiCompatProvider {
         request: StructuredRequest,
     ) -> Result<StructuredResponse, AiError> {
         let started = Instant::now();
-        let url = format!("{}/chat/completions", self.base_url);
-        let schema_text = serde_json::to_string(&request.json_schema)
-            .map_err(|error| AiError::Config(error.to_string()))?;
-        let system_prompt = format!(
-            "{} Required JSON schema named {}: {}",
-            request.system_prompt, request.json_schema_name, schema_text
-        );
-        let body = json!({
-            "model": self.model,
-            "temperature": request.temperature,
-            "max_tokens": request.max_output_tokens,
-            // `json_object` is the interoperable OpenAI-compatible contract.
-            // The gateway validates the returned object against the task schema
-            // before it can influence ranking.
-            "response_format": { "type": "json_object" },
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": request.data_prompt }
-            ]
-        });
+        let model = request
+            .model
+            .as_deref()
+            .unwrap_or(self.model.as_str())
+            .to_owned();
+        let protocol = request.protocol.unwrap_or(ApiProtocol::ChatCompletions);
+
+        let (url, body) = match protocol {
+            ApiProtocol::ChatCompletions => (
+                format!("{}/chat/completions", self.base_url),
+                build_chat_completions_body(&model, &request)?,
+            ),
+            ApiProtocol::Responses => (
+                format!("{}/responses", self.base_url),
+                build_responses_body(&model, &request)?,
+            ),
+        };
 
         let response = self
             .client
@@ -358,50 +357,205 @@ impl AiProvider for OpenAiCompatProvider {
             return Err(AiError::RateLimited);
         }
         if !status.is_success() {
-            return Err(AiError::ProviderRejected(format!(
-                "HTTP {}",
-                status.as_u16()
-            )));
+            // Surface protocol vs generic HTTP failures so the router can try the
+            // alternate protocol instead of treating the model as dead (AI-004A).
+            let code = status.as_u16();
+            let hint = if protocol == ApiProtocol::Responses && matches!(code, 404 | 405 | 501) {
+                format!("HTTP {code} responses protocol not supported")
+            } else if protocol == ApiProtocol::ChatCompletions && matches!(code, 404 | 405 | 501) {
+                format!("HTTP {code} chat/completions protocol not supported")
+            } else {
+                format!("HTTP {code}")
+            };
+            return Err(AiError::ProviderRejected(hint));
         }
 
         let payload: Value = serde_json::from_slice(&bytes)
             .map_err(|error| AiError::InvalidOutput(error.to_string()))?;
-        let content_text = payload
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AiError::InvalidOutput("missing choices[0].message.content".into()))?;
-        let content: Value = serde_json::from_str(content_text)
-            .map_err(|error| AiError::InvalidOutput(format!("content is not JSON: {error}")))?;
-        let usage_input = payload
-            .pointer("/usage/prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
-        let usage_output = payload
-            .pointer("/usage/completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
-        let prompt_cache_hit_tokens = payload
-            .pointer("/usage/prompt_cache_hit_tokens")
-            .or_else(|| payload.pointer("/usage/prompt_tokens_details/cached_tokens"))
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok());
-        let prompt_cache_miss_tokens = payload
-            .pointer("/usage/prompt_cache_miss_tokens")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .or_else(|| prompt_cache_hit_tokens.map(|hit| usage_input.saturating_sub(hit)));
+        let content = match protocol {
+            ApiProtocol::ChatCompletions => parse_chat_completions_content(&payload)?,
+            ApiProtocol::Responses => parse_responses_content(&payload)?,
+        };
+        let (usage_input, usage_output, prompt_cache_hit_tokens, prompt_cache_miss_tokens) =
+            parse_usage(&payload);
 
         Ok(StructuredResponse {
             provider: self.name.clone(),
-            model: self.model.clone(),
+            model,
             content,
             usage_input,
             usage_output,
             prompt_cache_hit_tokens,
             prompt_cache_miss_tokens,
             latency_ms: started.elapsed().as_millis() as u64,
+            protocol: Some(protocol),
         })
     }
+}
+
+impl OpenAiCompatProvider {
+    /// Discover models from `GET /v1/models` without logging secrets or bodies.
+    pub async fn list_models(&self) -> Result<Vec<ModelCapabilities>, AiError> {
+        let url = format!("{}/models", self.base_url);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    AiError::Timeout
+                } else {
+                    AiError::Transport(error.to_string())
+                }
+            })?;
+        let (status, bytes) = read_limited_body(response, MAX_PROBE_RESPONSE_BYTES * 4).await?;
+        if !status.is_success() {
+            return Err(AiError::ProviderRejected(format!(
+                "HTTP {}",
+                status.as_u16()
+            )));
+        }
+        let payload: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| AiError::InvalidOutput(error.to_string()))?;
+        let ids = parse_models_list(&payload)?;
+        Ok(capabilities_from_model_ids(ids))
+    }
+}
+
+/// Build Chat Completions request body (OpenAI-compatible).
+pub fn build_chat_completions_body(
+    model: &str,
+    request: &StructuredRequest,
+) -> Result<Value, AiError> {
+    let schema_text = serde_json::to_string(&request.json_schema)
+        .map_err(|error| AiError::Config(error.to_string()))?;
+    let system_prompt = format!(
+        "{} Required JSON schema named {}: {}",
+        request.system_prompt, request.json_schema_name, schema_text
+    );
+    Ok(json!({
+        "model": model,
+        "temperature": request.temperature,
+        "max_tokens": request.max_output_tokens,
+        // `json_object` is the interoperable OpenAI-compatible contract.
+        // The gateway validates the returned object against the task schema
+        // before it can influence ranking.
+        "response_format": { "type": "json_object" },
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": request.data_prompt }
+        ]
+    }))
+}
+
+/// Build Responses API request body (OpenAI-compatible / Grok2API).
+pub fn build_responses_body(model: &str, request: &StructuredRequest) -> Result<Value, AiError> {
+    let schema_text = serde_json::to_string(&request.json_schema)
+        .map_err(|error| AiError::Config(error.to_string()))?;
+    let instructions = format!(
+        "{} Required JSON schema named {}: {}. Output a single JSON object only.",
+        request.system_prompt, request.json_schema_name, schema_text
+    );
+    Ok(json!({
+        "model": model,
+        "temperature": request.temperature,
+        "max_output_tokens": request.max_output_tokens,
+        "instructions": instructions,
+        "input": [
+            { "role": "user", "content": request.data_prompt }
+        ],
+        "text": {
+            "format": { "type": "json_object" }
+        }
+    }))
+}
+
+/// Parse Chat Completions content into a JSON value.
+pub fn parse_chat_completions_content(payload: &Value) -> Result<Value, AiError> {
+    let content_text = payload
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AiError::InvalidOutput("missing choices[0].message.content".into()))?;
+    serde_json::from_str(content_text)
+        .map_err(|error| AiError::InvalidOutput(format!("content is not JSON: {error}")))
+}
+
+/// Parse Responses API content into a JSON value.
+///
+/// Supports common OpenAI / gateway shapes:
+/// - `output_text` top-level string
+/// - `output[].content[].text` / `output_text`
+/// - `output[].content[].type == output_text`
+pub fn parse_responses_content(payload: &Value) -> Result<Value, AiError> {
+    if let Some(text) = payload.get("output_text").and_then(Value::as_str) {
+        return serde_json::from_str(text)
+            .map_err(|error| AiError::InvalidOutput(format!("output_text is not JSON: {error}")));
+    }
+
+    if let Some(output) = payload.get("output").and_then(Value::as_array) {
+        for item in output {
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for part in content {
+                    let text = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| part.get("output_text").and_then(Value::as_str));
+                    if let Some(text) = text
+                        && let Ok(value) = serde_json::from_str::<Value>(text)
+                    {
+                        return Ok(value);
+                    }
+                }
+            }
+            // Some gateways return a single message string on the item.
+            if let Some(text) = item.get("text").and_then(Value::as_str)
+                && let Ok(value) = serde_json::from_str::<Value>(text)
+            {
+                return Ok(value);
+            }
+        }
+    }
+
+    // Fallback: some proxies still wrap Responses like chat completions.
+    if payload.pointer("/choices/0/message/content").is_some() {
+        return parse_chat_completions_content(payload);
+    }
+
+    Err(AiError::InvalidOutput(
+        "responses payload missing structured text output".into(),
+    ))
+}
+
+fn parse_usage(payload: &Value) -> (u32, u32, Option<u32>, Option<u32>) {
+    let usage_input = payload
+        .pointer("/usage/prompt_tokens")
+        .or_else(|| payload.pointer("/usage/input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let usage_output = payload
+        .pointer("/usage/completion_tokens")
+        .or_else(|| payload.pointer("/usage/output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let prompt_cache_hit_tokens = payload
+        .pointer("/usage/prompt_cache_hit_tokens")
+        .or_else(|| payload.pointer("/usage/prompt_tokens_details/cached_tokens"))
+        .or_else(|| payload.pointer("/usage/input_tokens_details/cached_tokens"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let prompt_cache_miss_tokens = payload
+        .pointer("/usage/prompt_cache_miss_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| prompt_cache_hit_tokens.map(|hit| usage_input.saturating_sub(hit)));
+    (
+        usage_input,
+        usage_output,
+        prompt_cache_hit_tokens,
+        prompt_cache_miss_tokens,
+    )
 }
 
 /// OpenAI-compatible `/embeddings` adapter.
@@ -586,6 +740,21 @@ impl EmbeddingProvider for OpenAiCompatEmbeddingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AiTaskType;
+
+    fn sample_request() -> StructuredRequest {
+        StructuredRequest {
+            task: AiTaskType::RankExplain,
+            system_prompt: "sys".into(),
+            data_prompt: "data".into(),
+            json_schema_name: "rank".into(),
+            json_schema: json!({"type": "object"}),
+            max_output_tokens: 100,
+            temperature: 0.0,
+            model: None,
+            protocol: None,
+        }
+    }
 
     #[test]
     fn base_url_requires_exact_local_http_host() {
@@ -642,5 +811,61 @@ mod tests {
                 "endpoint should be rejected: {endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn chat_body_uses_requested_model_override() {
+        let mut request = sample_request();
+        request.model = Some("grok-4.3".into());
+        let body = build_chat_completions_body("default-model", &request).unwrap();
+        // When building for an explicit model argument (router-selected), that wins.
+        assert_eq!(body["model"], "default-model");
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert!(body["messages"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn responses_body_declares_json_object_format() {
+        let body = build_responses_body("grok-4.5", &sample_request()).unwrap();
+        assert_eq!(body["model"], "grok-4.5");
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+        assert!(body.get("instructions").and_then(Value::as_str).is_some());
+        assert!(body.get("input").and_then(Value::as_array).is_some());
+    }
+
+    #[test]
+    fn parse_responses_output_text() {
+        let payload = json!({
+            "output_text": "{\"summary\":\"ok\",\"recommendations\":[]}",
+            "usage": { "input_tokens": 10, "output_tokens": 4 }
+        });
+        let content = parse_responses_content(&payload).unwrap();
+        assert_eq!(content["summary"], "ok");
+    }
+
+    #[test]
+    fn parse_responses_nested_output_content() {
+        let payload = json!({
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"ok\":true}"
+                }]
+            }]
+        });
+        let content = parse_responses_content(&payload).unwrap();
+        assert_eq!(content["ok"], true);
+    }
+
+    #[test]
+    fn parse_chat_completions_content_roundtrip() {
+        let payload = json!({
+            "choices": [{
+                "message": { "content": "{\"a\":1}" }
+            }]
+        });
+        let content = parse_chat_completions_content(&payload).unwrap();
+        assert_eq!(content["a"], 1);
     }
 }

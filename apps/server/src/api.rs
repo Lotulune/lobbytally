@@ -12,9 +12,9 @@ use axum::{
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 use mpgs_ai::{
     AiError, AiGateway, AiPolicy, AiRankResult, AiStatus, AiTaskType, CandidateEvidence,
-    EmbeddingInput, EmbeddingProvider, OpenAiCompatProvider, RANK_PROMPT_VERSION,
-    StructuredRequest, rank_analysis_schema, rank_analysis_system_prompt, validate_rank_result,
-    wrap_untrusted_data_block,
+    DEFAULT_ROUTE_VERSION, EmbeddingInput, EmbeddingProvider, OpenAiCompatProvider,
+    RANK_PROMPT_VERSION, StructuredRequest, TaskRouter, rank_analysis_schema,
+    rank_analysis_system_prompt, validate_rank_result, wrap_untrusted_data_block,
 };
 use mpgs_domain::{FeedSection, FeedbackType, RecommendationConfig, UserPreferences};
 use mpgs_recommender::{
@@ -53,6 +53,9 @@ pub struct AppState {
     pub cors: CorsConfig,
     pub account_ai_limits: AccountAiLimiter,
     pub ai: AiGateway,
+    /// Multi-model task router for the built-in provider (M8). User custom keys
+    /// continue to use a single-model [`AiGateway`] and never share this router.
+    pub task_router: Arc<TaskRouter>,
     pub embedding: Arc<dyn EmbeddingProvider>,
 }
 
@@ -599,6 +602,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/recommendations/natural-language",
             post(natural_language_recommendations),
         )
+        .route("/v1/ai/search", post(ai_search))
+        .route("/v1/ai/analyses/{analysis_id}", get(get_ai_analysis))
+        .route("/v1/ai/compare", post(ai_compare))
+        .route("/v1/games/{app_id}/ai-summary", get(get_game_ai_summary))
         .route("/v1/calendar", get(get_calendar))
         .route("/v1/search", get(search_games))
         .route("/v1/games/{app_id}", get(get_game))
@@ -2999,9 +3006,23 @@ async fn natural_language_recommendations(
         .map(|user_id| format!("account:{user_id}"))
         .unwrap_or_else(|| "anonymous".to_owned());
     let ai_started = std::time::Instant::now();
+    // Multi-model routing only applies to the server-built-in provider.
+    let task_router = resolved_ai
+        .builtin_quota
+        .as_ref()
+        .map(|_| state.task_router.as_ref())
+        .or_else(|| {
+            // Anonymous / builtin gateway without quota still uses the router
+            // when the deployment gateway is the same built-in endpoint.
+            (!resolved_ai.gateway.provider_name().is_empty()
+                && resolved_ai.gateway.provider_name() == state.ai.provider_name()
+                && state.task_router.is_available())
+            .then_some(state.task_router.as_ref())
+        });
     let (ai_status, fallback_reason, ai_summary, ai_summary_evidence_ids) =
         enhance_natural_language_with_ai(
             &resolved_ai.gateway,
+            task_router,
             state.repo.as_ref(),
             &cache_scope,
             &query,
@@ -3164,6 +3185,7 @@ async fn transient_custom_ai_gateway(
 /// Apply optional AI Top-N analysis. Always preserves deterministic items on failure.
 async fn enhance_natural_language_with_ai(
     gateway: &AiGateway,
+    task_router: Option<&TaskRouter>,
     repo: Option<&Repository>,
     cache_scope: &str,
     query: &str,
@@ -3247,7 +3269,16 @@ async fn enhance_natural_language_with_ai(
     }
 
     let provider_identity = gateway.provider_cache_identity();
-    let cache_key = nl_ai_cache_key(query, &compact, &provider_identity, cache_scope);
+    let route_version = task_router
+        .map(|router| router.route_version(AiTaskType::RankExplain).to_owned())
+        .unwrap_or_else(|| DEFAULT_ROUTE_VERSION.to_owned());
+    let cache_key = nl_ai_cache_key(
+        query,
+        &compact,
+        &provider_identity,
+        cache_scope,
+        &route_version,
+    );
     if let Some(repo) = repo {
         let now_ms = chrono_like_now_ms();
         let lookup_key = cache_key.clone();
@@ -3295,13 +3326,15 @@ async fn enhance_natural_language_with_ai(
         wrap_untrusted_data_block("user_query", query, 500),
     );
     let request = StructuredRequest {
-        task: AiTaskType::RankAnalysis,
+        task: AiTaskType::RankExplain,
         system_prompt: rank_analysis_system_prompt().to_owned(),
         data_prompt,
         json_schema_name: "rank_analysis".into(),
         json_schema: rank_analysis_schema(),
         max_output_tokens: 1_800,
         temperature: 0.2,
+        model: None,
+        protocol: None,
     };
 
     // Cache hits above return before this point. Only a real built-in model
@@ -3367,7 +3400,7 @@ async fn enhance_natural_language_with_ai(
         }
     }
 
-    let response = match gateway.structured_completion(request).await {
+    let response = match run_rank_completion(gateway, task_router, request).await {
         Ok(response) => response,
         Err(error) => {
             return (
@@ -3404,12 +3437,24 @@ async fn enhance_natural_language_with_ai(
         let now_ms = chrono_like_now_ms();
         let output_json = serde_json::to_string(&validated).unwrap_or_else(|_| "{}".to_owned());
         let entry = mpgs_storage::AiCacheEntry {
-            cache_key: nl_ai_cache_key(query, &compact, &provider_identity, cache_scope),
-            task_type: "rank_analysis".into(),
+            cache_key: nl_ai_cache_key(
+                query,
+                &compact,
+                &provider_identity,
+                cache_scope,
+                &route_version,
+            ),
+            task_type: "rank_explain".into(),
             provider: response.provider.clone(),
             model: response.model.clone(),
             prompt_version: RANK_PROMPT_VERSION.into(),
-            input_hash: nl_ai_cache_key(query, &compact, &provider_identity, cache_scope),
+            input_hash: nl_ai_cache_key(
+                query,
+                &compact,
+                &provider_identity,
+                cache_scope,
+                &route_version,
+            ),
             output_json,
             // The persisted payload has already been strictly validated. In the
             // degradation path it is the sanitized ranking-only payload, which
@@ -3556,6 +3601,7 @@ fn nl_ai_cache_key(
     compact: &[serde_json::Value],
     provider_identity: &str,
     cache_scope: &str,
+    route_version: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -3564,6 +3610,8 @@ fn nl_ai_cache_key(
     hasher.update(cache_scope.as_bytes());
     hasher.update([0]);
     hasher.update(RANK_PROMPT_VERSION.as_bytes());
+    hasher.update([0]);
+    hasher.update(route_version.as_bytes());
     hasher.update([0]);
     hasher.update(ALGORITHM_VERSION.as_bytes());
     hasher.update([0]);
@@ -3586,6 +3634,390 @@ fn nl_ai_cache_key(
         let _ = write!(hex, "{byte:02x}");
     }
     format!("nl-rank:{hex}")
+}
+
+async fn run_rank_completion(
+    gateway: &AiGateway,
+    task_router: Option<&TaskRouter>,
+    request: StructuredRequest,
+) -> Result<mpgs_ai::StructuredResponse, AiError> {
+    if let Some(router) = task_router
+        && router.is_available()
+    {
+        return router
+            .structured_completion(request)
+            .await
+            .map(|routed| routed.response);
+    }
+    gateway.structured_completion(request).await
+}
+
+fn new_analysis_id() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(chrono_like_now_ms().to_le_bytes());
+    hasher.update(getrandom_u64().to_le_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "an_{}",
+        digest
+            .iter()
+            .take(12)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+
+fn getrandom_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ std::process::id() as u64
+}
+
+#[derive(Debug, Deserialize)]
+struct AiSearchRequest {
+    query: String,
+    #[serde(default)]
+    limit: Option<u8>,
+    /// When true (default), return base candidates immediately with analysis_id.
+    #[serde(default = "default_true")]
+    r#async: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct AiCompareRequest {
+    app_ids: Vec<u32>,
+}
+
+async fn ai_search(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AiSearchRequest>,
+) -> Response {
+    let query = body.query.trim().to_owned();
+    if query.len() < 3 || query.len() > 500 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "query must contain between 3 and 500 characters",
+            None,
+        );
+    }
+    let output_limit = body.limit.unwrap_or(6);
+    if !(3..=10).contains(&output_limit) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "limit must be between 3 and 10",
+            None,
+        );
+    }
+
+    // Reuse the existing natural-language path for deterministic base results.
+    let nl_body = NaturalLanguageRequest {
+        query: query.clone(),
+        limit: Some(i64::from(output_limit)),
+        custom_ai: None,
+    };
+    let nl_response =
+        natural_language_recommendations(State(state.clone()), headers.clone(), Json(nl_body))
+            .await
+            .into_response();
+    if nl_response.status() != StatusCode::OK {
+        return nl_response;
+    }
+    let (_, body_bytes) = nl_response.into_parts();
+    let bytes = match axum::body::to_bytes(body_bytes, 2 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "failed to assemble AI search response",
+                None,
+            );
+        }
+    };
+    let mut payload: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "failed to parse AI search base results",
+                None,
+            );
+        }
+    };
+
+    // Progressive mode records an analysis_id so clients can poll enhancement
+    // without blocking the first paint. When async=false, the NL path already
+    // waited for AI and we still expose a completed analysis id when storage
+    // is available.
+    let analysis_id = new_analysis_id();
+    let ai_status = payload
+        .get("ai_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fallback")
+        .to_owned();
+    if let Some(repo) = state.repo.as_ref() {
+        let now_ms = chrono_like_now_ms();
+        let request_json = json!({ "query": query, "limit": output_limit }).to_string();
+        let base_result_json = payload.to_string();
+        let status_for_row = if body.r#async && ai_status == "used" {
+            // Enhancement already finished synchronously via NL path.
+            "used"
+        } else if body.r#async && matches!(ai_status.as_str(), "fallback" | "disabled") {
+            ai_status.as_str()
+        } else if body.r#async {
+            "pending"
+        } else {
+            ai_status.as_str()
+        };
+        let insert = mpgs_storage::InsertProgressiveAnalysis {
+            analysis_id: analysis_id.clone(),
+            task_type: "rank_explain".into(),
+            status: status_for_row.into(),
+            prompt_version: RANK_PROMPT_VERSION.into(),
+            input_hash: analysis_id.clone(),
+            preference_hash: String::new(),
+            data_snapshot_hash: String::new(),
+            request_json,
+            base_result_json: Some(base_result_json),
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(6 * 60 * 60 * 1000),
+        };
+        let _ = storage_result(repo, move |repo| repo.insert_progressive_analysis(&insert)).await;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("analysis_id".into(), json!(analysis_id));
+            if body.r#async && status_for_row == "pending" {
+                obj.insert("ai_status".into(), json!("pending"));
+            }
+        }
+    } else if let Some(obj) = payload.as_object_mut() {
+        obj.insert("analysis_id".into(), json!(analysis_id));
+    }
+
+    Json(payload).into_response()
+}
+
+async fn get_ai_analysis(
+    State(state): State<Arc<AppState>>,
+    Path(analysis_id): Path<String>,
+) -> Response {
+    let Some(repo) = state.repo.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_unavailable",
+            "database is not configured",
+            None,
+        );
+    };
+    if analysis_id.len() > 64 || analysis_id.trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "analysis_id is invalid",
+            None,
+        );
+    }
+    let now_ms = chrono_like_now_ms();
+    let id = analysis_id.clone();
+    match storage_result(repo, move |repo| repo.get_progressive_analysis(&id, now_ms)).await {
+        Ok(Some(row)) => Json(json!({
+            "analysis_id": row.analysis_id,
+            "task_type": row.task_type,
+            "ai_status": row.status,
+            "provider": row.provider,
+            "model": row.model,
+            "protocol": row.protocol,
+            "route_version": row.route_version,
+            "prompt_version": row.prompt_version,
+            "base_result": row.base_result_json.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+            "result": row.result_json.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+            "fallback_reason": row.fallback_reason,
+            "created_at_ms": row.created_at_ms,
+            "updated_at_ms": row.updated_at_ms,
+            "completed_at_ms": row.completed_at_ms,
+            "expires_at_ms": row.expires_at_ms,
+        }))
+        .into_response(),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "analysis not found or expired",
+            None,
+        ),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "failed to load analysis",
+            None,
+        ),
+    }
+}
+
+async fn ai_compare(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AiCompareRequest>,
+) -> Response {
+    let app_ids = body.app_ids;
+    if !(2..=4).contains(&app_ids.len()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "app_ids must contain 2 to 4 games",
+            None,
+        );
+    }
+    let mut unique = HashSet::new();
+    for id in &app_ids {
+        if *id == 0 || !unique.insert(*id) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "app_ids must be unique positive AppIDs",
+                None,
+            );
+        }
+    }
+
+    let Some(repo) = state.repo.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_unavailable",
+            "database is not configured",
+            None,
+        );
+    };
+
+    // Fact matrix is server-generated; the model may only explain later (AI-009).
+    let mut matrix = Vec::new();
+    for app_id in app_ids {
+        let app = match storage_result(repo, move |repo| repo.get_app(app_id)).await {
+            Ok(Some(app)) => app,
+            Ok(None) => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    &format!("app_id {app_id} was not found"),
+                    None,
+                );
+            }
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to load game facts",
+                    None,
+                );
+            }
+        };
+        let profile = storage_result(repo, move |repo| repo.get_profile(app_id))
+            .await
+            .ok()
+            .flatten();
+        matrix.push(json!({
+            "app_id": app.app_id,
+            "name": app.canonical_name,
+            "release_state": app.release_state,
+            "release_date": app.release_date,
+            "is_early_access": app.is_early_access,
+            "party": profile.as_ref().map(|p| json!({
+                "min": p.recommended_min_players,
+                "max": p.recommended_max_players,
+            })),
+            "multiplayer": profile.as_ref().map(|p| json!({
+                "dominant_mode": p.dominant_mode,
+                "private_session": p.private_session,
+                "online_coop": p.online_coop,
+                "crossplay": p.crossplay,
+                "self_hosted_server": p.self_hosted_server,
+                "drop_in_out": p.drop_in_out,
+            })),
+            "data_updated_at_ms": app.updated_at_ms,
+        }));
+    }
+
+    Json(json!({
+        "fact_matrix": matrix,
+        "ai_status": "fallback",
+        "explanation": null,
+        "fallback_reason": "compare explanation uses the fact matrix until the compare_games route is online",
+        "columns": [
+            "party_size",
+            "platforms",
+            "price",
+            "multiplayer_mode",
+            "service_dependency",
+            "content_pacing",
+            "review_quality",
+            "data_updated_at"
+        ]
+    }))
+    .into_response()
+}
+
+async fn get_game_ai_summary(
+    State(state): State<Arc<AppState>>,
+    Path(app_id): Path<u32>,
+) -> Response {
+    if app_id == 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "app_id must be positive",
+            None,
+        );
+    }
+    let Some(repo) = state.repo.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_unavailable",
+            "database is not configured",
+            None,
+        );
+    };
+    // Offline summaries are filled by M8.3 batch jobs. Until then return an
+    // honest empty payload rather than inventing content.
+    let exists = match storage_result(repo, move |repo| repo.get_app(app_id)).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "failed to load game",
+                None,
+            );
+        }
+    };
+    if !exists {
+        return error_response(StatusCode::NOT_FOUND, "not_found", "game not found", None);
+    }
+    Json(json!({
+        "app_id": app_id,
+        "ai_status": "disabled",
+        "summary": null,
+        "sections": {
+            "who_it_fits": null,
+            "how_to_play": null,
+            "multiplayer_dependency": null,
+            "review_strengths": null,
+            "common_issues": null,
+            "unknowns": null
+        },
+        "updated_at_ms": null,
+        "fallback_reason": "offline game summaries are not generated yet"
+    }))
+    .into_response()
 }
 
 fn chrono_like_now_ms() -> i64 {
