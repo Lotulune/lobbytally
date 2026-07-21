@@ -1598,6 +1598,15 @@ fn collect_steam_candidates(
                 message: error.to_string(),
                 stats,
             })?;
+        // Refresh multiplayer dominant_mode from the Multi-player search hint
+        // (and any co-op / PvP category_hint evidence already stored).
+        let _ = repo
+            .materialize_store_category_profiles()
+            .map_err(|error| CollectionError {
+                category: "storage",
+                message: error.to_string(),
+                stats,
+            })?;
         stats.success_count = stats.success_count.saturating_add(ingested as i64);
 
         let next_start = page.next_start();
