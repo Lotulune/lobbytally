@@ -2778,10 +2778,11 @@ async fn get_feed(
                     typical_ccu_7d: row.typical_ccu_7d,
                 },
             );
+            let dominant_mode = row.display_dominant_mode();
             Some(RankingInput {
                 app_id: row.app_id,
                 name: row.name,
-                dominant_mode: row.dominant_mode,
+                dominant_mode,
                 recommended_min: row.recommended_min,
                 recommended_max: row.recommended_max,
                 availability,
@@ -5430,7 +5431,10 @@ async fn get_game(
                 "short_description": game.short_description,
                 "steam_url": format!("https://store.steampowered.com/app/{app_id}/"),
                 "multiplayer": {
-                    "dominant_mode": game.dominant_mode,
+                    "dominant_mode": mpgs_storage::resolve_display_dominant_mode(
+                        game.dominant_mode.as_deref(),
+                        game.online_coop,
+                    ),
                     "private_session": game.private_session,
                     "online_coop": game.online_coop,
                     "self_hosted_server": game.self_hosted_server,

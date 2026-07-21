@@ -465,6 +465,63 @@ pub fn ingest_store_details(
 
 const STORE_CATEGORY_PROFILE_CONFIDENCE: f64 = 0.3;
 
+/// Derive a coarse dominant mode from Steam store multiplayer category labels.
+/// Returns (mode, has_coop, has_competitive, has_online_coop_flag, has_crossplay).
+fn derive_mode_from_category_labels(
+    labels: &[String],
+) -> (Option<&'static str>, bool, bool, bool, bool) {
+    let has_coop = labels.iter().any(|label| {
+        label.contains("co-op")
+            || label.contains("coop")
+            || label.contains("cooperative")
+            || label.contains("co operative")
+    });
+    // Friend-group co-op signal: any co-op category (private or online).
+    let has_online_coop = has_coop
+        || labels.iter().any(|label| {
+            label.contains("online co-op")
+                || label.contains("online coop")
+                || label.contains("shared/split screen co-op")
+                || label.contains("shared/split-screen co-op")
+        });
+    let has_competitive = labels.iter().any(|label| {
+        label.contains("pvp")
+            || label.contains("competitive")
+            || label.contains("versus")
+            || label.contains(" vs ")
+            || label.ends_with(" vs")
+            || label.starts_with("vs ")
+    });
+    let has_crossplay = labels.iter().any(|label| {
+        label.contains("cross-platform multiplayer")
+            || label.contains("crossplay")
+            || label.contains("cross-play")
+    });
+    let has_multiplayer = labels.iter().any(|label| {
+        label.contains("multi-player")
+            || label.contains("multiplayer")
+            || label.contains("multi player")
+            || label.contains("online pvp")
+            || label.contains("online multiplayer")
+    });
+    // mixed = both coop and competitive/PvP → UI shows 合作/对抗
+    let mode = match (has_coop, has_competitive) {
+        (true, true) => Some("mixed"),
+        (true, false) => Some("coop"),
+        (false, true) => Some("pvp"),
+        // Multiplayer-only catalog filter without coop/pvp tags: still not "未知".
+        (false, false) if has_multiplayer || has_online_coop => Some("multiplayer"),
+        (false, false) => None,
+    };
+    (
+        mode,
+        has_coop,
+        has_competitive,
+        has_online_coop,
+        has_crossplay,
+    )
+}
+
 fn materialize_store_category_profile(
     conn: &Connection,
     app_id: u32,
@@ -479,20 +536,8 @@ fn materialize_store_category_profile(
     if labels.is_empty() {
         return Ok(false);
     }
-    let has_coop = labels
-        .iter()
-        .any(|label| label.contains("co-op") || label.contains("coop"));
-    let has_online_coop = labels.iter().any(|label| label == "online co-op");
-    let has_pvp = labels.iter().any(|label| label.contains("pvp"));
-    let has_crossplay = labels
-        .iter()
-        .any(|label| label == "cross-platform multiplayer");
-    let mode = match (has_coop, has_pvp) {
-        (true, true) => Some("mixed"),
-        (true, false) => Some("coop"),
-        (false, true) => Some("pvp"),
-        (false, false) => None,
-    };
+    let (mode, _has_coop, _has_competitive, has_online_coop, has_crossplay) =
+        derive_mode_from_category_labels(&labels);
     let source_ref = format!("steam_store_categories:{}", hints.join("|"));
 
     conn.execute(

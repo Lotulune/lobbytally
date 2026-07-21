@@ -1146,6 +1146,81 @@ fn store_categories_materialize_conservative_multiplayer_profiles() {
 }
 
 #[test]
+fn store_categories_mark_mixed_when_coop_and_pvp_present() {
+    let (repo, _) = repo_with_clock(5_000);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 730,
+            name: "Counter-Strike 2".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "mixed-mode".into(),
+    })
+    .unwrap();
+    repo.database()
+        .with_conn_mut(|conn| {
+            crate::curation::insert_feature_evidence(
+                conn,
+                730,
+                "category_hint",
+                &serde_json::json!(["Online Co-op", "Online PvP", "Competitive"]),
+                "store_category",
+                "fixture",
+                0.3,
+                5_000,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(repo.materialize_store_category_profiles().unwrap(), 1);
+    let profile = repo.get_profile(730).unwrap().unwrap();
+    assert_eq!(profile.dominant_mode.as_deref(), Some("mixed"));
+    assert_eq!(profile.online_coop, Some(true));
+}
+
+#[test]
+fn store_search_multiplayer_only_is_not_unknown() {
+    let (repo, _) = repo_with_clock(5_000);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 548430,
+            name: "Deep Rock Galactic".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "mp-only".into(),
+    })
+    .unwrap();
+    // Search page materializes with Multi-player hint via store_search_category.
+    assert_eq!(repo.materialize_store_category_profiles().unwrap(), 1);
+    let profile = repo.get_profile(548430).unwrap().unwrap();
+    assert_eq!(profile.dominant_mode.as_deref(), Some("multiplayer"));
+}
+
+#[test]
+fn resolve_display_dominant_mode_falls_back_to_online_coop() {
+    assert_eq!(
+        crate::resolve_display_dominant_mode(None, Some(true)).as_deref(),
+        Some("coop")
+    );
+    assert_eq!(
+        crate::resolve_display_dominant_mode(Some("competitive"), None).as_deref(),
+        Some("pvp")
+    );
+    assert_eq!(
+        crate::resolve_display_dominant_mode(Some("unknown"), None),
+        None
+    );
+    assert_eq!(
+        crate::resolve_display_dominant_mode(Some("mixed"), Some(true)).as_deref(),
+        Some("mixed")
+    );
+}
+
+#[test]
 fn store_search_category_materializes_only_a_safe_minimum_party_size() {
     let (repo, _) = repo_with_clock(5_000);
     repo.ingest_store_search_page(&StoreSearchPage {
@@ -1164,7 +1239,8 @@ fn store_search_category_materializes_only_a_safe_minimum_party_size() {
     let profile = repo.get_profile(548430).unwrap().unwrap();
     assert_eq!(profile.recommended_min_players, Some(2));
     assert_eq!(profile.recommended_max_players, None);
-    assert_eq!(profile.dominant_mode, None);
+    // Multi-player search filter alone is still a coarse multiplayer label, not blank.
+    assert_eq!(profile.dominant_mode.as_deref(), Some("multiplayer"));
     assert_eq!(profile.online_coop, None);
     assert_eq!(profile.profile_confidence, Some(0.3));
 }

@@ -45,6 +45,7 @@ pub use offline_features::{
     OFFLINE_FEATURE_TASK, OfflineFeatureStats,
 };
 pub use quality::QualityFinding;
+pub use query::{GameCandidateRow, resolve_display_dominant_mode};
 pub use repo::Repository;
 pub use retrieval::{
     AiCacheEntry, DocumentEmbedTarget, FtsHit, GameDocument, HASH_EMBED_DIMENSIONS,

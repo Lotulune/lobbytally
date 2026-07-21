@@ -74,6 +74,12 @@ impl GameCandidateRow {
         }
     }
 
+    /// Prefer stored dominant_mode; fall back to online_coop so the UI is not
+    /// stuck on 未知 when Steam only left a co-op bool.
+    pub fn display_dominant_mode(&self) -> Option<String> {
+        resolve_display_dominant_mode(self.dominant_mode.as_deref(), self.online_coop)
+    }
+
     pub fn to_ranking_signals(&self) -> RankingSignals {
         let quality =
             self.wilson_lower
@@ -87,7 +93,8 @@ impl GameCandidateRow {
             .map(|c| (1.0 + (c as f64).ln()).min(12.0) / 12.0)
             .unwrap_or(0.3);
         let confidence = self.profile_confidence.unwrap_or(0.4);
-        let mode = self.dominant_mode.as_deref().unwrap_or("");
+        let mode = self.display_dominant_mode().unwrap_or_default();
+        let mode = mode.as_str();
         let matchmaking_core = mode.contains("match") || mode.contains("competitive");
         let public_world_mode = mode.contains("mmo") || mode.contains("public");
         // Dedicated servers for matchmaking-core titles do not count as friend-group self-host.
@@ -633,6 +640,29 @@ pub fn list_calendar(
         }
     }
     Ok((dated, undated))
+}
+
+/// Resolve the mode string shown in feeds/detail chips.
+/// - Prefer an explicit profile mode (not empty / "unknown")
+/// - Map competitive → pvp for consistent UI labels
+/// - If only online_coop is known, treat as coop
+pub fn resolve_display_dominant_mode(
+    stored: Option<&str>,
+    online_coop: Option<bool>,
+) -> Option<String> {
+    if let Some(raw) = stored.map(str::trim).filter(|s| !s.is_empty()) {
+        if !raw.eq_ignore_ascii_case("unknown") {
+            let normalized = match raw {
+                "competitive" | "versus" | "vs" => "pvp",
+                other => other,
+            };
+            return Some(normalized.to_owned());
+        }
+    }
+    if online_coop == Some(true) {
+        return Some("coop".to_owned());
+    }
+    None
 }
 
 fn map_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameCandidateRow> {

@@ -23,12 +23,19 @@ const DOMINANT_MODE_LABELS: Record<string, string> = {
   matchmaking_competitive: "竞技匹配",
   mmo: "MMO",
   pvp: "对抗",
-  mixed: "混合模式",
+  competitive: "对抗",
+  versus: "对抗",
+  // Both co-op and competitive tags present (Steam categories / mixed profile).
+  mixed: "合作/对抗",
+  multiplayer: "联机",
+  unknown: "未知",
 };
 
-export function dominantModeLabel(mode: string | null): string {
+export function dominantModeLabel(mode: string | null | undefined): string {
   if (!mode) return "未知";
-  return DOMINANT_MODE_LABELS[mode] ?? mode;
+  const key = mode.trim().toLowerCase();
+  if (!key || key === "unknown") return "未知";
+  return DOMINANT_MODE_LABELS[key] ?? DOMINANT_MODE_LABELS[mode] ?? mode;
 }
 
 /**
