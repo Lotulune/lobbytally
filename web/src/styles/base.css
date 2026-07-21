@@ -1645,6 +1645,15 @@ body::before {
   background: var(--danger);
 }
 
+.easy-setup-box {
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+  border-radius: 10px;
+  display: grid;
+  gap: 8px;
+}
+
 .ai-route-list {
   list-style: none;
   margin: 0.5rem 0 0;

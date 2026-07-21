@@ -11,7 +11,7 @@ use axum::{
 };
 use image::{DynamicImage, ImageFormat, imageops::FilterType};
 use mpgs_ai::{
-    AiError, AiGateway, AiPolicy, AiRankResult, AiStatus, AiTaskType, AppVoteCount,
+    AiError, AiGateway, AiPolicy, AiProvider, AiRankResult, AiStatus, AiTaskType, AppVoteCount,
     COMPARE_PROMPT_VERSION, CandidateEvidence, DEFAULT_ROUTE_VERSION, EmbeddingInput,
     EmbeddingProvider, GroupAdviceRequest as AiGroupAdviceRequest, OpenAiCompatProvider,
     RANK_PROMPT_VERSION, RuleIntentBaseline, SUMMARY_PROMPT_VERSION, StructuredRequest, TaskRouter,
@@ -279,8 +279,26 @@ struct NaturalLanguageRequest {
 struct TransientCustomAiRequest {
     provider: String,
     base_url: String,
+    /// Default / construction-time model.
     model: String,
     api_key: String,
+    /// When true (default), use `routes` or primary+fallback multi-model routing.
+    #[serde(default)]
+    multi_model: Option<bool>,
+    /// Optional shared fallback when `routes` is empty.
+    #[serde(default)]
+    fallback_model: Option<String>,
+    /// Per-task routes from the device (省心配置 result). Never persisted server-side.
+    #[serde(default)]
+    routes: Option<Vec<TransientCustomRoute>>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+struct TransientCustomRoute {
+    task: String,
+    primary_model: String,
+    #[serde(default)]
+    fallback_models: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -602,6 +620,7 @@ pub fn build_router(state: AppState) -> Router {
             get(get_ai_settings).put(put_ai_settings),
         )
         .route("/v1/me/ai-settings/test", post(test_ai_settings))
+        .route("/v1/me/ai-settings/discover", post(discover_custom_models))
         .route(
             "/v1/me/ai-settings/custom-key",
             delete(delete_custom_ai_key),
@@ -2085,6 +2104,74 @@ async fn test_ai_settings(
     }
 }
 
+/// List upstream models with a device-local key (never stored). Used by 省心配置.
+#[derive(Debug, Deserialize)]
+struct DiscoverCustomModelsBody {
+    base_url: String,
+    api_key: String,
+}
+
+async fn discover_custom_models(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DiscoverCustomModelsBody>,
+) -> Response {
+    let Some(repo) = require_repo(&state) else {
+        return storage_disabled();
+    };
+    if let Err(response) = require_account(repo, &headers).await {
+        return *response;
+    }
+    if body.api_key.trim().is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "api_key is required",
+            None,
+        );
+    }
+    let resolution = match mpgs_ai::resolve_custom_base_url(&body.base_url).await {
+        Ok(r) => r,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "custom AI endpoint is not allowed",
+                None,
+            );
+        }
+    };
+    let provider = match OpenAiCompatProvider::new_with_custom_resolution(
+        resolution.base_url.clone(),
+        body.api_key,
+        "probe-model",
+        Duration::from_secs(12),
+        &resolution,
+    ) {
+        Ok(p) => p,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "custom AI configuration is invalid",
+                None,
+            );
+        }
+    };
+    match provider.list_models().await {
+        Ok(models) => {
+            let ids: Vec<String> = models.into_iter().map(|m| m.model).collect();
+            Json(json!({ "models": ids })).into_response()
+        }
+        Err(_) => error_response(
+            StatusCode::BAD_GATEWAY,
+            "ai_connection_failed",
+            "could not list models from the custom endpoint",
+            None,
+        ),
+    }
+}
+
 #[utoipa::path(
     delete,
     path = "/v1/me/ai-settings/custom-key",
@@ -3064,11 +3151,8 @@ async fn natural_language_recommendations(
                 None => AiMode::Off,
             };
             if mode == AiMode::Custom {
-                match transient_custom_ai_gateway(custom).await {
-                    Ok(gateway) => ResolvedAiGateway {
-                        gateway,
-                        builtin_quota: None,
-                    },
+                match transient_custom_ai_resolved(custom).await {
+                    Ok(resolved) => resolved,
                     Err(response) => return response,
                 }
             } else {
@@ -3084,14 +3168,18 @@ async fn natural_language_recommendations(
         .map(|user_id| format!("account:{user_id}"))
         .unwrap_or_else(|| "anonymous".to_owned());
     let ai_started = std::time::Instant::now();
-    // Multi-model routing only applies to the server-built-in provider.
-    let task_router = resolved_ai
-        .builtin_quota
+    // Prefer device-local multi-model custom router; otherwise built-in TaskRouter.
+    let custom_router = resolved_ai.task_router.clone();
+    let task_router = custom_router
         .as_ref()
-        .map(|_| state.task_router.as_ref())
+        .map(|r| r.as_ref())
         .or_else(|| {
-            // Anonymous / builtin gateway without quota still uses the router
-            // when the deployment gateway is the same built-in endpoint.
+            resolved_ai
+                .builtin_quota
+                .as_ref()
+                .map(|_| state.task_router.as_ref())
+        })
+        .or_else(|| {
             (!resolved_ai.gateway.provider_name().is_empty()
                 && resolved_ai.gateway.provider_name() == state.ai.provider_name()
                 && state.task_router.is_available())
@@ -3117,8 +3205,9 @@ async fn natural_language_recommendations(
         .await
     };
     items.truncate(output_limit as usize);
-    let rank_route = state.task_router.route_for(AiTaskType::RankExplain);
-    let intent_route = state.task_router.route_for(AiTaskType::IntentParse);
+    let active_router = task_router.unwrap_or(state.task_router.as_ref());
+    let rank_route = active_router.route_for(AiTaskType::RankExplain);
+    let intent_route = active_router.route_for(AiTaskType::IntentParse);
     Json(json!({
         "query": query,
         "interpreted": interpreted,
@@ -3130,7 +3219,7 @@ async fn natural_language_recommendations(
         "ai_route_version": enhance.route_version,
         "ai_used_model_fallback": enhance.used_model_fallback,
         "ai_attempted_models": enhance.attempted_models,
-        "ai_multi_model": state.task_router.multi_model_active(),
+        "ai_multi_model": active_router.multi_model_active(),
         "ai_routes": {
             "rank_explain": rank_route.map(|r| json!({
                 "primary": r.primary_model,
@@ -3193,6 +3282,8 @@ fn reorder_items_by_hybrid(items: &mut [serde_json::Value], hits: &[mpgs_storage
 /// mode but cannot select a custom provider.
 struct ResolvedAiGateway {
     gateway: AiGateway,
+    /// When set (device-local multi-model custom API), prefer this over `state.task_router`.
+    task_router: Option<Arc<TaskRouter>>,
     builtin_quota: Option<BuiltinAiQuota>,
 }
 
@@ -3206,12 +3297,14 @@ async fn account_ai_gateway(state: &AppState, user_id: Option<&str>) -> Resolved
     let Some(user_id) = user_id else {
         return ResolvedAiGateway {
             gateway: state.ai.clone(),
+            task_router: None,
             builtin_quota: None,
         };
     };
     let Some(repo) = state.repo.as_ref() else {
         return ResolvedAiGateway {
             gateway: AiGateway::disabled(),
+            task_router: None,
             builtin_quota: None,
         };
     };
@@ -3222,6 +3315,7 @@ async fn account_ai_gateway(state: &AppState, user_id: Option<&str>) -> Resolved
             Err(_) => {
                 return ResolvedAiGateway {
                     gateway: AiGateway::disabled(),
+                    task_router: None,
                     builtin_quota: None,
                 };
             }
@@ -3229,10 +3323,12 @@ async fn account_ai_gateway(state: &AppState, user_id: Option<&str>) -> Resolved
     match settings.mode {
         AiMode::Off => ResolvedAiGateway {
             gateway: AiGateway::disabled(),
+            task_router: None,
             builtin_quota: None,
         },
         AiMode::Builtin => ResolvedAiGateway {
             gateway: state.ai.clone(),
+            task_router: None,
             builtin_quota: Some(BuiltinAiQuota {
                 user_id: user_id.to_owned(),
                 limiter: state.account_ai_limits.clone(),
@@ -3242,19 +3338,28 @@ async fn account_ai_gateway(state: &AppState, user_id: Option<&str>) -> Resolved
             // Custom credentials are device-owned and must arrive transiently
             // with the recommendation request.
             gateway: AiGateway::disabled(),
+            task_router: None,
             builtin_quota: None,
         },
     }
 }
 
-async fn transient_custom_ai_gateway(
+async fn transient_custom_ai_resolved(
     custom: TransientCustomAiRequest,
-) -> Result<AiGateway, Response> {
+) -> Result<ResolvedAiGateway, Response> {
     if custom.provider != "openai_compat" {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
             "custom provider must be openai_compat",
+            None,
+        ));
+    }
+    if custom.model.trim().is_empty() || custom.api_key.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "custom model and api_key are required",
             None,
         ));
     }
@@ -3268,11 +3373,12 @@ async fn transient_custom_ai_gateway(
                 None,
             )
         })?;
+    let timeout = Duration::from_secs(20);
     let provider = OpenAiCompatProvider::new_with_custom_resolution(
         resolution.base_url.clone(),
-        custom.api_key,
-        custom.model,
-        Duration::from_secs(12),
+        custom.api_key.clone(),
+        custom.model.clone(),
+        timeout,
         &resolution,
     )
     .map_err(|_| {
@@ -3283,7 +3389,120 @@ async fn transient_custom_ai_gateway(
             None,
         )
     })?;
-    Ok(AiGateway::new(Arc::new(provider), AiPolicy::default()))
+    let provider = Arc::new(provider);
+    let gateway = AiGateway::new(
+        provider.clone(),
+        AiPolicy {
+            online_timeout: timeout,
+            ..AiPolicy::default()
+        },
+    );
+
+    let multi = custom.multi_model.unwrap_or(true);
+    let task_router = if multi {
+        let routes = build_transient_custom_routes(&custom);
+        let router = TaskRouter::new(
+            provider,
+            routes,
+            Arc::new(mpgs_ai::ModelRegistry::new()),
+            mpgs_ai::RouterPolicy::default(),
+        );
+        // Best-effort discovery so missing models are skipped (device key, not logged).
+        let _ = router.refresh_model_registry().await;
+        Some(Arc::new(router))
+    } else {
+        None
+    };
+
+    Ok(ResolvedAiGateway {
+        gateway,
+        task_router,
+        builtin_quota: None,
+    })
+}
+
+fn build_transient_custom_routes(
+    custom: &TransientCustomAiRequest,
+) -> std::collections::HashMap<AiTaskType, mpgs_ai::TaskRouteConfig> {
+    use mpgs_ai::{DEFAULT_ROUTE_VERSION, default_task_routes};
+    use std::time::Duration;
+
+    let mut routes = default_task_routes();
+    let fallback = custom
+        .fallback_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    if let Some(custom_routes) = &custom.routes {
+        for row in custom_routes {
+            let Ok(task) = parse_ai_task(&row.task) else {
+                continue;
+            };
+            let primary = row.primary_model.trim();
+            if primary.is_empty() {
+                continue;
+            }
+            let entry = routes
+                .entry(task)
+                .or_insert_with(|| mpgs_ai::TaskRouteConfig {
+                    task,
+                    primary_model: primary.to_owned(),
+                    fallback_models: vec![],
+                    protocol_preference: vec![
+                        mpgs_ai::ApiProtocol::ChatCompletions,
+                        mpgs_ai::ApiProtocol::Responses,
+                    ],
+                    timeout: Duration::from_secs(20),
+                    max_output_tokens: 1_800,
+                    enabled: true,
+                    route_version: DEFAULT_ROUTE_VERSION.to_owned(),
+                });
+            entry.primary_model = primary.to_owned();
+            entry.fallback_models = row
+                .fallback_models
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty() && s != primary)
+                .collect();
+            entry.enabled = true;
+        }
+    } else {
+        // Simple multi-model: same primary for all online tasks + optional shared fallback.
+        for route in routes.values_mut() {
+            if matches!(
+                route.task,
+                AiTaskType::IntentParse
+                    | AiTaskType::RankExplain
+                    | AiTaskType::CompareGames
+                    | AiTaskType::GroupAdvice
+                    | AiTaskType::GameSummary
+            ) {
+                route.primary_model = custom.model.clone();
+                route.fallback_models = fallback
+                    .clone()
+                    .into_iter()
+                    .filter(|m| m != &custom.model)
+                    .collect();
+            }
+        }
+    }
+    routes
+}
+
+fn parse_ai_task(raw: &str) -> Result<AiTaskType, ()> {
+    match raw.trim() {
+        "intent_parse" => Ok(AiTaskType::IntentParse),
+        "rank_explain" | "rank_analysis" => Ok(AiTaskType::RankExplain),
+        "compare_games" => Ok(AiTaskType::CompareGames),
+        "group_advice" => Ok(AiTaskType::GroupAdvice),
+        "game_summary" => Ok(AiTaskType::GameSummary),
+        "data_quality" => Ok(AiTaskType::DataQuality),
+        "feature_extract" => Ok(AiTaskType::FeatureExtract),
+        "embed" => Ok(AiTaskType::Embed),
+        _ => Err(()),
+    }
 }
 
 #[derive(Debug, Clone)]

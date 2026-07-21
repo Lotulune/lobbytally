@@ -1,18 +1,27 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import type { CustomRoutingPreset, CustomTaskRoute } from "./customAiRoutes";
 
-const BROWSER_SESSION_KEY = "mpgs.ai.custom.session.v1";
+const BROWSER_SESSION_KEY = "mpgs.ai.custom.session.v2";
+const LEGACY_BROWSER_KEY = "mpgs.ai.custom.session.v1";
 
 export interface LocalCustomAiSettings {
   userId: string;
   baseUrl: string;
+  /** Default / construction-time model (also primary for single mode). */
   model: string;
   apiKey: string;
+  /** easy = multi-model auto plan; single = one model for all tasks. */
+  routingPreset: CustomRoutingPreset;
+  fallbackModel?: string | null;
+  routes?: CustomTaskRoute[];
 }
 
 function parse(value: string | null, userId: string): LocalCustomAiSettings | null {
   if (!value) return null;
   try {
-    const parsed = JSON.parse(value) as Partial<LocalCustomAiSettings>;
+    const parsed = JSON.parse(value) as Partial<LocalCustomAiSettings> & {
+      // v1 fields only had model/baseUrl/apiKey/userId
+    };
     if (
       parsed.userId !== userId ||
       typeof parsed.baseUrl !== "string" ||
@@ -22,7 +31,19 @@ function parse(value: string | null, userId: string): LocalCustomAiSettings | nu
     ) {
       return null;
     }
-    return parsed as LocalCustomAiSettings;
+    const routingPreset: CustomRoutingPreset =
+      parsed.routingPreset === "single" || parsed.routingPreset === "easy"
+        ? parsed.routingPreset
+        : "easy";
+    return {
+      userId,
+      baseUrl: parsed.baseUrl,
+      model: parsed.model,
+      apiKey: parsed.apiKey,
+      routingPreset,
+      fallbackModel: parsed.fallbackModel ?? null,
+      routes: Array.isArray(parsed.routes) ? parsed.routes : undefined,
+    };
   } catch {
     return null;
   }
@@ -31,10 +52,19 @@ function parse(value: string | null, userId: string): LocalCustomAiSettings | nu
 export async function loadLocalCustomAiSettings(
   userId: string,
 ): Promise<LocalCustomAiSettings | null> {
-  const raw = isTauri()
-    ? await invoke<string | null>("ai_credential_load")
-    : globalThis.sessionStorage.getItem(BROWSER_SESSION_KEY);
-  return parse(raw, userId);
+  if (isTauri()) {
+    const raw = await invoke<string | null>("ai_credential_load");
+    return parse(raw, userId);
+  }
+  const modern = parse(globalThis.sessionStorage.getItem(BROWSER_SESSION_KEY), userId);
+  if (modern) return modern;
+  // Migrate v1 session key once.
+  const legacy = parse(globalThis.sessionStorage.getItem(LEGACY_BROWSER_KEY), userId);
+  if (legacy) {
+    await saveLocalCustomAiSettings(legacy);
+    globalThis.sessionStorage.removeItem(LEGACY_BROWSER_KEY);
+  }
+  return legacy;
 }
 
 export async function saveLocalCustomAiSettings(
@@ -53,5 +83,6 @@ export async function removeLocalCustomAiSettings(): Promise<void> {
     await invoke("ai_credential_remove");
   } else {
     globalThis.sessionStorage.removeItem(BROWSER_SESSION_KEY);
+    globalThis.sessionStorage.removeItem(LEGACY_BROWSER_KEY);
   }
 }

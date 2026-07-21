@@ -529,6 +529,13 @@ export class ApiClient {
       baseUrl: string;
       model: string;
       apiKey: string;
+      multiModel?: boolean;
+      fallbackModel?: string | null;
+      routes?: Array<{
+        task: string;
+        primary_model: string;
+        fallback_models: string[];
+      }>;
     },
   ): Promise<NaturalLanguageRecommendationResponse> {
     return this.rawJson<NaturalLanguageRecommendationResponse>(
@@ -545,6 +552,9 @@ export class ApiClient {
                 base_url: customAi.baseUrl,
                 model: customAi.model,
                 api_key: customAi.apiKey,
+                multi_model: customAi.multiModel ?? true,
+                fallback_model: customAi.fallbackModel ?? undefined,
+                routes: customAi.routes,
               }
             : undefined,
         },
@@ -740,6 +750,17 @@ export class ApiClient {
       model: input.model,
       api_key: input.apiKey,
     });
+  }
+
+  async discoverCustomModels(input: {
+    baseUrl: string;
+    apiKey: string;
+  }): Promise<{ models: string[] }> {
+    const response = await this.accountResponse("POST", "/v1/me/ai-settings/discover", {
+      base_url: input.baseUrl,
+      api_key: input.apiKey,
+    });
+    return (await response.json()) as { models: string[] };
   }
 
   async deleteCustomAiKey(): Promise<AiSettings> {
