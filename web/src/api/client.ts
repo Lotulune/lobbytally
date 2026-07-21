@@ -552,7 +552,8 @@ export class ApiClient {
                 base_url: customAi.baseUrl,
                 model: customAi.model,
                 api_key: customAi.apiKey,
-                multi_model: customAi.multiModel ?? true,
+                // Custom providers stay single-model by default; name heuristics are unsafe across vendors.
+                multi_model: customAi.multiModel ?? false,
                 fallback_model: customAi.fallbackModel ?? undefined,
                 routes: customAi.routes,
               }

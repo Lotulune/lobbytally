@@ -518,6 +518,7 @@ impl utoipa::Modify for SecurityAddon {
         get_ai_settings,
         put_ai_settings,
         test_ai_settings,
+        discover_custom_models,
         delete_custom_ai_key,
         get_community_play_intents,
         get_preferences,
@@ -548,6 +549,8 @@ impl utoipa::Modify for SecurityAddon {
         AccountProfileSchema,
         AiSettingsBody,
         AiSettingsSchema,
+        DiscoverCustomModelsBody,
+        DiscoverCustomModelsResponse,
         CommunityResponseSchema,
         CommunityItemSchema,
         CommunityPlayIntentSchema,
@@ -2104,13 +2107,31 @@ async fn test_ai_settings(
     }
 }
 
-/// List upstream models with a device-local key (never stored). Used by 省心配置.
-#[derive(Debug, Deserialize)]
+/// List upstream models with a device-local key (never stored server-side).
+#[derive(Debug, Deserialize, ToSchema)]
 struct DiscoverCustomModelsBody {
     base_url: String,
     api_key: String,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+struct DiscoverCustomModelsResponse {
+    models: Vec<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/me/ai-settings/discover",
+    request_body = DiscoverCustomModelsBody,
+    responses(
+        (status = 200, body = DiscoverCustomModelsResponse),
+        (status = 400, body = ErrorBody),
+        (status = 401, body = ErrorBody),
+        (status = 502, body = ErrorBody)
+    ),
+    security(("bearer_auth" = [])),
+    tag = "account"
+)]
 async fn discover_custom_models(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

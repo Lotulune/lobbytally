@@ -304,6 +304,7 @@ describe("ApiClient natural-language recommendations", () => {
         base_url: "https://provider.example/v1",
         model: "model-a",
         api_key: "local-secret",
+        multi_model: false,
       },
     });
   });

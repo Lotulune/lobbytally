@@ -1658,6 +1658,7 @@ mod tests {
             "/v1/me/avatar",
             "/v1/me/ai-settings",
             "/v1/me/ai-settings/test",
+            "/v1/me/ai-settings/discover",
             "/v1/me/ai-settings/custom-key",
             "/v1/community/play-intents",
             "/v1/preferences",

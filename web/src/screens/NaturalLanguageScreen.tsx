@@ -33,9 +33,8 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
                 baseUrl: custom.baseUrl,
                 model: custom.model,
                 apiKey: custom.apiKey,
-                multiModel: custom.routingPreset !== "single",
-                fallbackModel: custom.fallbackModel,
-                routes: custom.routes,
+                // Custom stays single-model until we have vendor-neutral routing UX.
+                multiModel: false,
               }
             : undefined,
         ),

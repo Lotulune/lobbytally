@@ -3,13 +3,6 @@ import { ApiError } from "../api/client";
 import type { AiSettings } from "../api/types";
 import { apiClient } from "../app/runtime";
 import {
-  buildEasyRoutePlan,
-  taskLabel,
-  type CustomRoutingPreset,
-  type CustomTaskRoute,
-  type EasyRoutePlan,
-} from "../app/customAiRoutes";
-import {
   loadLocalCustomAiSettings,
   removeLocalCustomAiSettings,
   saveLocalCustomAiSettings,
@@ -19,7 +12,7 @@ import { useToast } from "../app/ToastProvider";
 
 type Mode = AiSettings["mode"];
 
-function aiErrorMessage(error: unknown, action: "load" | "test" | "save" | "delete" | "discover"): string {
+function aiErrorMessage(error: unknown, action: "load" | "test" | "save" | "delete"): string {
   if (error instanceof ApiError) {
     if (error.code === "temporarily_unavailable") {
       return "服务端尚未启用自定义 AI 凭据加密，请联系管理员配置后重试。";
@@ -34,56 +27,8 @@ function aiErrorMessage(error: unknown, action: "load" | "test" | "save" | "dele
   }
   if (action === "load") return "无法加载 AI 设置。";
   if (action === "test") return "无法连接到该服务。";
-  if (action === "discover") return "无法探测上游模型列表。";
   if (action === "delete") return "无法删除自定义密钥。";
   return "AI 设置保存失败。";
-}
-
-function RouteTable({
-  routes,
-  title,
-  note,
-}: {
-  routes: Array<{
-    task: string;
-    primary_model: string;
-    fallback_models: string[];
-    primary_available?: boolean;
-  }>;
-  title: string;
-  note: string;
-}) {
-  return (
-    <div className="ai-routes" aria-label={title}>
-      <p className="cal-note">{note}</p>
-      <p className="cal-note">
-        <strong>箭头含义：</strong>左侧是该任务<strong>优先使用的主模型</strong>；
-        <code> → </code>后面是<strong>回退模型</strong>（主模型失败/限流/不可用时依次尝试，全部失败则用确定性结果，不会假装 AI 成功）。
-      </p>
-      <ul className="ai-route-list">
-        {routes.map((route) => (
-          <li key={route.task} className="ai-route-row">
-            <strong title={route.task}>{taskLabel(route.task)}</strong>
-            <span
-              className="chip accent"
-              title={
-                route.primary_available === false
-                  ? "上游未发现此模型，运行时会跳过"
-                  : "主模型（优先）"
-              }
-            >
-              主 {route.primary_model}
-            </span>
-            {route.fallback_models.map((fb) => (
-              <span key={fb} className="chip" title="回退模型">
-                → 回退 {fb}
-              </span>
-            ))}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
 }
 
 export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
@@ -92,10 +37,6 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
   const [mode, setMode] = useState<Mode>("builtin");
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
-  const [fallbackModel, setFallbackModel] = useState("");
-  const [routingPreset, setRoutingPreset] = useState<CustomRoutingPreset>("easy");
-  const [routes, setRoutes] = useState<CustomTaskRoute[]>([]);
-  const [planNotes, setPlanNotes] = useState<string[]>([]);
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -134,9 +75,6 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
           if (local) {
             setBaseUrl(local.baseUrl);
             setModel(local.model);
-            setFallbackModel(local.fallbackModel ?? "");
-            setRoutingPreset(local.routingPreset);
-            setRoutes(local.routes ?? []);
           }
         }
       })
@@ -152,14 +90,6 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
     };
   }, [toast]);
 
-  const applyPlan = (plan: EasyRoutePlan) => {
-    setRoutingPreset(plan.preset);
-    setModel(plan.model);
-    setFallbackModel(plan.fallback_model ?? "");
-    setRoutes(plan.routes);
-    setPlanNotes(plan.notes);
-  };
-
   const save = async () => {
     setErrorMessage(null);
     setBusy(true);
@@ -173,25 +103,34 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
           message: "API Key 不能为空",
         });
       }
+      if (mode === "custom" && !model.trim()) {
+        throw new ApiError({
+          code: "invalid_argument",
+          status: 400,
+          message: "请填写模型名称",
+        });
+      }
       const next = await apiClient.putAiSettings(
         mode === "custom"
           ? {
               mode,
               provider: "openai_compat",
               baseUrl,
-              model,
+              model: model.trim(),
             }
           : { mode },
       );
       if (mode === "custom" && userId) {
+        // Single model only for custom until vendor-neutral multi-model UX exists.
+        // Do not invent per-task models from name heuristics.
         const local: LocalCustomAiSettings = {
           userId,
           baseUrl,
-          model,
+          model: model.trim(),
           apiKey: effectiveKey,
-          routingPreset,
-          fallbackModel: fallbackModel || null,
-          routes: routingPreset === "easy" ? routes : routes.length ? routes : undefined,
+          routingPreset: "single",
+          fallbackModel: null,
+          routes: undefined,
         };
         await saveLocalCustomAiSettings(local);
         setLocalCustom(local);
@@ -221,44 +160,12 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
       await apiClient.testAiSettings({
         provider: "openai_compat",
         baseUrl,
-        model: model || "probe-model",
+        model: model.trim() || "probe-model",
         apiKey: effectiveKey,
       });
       toast.show("连接正常");
     } catch (error: unknown) {
       const message = aiErrorMessage(error, "test");
-      setErrorMessage(message);
-      toast.show(message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const easySetup = async () => {
-    setErrorMessage(null);
-    setBusy(true);
-    try {
-      const effectiveKey = apiKey || localCustom?.apiKey || "";
-      if (!baseUrl.trim() || !effectiveKey) {
-        throw new ApiError({
-          code: "invalid_argument",
-          status: 400,
-          message: "请先填写 HTTPS 地址和 API Key",
-        });
-      }
-      const { models } = await apiClient.discoverCustomModels({
-        baseUrl,
-        apiKey: effectiveKey,
-      });
-      const plan = buildEasyRoutePlan(models);
-      applyPlan(plan);
-      toast.show(
-        plan.preset === "easy"
-          ? `已自动配置多模型（发现 ${models.length} 个）`
-          : `已配置单模型（发现 ${models.length} 个）`,
-      );
-    } catch (error: unknown) {
-      const message = aiErrorMessage(error, "discover");
       setErrorMessage(message);
       toast.show(message);
     } finally {
@@ -272,9 +179,6 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
       const next = await apiClient.deleteCustomAiKey();
       setApiKey("");
       setLocalCustom(null);
-      setRoutes([]);
-      setPlanNotes([]);
-      setFallbackModel("");
       applySettings(next);
       toast.show("自定义密钥已删除");
     } catch (error: unknown) {
@@ -331,14 +235,15 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
               <span className="chip">今日剩余 {settings.builtin.daily_remaining} 次</span>
             )}
           </div>
-          <p className="cal-note">
-            使用服务端内置 AI。模型分配与回退在后台自动完成，无需配置。
-          </p>
+          <p className="cal-note">使用服务端内置 AI。模型与回退在后台自动完成，无需配置。</p>
         </>
       )}
 
       {mode === "custom" && (
         <div className="stack-form ai-custom-form">
+          <p className="cal-note">
+            填写 OpenAI 兼容接口的地址、模型名和 Key。当前为<strong>单模型</strong>模式（跨厂商名称无法可靠推断能力，故不做自动分模型）。
+          </p>
           <label>
             HTTPS 地址
             <input
@@ -346,6 +251,14 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
               value={baseUrl}
               placeholder="https://api.example.com/v1"
               onChange={(event) => setBaseUrl(event.target.value)}
+            />
+          </label>
+          <label>
+            模型
+            <input
+              value={model}
+              placeholder="例如 gpt-4o-mini"
+              onChange={(event) => setModel(event.target.value)}
             />
           </label>
           <label>
@@ -361,93 +274,6 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
           {(settings.configured || localCustom) && (
             <span className="chip ok">密钥 {settings.key_mask ?? "本机安全存储"}</span>
           )}
-
-          <div className="easy-setup-box">
-            <button
-              type="button"
-              className="btn accent"
-              disabled={busy || (!apiKey && !localCustom) || !baseUrl.trim()}
-              onClick={() => void easySetup()}
-            >
-              {busy ? "配置中…" : "一键省心配置"}
-            </button>
-            <p className="cal-note">
-              填好地址和 Key 后点一次即可：自动探测 <code>/v1/models</code>，为「理解你的话 /
-              推荐理由 / 比较」等任务分配主模型与回退链。密钥仍只在本机。
-            </p>
-          </div>
-
-          <div className="seg" role="tablist" aria-label="自定义路由方式">
-            <button
-              type="button"
-              className="btn small"
-              aria-pressed={routingPreset === "easy"}
-              onClick={() => setRoutingPreset("easy")}
-            >
-              多模型（推荐）
-            </button>
-            <button
-              type="button"
-              className="btn small"
-              aria-pressed={routingPreset === "single"}
-              onClick={() => {
-                setRoutingPreset("single");
-                setRoutes([]);
-              }}
-            >
-              单模型
-            </button>
-          </div>
-
-          {routingPreset === "single" ? (
-            <label>
-              模型
-              <input
-                value={model}
-                placeholder="model-name"
-                onChange={(event) => setModel(event.target.value)}
-              />
-            </label>
-          ) : (
-            <>
-              <label>
-                默认主模型（推荐任务）
-                <input
-                  value={model}
-                  placeholder="探测后自动填入"
-                  onChange={(event) => setModel(event.target.value)}
-                />
-              </label>
-              <label>
-                默认回退模型（可选）
-                <input
-                  value={fallbackModel}
-                  placeholder="主模型失败时使用"
-                  onChange={(event) => setFallbackModel(event.target.value)}
-                />
-              </label>
-            </>
-          )}
-
-          {routes.length > 0 && routingPreset === "easy" && (
-            <RouteTable
-              title="自定义任务模型路由"
-              note="以下为省心配置结果，可保存后用于描述推荐。"
-              routes={routes.map((r) => ({
-                task: r.task,
-                primary_model: r.primary_model,
-                fallback_models: r.fallback_models,
-              }))}
-            />
-          )}
-          {planNotes.length > 0 && (
-            <ul className="cal-note">
-              {planNotes.map((n) => (
-                <li key={n}>{n}</li>
-              ))}
-            </ul>
-          )}
-
           <div className="seg">
             <button
               type="button"

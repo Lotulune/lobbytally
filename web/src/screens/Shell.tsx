@@ -146,6 +146,7 @@ export function Shell() {
               type="button"
               role="tab"
               className="tab"
+              data-testid={`nav-feed-${s}`}
               aria-selected={activeSection === s}
               onClick={() => setView({ kind: "feed", section: s })}
             >
@@ -160,6 +161,7 @@ export function Shell() {
               type="button"
               role="tab"
               className="tab"
+              data-testid={`nav-${tab.view.kind}`}
               aria-selected={view.kind === tab.view.kind}
               onClick={() => setView(tab.view)}
             >
