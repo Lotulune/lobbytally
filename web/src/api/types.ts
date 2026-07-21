@@ -191,6 +191,16 @@ export interface NaturalLanguageRecommendationResponse {
   items: FeedItem[];
   ai_status: AiStatus;
   ai_provider?: string;
+  ai_model?: string | null;
+  ai_protocol?: string | null;
+  ai_route_version?: string | null;
+  ai_used_model_fallback?: boolean;
+  ai_attempted_models?: string[];
+  ai_multi_model?: boolean;
+  ai_routes?: {
+    rank_explain?: { primary: string; fallbacks: string[] } | null;
+    intent_parse?: { primary: string; fallbacks: string[] } | null;
+  };
   ai_latency_ms?: number;
   fallback_reason: string | null;
   ai_summary?: string | null;
@@ -295,6 +305,18 @@ export interface AccountProfile {
   avatar_version: number;
 }
 
+export interface AiTaskRouteInfo {
+  task: string;
+  primary_model: string;
+  fallback_models: string[];
+  protocol_preference: string[];
+  timeout_ms: number;
+  max_output_tokens: number;
+  enabled: boolean;
+  route_version: string;
+  primary_available: boolean;
+}
+
 export interface AiSettings {
   mode: "builtin" | "custom" | "off";
   provider: string | null;
@@ -305,7 +327,13 @@ export interface AiSettings {
   updated_at_ms: number | null;
   builtin: {
     available: boolean;
-    model: string;
+    /** @deprecated use provider + routes; kept for older servers */
+    model?: string;
+    provider?: string;
+    multi_model?: boolean;
+    route_version?: string;
+    routes?: AiTaskRouteInfo[];
+    discovered_models?: string[];
     daily_remaining: number | null;
   };
 }

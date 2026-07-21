@@ -149,6 +149,10 @@ struct MetaResponse {
     data_updated_at_ms: Option<i64>,
     supported_sections: Vec<&'static str>,
     ai_available: bool,
+    /// Built-in multi-model task routing is active (not a single collapsed model).
+    ai_multi_model: bool,
+    /// Per-task primary models for the built-in router (empty when disabled).
+    ai_task_models: Vec<String>,
     storage_enabled: bool,
     demo_mode: bool,
 }
@@ -783,6 +787,13 @@ async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl In
         }
         None => (ALGORITHM_VERSION.to_owned(), None, None),
     };
+    let ai_task_models: Vec<String> = state
+        .task_router
+        .route_snapshot()
+        .into_iter()
+        .filter(|r| r.enabled)
+        .map(|r| format!("{}:{}", r.task, r.primary_model))
+        .collect();
     let body = MetaResponse {
         api_version: "v1",
         service_version: env!("CARGO_PKG_VERSION"),
@@ -794,21 +805,25 @@ async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl In
             .into_iter()
             .map(FeedSection::as_str)
             .collect(),
-        ai_available: state.ai.is_available(),
+        ai_available: state.ai.is_available() || state.task_router.is_available(),
+        ai_multi_model: state.task_router.multi_model_active(),
+        ai_task_models,
         storage_enabled: state.repo.is_some(),
         demo_mode: std::env::var("MPGS_SEED_DEMO").ok().is_some_and(|value| {
             matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
         }),
     };
     let etag = weak_etag(&format!(
-        "{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         body.service_version,
         body.algorithm_version,
         body.schema_version.unwrap_or(-1),
         body.build_git_sha,
         body.data_updated_at_ms.unwrap_or(0),
         body.storage_enabled,
-        body.demo_mode
+        body.demo_mode,
+        body.ai_multi_model,
+        body.ai_task_models.join(",")
     ));
     if_none_match_ok(&headers, &etag)
         .unwrap_or_else(|| ([(header::ETAG, etag)], Json(body)).into_response())
@@ -2225,6 +2240,8 @@ async fn ai_settings_json(
     .await
     .ok()
     .map(|used| state.account_ai_limits.daily_budget().saturating_sub(used));
+    let routes = state.task_router.route_snapshot();
+    let discovered = state.task_router.registry().available_models();
     json!({
         "mode": settings.mode.as_str(),
         "provider": settings.provider,
@@ -2234,8 +2251,12 @@ async fn ai_settings_json(
         "key_mask": settings.key_mask,
         "updated_at_ms": settings.updated_at_ms,
         "builtin": {
-            "available": state.ai.is_available(),
-            "model": state.ai.provider_name(),
+            "available": state.ai.is_available() || state.task_router.is_available(),
+            "provider": state.ai.provider_name(),
+            "multi_model": state.task_router.multi_model_active(),
+            "route_version": DEFAULT_ROUTE_VERSION,
+            "routes": routes,
+            "discovered_models": discovered,
             "daily_remaining": daily_remaining,
         }
     })
@@ -3077,21 +3098,11 @@ async fn natural_language_recommendations(
             .then_some(state.task_router.as_ref())
         });
 
-    let (ai_status, fallback_reason, ai_summary, ai_summary_evidence_ids) = if skip_rank_ai {
+    let enhance = if skip_rank_ai {
         if resolved_ai.gateway.is_available() || task_router.is_some_and(|r| r.is_available()) {
-            (
-                AiStatus::Pending,
-                Some("base ranking returned; AI enhancement is pending".into()),
-                None,
-                Vec::new(),
-            )
+            AiEnhanceOutcome::pending("base ranking returned; AI enhancement is pending")
         } else {
-            (
-                AiStatus::Fallback,
-                Some(mpgs_ai::AiError::Disabled.fallback_reason().to_owned()),
-                None,
-                Vec::new(),
-            )
+            AiEnhanceOutcome::fallback(mpgs_ai::AiError::Disabled.fallback_reason())
         }
     } else {
         enhance_natural_language_with_ai(
@@ -3106,16 +3117,34 @@ async fn natural_language_recommendations(
         .await
     };
     items.truncate(output_limit as usize);
+    let rank_route = state.task_router.route_for(AiTaskType::RankExplain);
+    let intent_route = state.task_router.route_for(AiTaskType::IntentParse);
     Json(json!({
         "query": query,
         "interpreted": interpreted,
         "items": items,
-        "ai_status": ai_status.as_str(),
+        "ai_status": enhance.status.as_str(),
         "ai_provider": resolved_ai.gateway.provider_name(),
+        "ai_model": enhance.model,
+        "ai_protocol": enhance.protocol,
+        "ai_route_version": enhance.route_version,
+        "ai_used_model_fallback": enhance.used_model_fallback,
+        "ai_attempted_models": enhance.attempted_models,
+        "ai_multi_model": state.task_router.multi_model_active(),
+        "ai_routes": {
+            "rank_explain": rank_route.map(|r| json!({
+                "primary": r.primary_model,
+                "fallbacks": r.fallback_models,
+            })),
+            "intent_parse": intent_route.map(|r| json!({
+                "primary": r.primary_model,
+                "fallbacks": r.fallback_models,
+            })),
+        },
         "ai_latency_ms": ai_started.elapsed().as_millis() as u64,
-        "fallback_reason": fallback_reason,
-        "ai_summary": ai_summary,
-        "ai_summary_evidence_ids": ai_summary_evidence_ids,
+        "fallback_reason": enhance.fallback_reason,
+        "ai_summary": enhance.summary,
+        "ai_summary_evidence_ids": enhance.summary_evidence_ids,
         "algorithm_version": feed.get("algorithm_version").cloned().unwrap_or(json!(ALGORITHM_VERSION)),
         "data_updated_at_ms": feed.get("data_updated_at_ms").cloned().unwrap_or(json!(0)),
     }))
@@ -3257,6 +3286,61 @@ async fn transient_custom_ai_gateway(
     Ok(AiGateway::new(Arc::new(provider), AiPolicy::default()))
 }
 
+#[derive(Debug, Clone)]
+struct AiEnhanceOutcome {
+    status: AiStatus,
+    fallback_reason: Option<String>,
+    summary: Option<String>,
+    summary_evidence_ids: Vec<String>,
+    model: Option<String>,
+    protocol: Option<String>,
+    route_version: Option<String>,
+    used_model_fallback: bool,
+    attempted_models: Vec<String>,
+}
+
+impl Default for AiEnhanceOutcome {
+    fn default() -> Self {
+        Self {
+            status: AiStatus::Fallback,
+            fallback_reason: None,
+            summary: None,
+            summary_evidence_ids: Vec::new(),
+            model: None,
+            protocol: None,
+            route_version: None,
+            used_model_fallback: false,
+            attempted_models: Vec::new(),
+        }
+    }
+}
+
+impl AiEnhanceOutcome {
+    fn disabled(reason: impl Into<String>) -> Self {
+        Self {
+            status: AiStatus::Disabled,
+            fallback_reason: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
+    fn fallback(reason: impl Into<String>) -> Self {
+        Self {
+            status: AiStatus::Fallback,
+            fallback_reason: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
+    fn pending(reason: impl Into<String>) -> Self {
+        Self {
+            status: AiStatus::Pending,
+            fallback_reason: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+}
+
 /// Apply optional AI Top-N analysis. Always preserves deterministic items on failure.
 async fn enhance_natural_language_with_ai(
     gateway: &AiGateway,
@@ -3266,27 +3350,20 @@ async fn enhance_natural_language_with_ai(
     query: &str,
     items: &mut Vec<serde_json::Value>,
     builtin_quota: Option<&BuiltinAiQuota>,
-) -> (AiStatus, Option<String>, Option<String>, Vec<String>) {
+) -> AiEnhanceOutcome {
     const AI_MAX_RECOMMENDATIONS: usize = 8;
     if items.is_empty() {
         if gateway.is_available() {
-            return (AiStatus::Used, None, None, Vec::new());
+            return AiEnhanceOutcome {
+                status: AiStatus::Used,
+                ..AiEnhanceOutcome::default()
+            };
         }
-        return (
-            AiStatus::Disabled,
-            Some(mpgs_ai::AiError::Disabled.fallback_reason().to_owned()),
-            None,
-            Vec::new(),
-        );
+        return AiEnhanceOutcome::disabled(mpgs_ai::AiError::Disabled.fallback_reason());
     }
     if !gateway.is_available() {
         // Keep reason text compatible with M4 acceptance wording while exposing disabled status.
-        return (
-            AiStatus::Fallback,
-            Some(mpgs_ai::AiError::Disabled.fallback_reason().to_owned()),
-            None,
-            Vec::new(),
-        );
+        return AiEnhanceOutcome::fallback(mpgs_ai::AiError::Disabled.fallback_reason());
     }
 
     let mut candidates = Vec::new();
@@ -3335,12 +3412,7 @@ async fn enhance_natural_language_with_ai(
             .unwrap_or(0)
     });
     if candidates.is_empty() {
-        return (
-            AiStatus::Fallback,
-            Some("no valid candidates for AI analysis".into()),
-            None,
-            Vec::new(),
-        );
+        return AiEnhanceOutcome::fallback("no valid candidates for AI analysis");
     }
 
     let provider_identity = gateway.provider_cache_identity();
@@ -3373,12 +3445,14 @@ async fn enhance_natural_language_with_ai(
                         } else {
                             Some(validated.summary)
                         };
-                        return (
-                            AiStatus::Cached,
-                            None,
+                        return AiEnhanceOutcome {
+                            status: AiStatus::Cached,
                             summary,
-                            validated.summary_evidence_ids,
-                        );
+                            summary_evidence_ids: validated.summary_evidence_ids,
+                            model: Some(entry.model),
+                            route_version: Some(route_version),
+                            ..AiEnhanceOutcome::default()
+                        };
                     }
                     Err(error) => {
                         tracing::warn!(%error, "AI response cache entry failed validation");
@@ -3419,15 +3493,8 @@ async fn enhance_natural_language_with_ai(
         match quota.limiter.try_acquire(&quota.user_id) {
             Some(permit) => Some(permit),
             None => {
-                return (
-                    AiStatus::Fallback,
-                    Some(
-                        mpgs_ai::AiError::BudgetExhausted
-                            .fallback_reason()
-                            .to_owned(),
-                    ),
-                    None,
-                    Vec::new(),
+                return AiEnhanceOutcome::fallback(
+                    mpgs_ai::AiError::BudgetExhausted.fallback_reason(),
                 );
             }
         }
@@ -3436,12 +3503,7 @@ async fn enhance_natural_language_with_ai(
     };
     if let Some(quota) = builtin_quota {
         let Some(repo) = repo else {
-            return (
-                AiStatus::Fallback,
-                Some(mpgs_ai::AiError::Disabled.fallback_reason().to_owned()),
-                None,
-                Vec::new(),
-            );
+            return AiEnhanceOutcome::fallback(mpgs_ai::AiError::Disabled.fallback_reason());
         };
         let user_id = quota.user_id.clone();
         let day_utc = chrono_like_now_ms() / 86_400_000;
@@ -3453,40 +3515,30 @@ async fn enhance_natural_language_with_ai(
         {
             Ok(Some(_)) => {}
             Ok(None) => {
-                return (
-                    AiStatus::Fallback,
-                    Some(
-                        mpgs_ai::AiError::BudgetExhausted
-                            .fallback_reason()
-                            .to_owned(),
-                    ),
-                    None,
-                    Vec::new(),
+                return AiEnhanceOutcome::fallback(
+                    mpgs_ai::AiError::BudgetExhausted.fallback_reason(),
                 );
             }
             Err(_) => {
-                return (
-                    AiStatus::Fallback,
-                    Some("AI account quota is temporarily unavailable; deterministic recommendations are shown".to_owned()),
-                    None,
-                    Vec::new(),
+                return AiEnhanceOutcome::fallback(
+                    "AI account quota is temporarily unavailable; deterministic recommendations are shown",
                 );
             }
         }
     }
 
-    let response = match run_rank_completion(gateway, task_router, request).await {
-        Ok(response) => response,
-        Err(error) => {
-            return (
-                AiStatus::Fallback,
-                Some(safe_ai_failure_reason(&error)),
-                None,
-                Vec::new(),
-            );
-        }
-    };
+    let (response, used_model_fallback, attempted_models) =
+        match run_rank_completion(gateway, task_router, request).await {
+            Ok(result) => result,
+            Err(error) => {
+                return AiEnhanceOutcome::fallback(safe_ai_failure_reason(&error));
+            }
+        };
     tracing::info!(
+        model = %response.model,
+        protocol = ?response.protocol,
+        used_model_fallback,
+        ?attempted_models,
         prompt_cache_hit_tokens = ?response.prompt_cache_hit_tokens,
         prompt_cache_miss_tokens = ?response.prompt_cache_miss_tokens,
         "AI provider prompt-cache usage"
@@ -3499,12 +3551,7 @@ async fn enhance_natural_language_with_ai(
     ) {
         Ok(result) => result,
         Err(error) => {
-            return (
-                AiStatus::Fallback,
-                Some(safe_ai_failure_reason(&error)),
-                None,
-                Vec::new(),
-            );
+            return AiEnhanceOutcome::fallback(safe_ai_failure_reason(&error));
         }
     };
 
@@ -3553,12 +3600,17 @@ async fn enhance_natural_language_with_ai(
     } else {
         Some(validated.summary)
     };
-    (
-        AiStatus::Used,
-        degraded_notice,
+    AiEnhanceOutcome {
+        status: AiStatus::Used,
+        fallback_reason: degraded_notice,
         summary,
-        validated.summary_evidence_ids,
-    )
+        summary_evidence_ids: validated.summary_evidence_ids,
+        model: Some(response.model),
+        protocol: response.protocol.map(|p| p.as_str().to_owned()),
+        route_version: Some(route_version),
+        used_model_fallback,
+        attempted_models,
+    }
 }
 
 fn safe_ai_failure_reason(error: &AiError) -> String {
@@ -3715,16 +3767,21 @@ async fn run_rank_completion(
     gateway: &AiGateway,
     task_router: Option<&TaskRouter>,
     request: StructuredRequest,
-) -> Result<mpgs_ai::StructuredResponse, AiError> {
+) -> Result<(mpgs_ai::StructuredResponse, bool, Vec<String>), AiError> {
     if let Some(router) = task_router
         && router.is_available()
     {
-        return router
-            .structured_completion(request)
-            .await
-            .map(|routed| routed.response);
+        let routed = router.structured_completion(request).await?;
+        return Ok((
+            routed.response,
+            routed.used_fallback,
+            routed.attempted_models,
+        ));
     }
-    gateway.structured_completion(request).await
+    gateway
+        .structured_completion(request)
+        .await
+        .map(|response| (response, false, Vec::new()))
 }
 
 fn new_analysis_id() -> String {
@@ -3915,43 +3972,52 @@ async fn enhance_progressive_analysis_in_background(
         .task_router
         .is_available()
         .then_some(state.task_router.as_ref());
-    let (ai_status, fallback_reason, ai_summary, ai_summary_evidence_ids) =
-        enhance_natural_language_with_ai(
-            &state.ai,
-            router,
-            Some(repo),
-            "progressive",
-            &query,
-            &mut items,
-            None,
-        )
-        .await;
+    let enhance = enhance_natural_language_with_ai(
+        &state.ai,
+        router,
+        Some(repo),
+        "progressive",
+        &query,
+        &mut items,
+        None,
+    )
+    .await;
     let now_ms = chrono_like_now_ms();
     let result = json!({
         "items": items,
-        "ai_status": ai_status.as_str(),
-        "fallback_reason": fallback_reason,
-        "ai_summary": ai_summary,
-        "ai_summary_evidence_ids": ai_summary_evidence_ids,
+        "ai_status": enhance.status.as_str(),
+        "fallback_reason": enhance.fallback_reason,
+        "ai_summary": enhance.summary,
+        "ai_summary_evidence_ids": enhance.summary_evidence_ids,
         "ai_provider": state.ai.provider_name(),
+        "ai_model": enhance.model,
+        "ai_protocol": enhance.protocol,
+        "ai_route_version": enhance.route_version,
+        "ai_used_model_fallback": enhance.used_model_fallback,
+        "ai_attempted_models": enhance.attempted_models,
     });
     let result_json = result.to_string();
-    let status = ai_status.as_str().to_owned();
+    let status = enhance.status.as_str().to_owned();
     let update = mpgs_storage::CompleteProgressiveAnalysis {
         analysis_id: analysis_id.clone(),
         status,
         provider: Some(state.ai.provider_name().to_owned()),
-        model: None,
-        protocol: None,
-        route_version: Some(
-            state
-                .task_router
-                .route_version(AiTaskType::RankExplain)
-                .to_owned(),
-        ),
+        model: enhance.model.clone(),
+        protocol: enhance.protocol.clone(),
+        route_version: enhance.route_version.or_else(|| {
+            Some(
+                state
+                    .task_router
+                    .route_version(AiTaskType::RankExplain)
+                    .to_owned(),
+            )
+        }),
         result_json: Some(result_json),
-        error_category: fallback_reason.as_ref().map(|_| "ai_fallback".into()),
-        fallback_reason,
+        error_category: enhance
+            .fallback_reason
+            .as_ref()
+            .map(|_| "ai_fallback".into()),
+        fallback_reason: enhance.fallback_reason,
         completed_at_ms: now_ms,
     };
     if let Err(error) = storage_result(repo, move |repo| {
@@ -3961,7 +4027,12 @@ async fn enhance_progressive_analysis_in_background(
     {
         tracing::warn!(%analysis_id, %error, "progressive AI enhancement persistence failed");
     } else {
-        tracing::info!(%analysis_id, status = ai_status.as_str(), "progressive AI enhancement completed");
+        tracing::info!(
+            %analysis_id,
+            status = enhance.status.as_str(),
+            model = ?enhance.model,
+            "progressive AI enhancement completed"
+        );
     }
 }
 

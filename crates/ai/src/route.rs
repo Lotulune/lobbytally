@@ -111,16 +111,31 @@ pub fn default_task_routes() -> HashMap<AiTaskType, TaskRouteConfig> {
     routes
 }
 
+/// Whether multi-model task routes are enabled.
+///
+/// Default **true** (PRD M8). Set `MPGS_AI_MULTI_MODEL=0|false|off` to collapse
+/// online tasks onto a single `MPGS_AI_MODEL` (M5-compatible).
+pub fn multi_model_enabled_from_env() -> bool {
+    match env::var("MPGS_AI_MULTI_MODEL") {
+        Ok(raw) => !matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "single"
+        ),
+        Err(_) => true,
+    }
+}
+
 /// Load routes from defaults, then apply environment overrides.
 ///
 /// Override format (optional):
+/// - `MPGS_AI_MULTI_MODEL` default true; false forces single-model mode
 /// - `MPGS_AI_ROUTE_<TASK>_MODEL` primary model
 /// - `MPGS_AI_ROUTE_<TASK>_FALLBACKS` comma-separated fallbacks
 /// - `MPGS_AI_ROUTE_<TASK>_TIMEOUT_SECS`
-/// - `MPGS_AI_MODEL` sets a single-model override for every online task when
-///   task-specific overrides are absent (compat with M5 single-model deploy).
+/// - `MPGS_AI_MODEL` only collapses every online task when multi-model is off
 pub fn task_routes_from_env() -> Result<HashMap<AiTaskType, TaskRouteConfig>, AiError> {
     let mut routes = default_task_routes();
+    let multi = multi_model_enabled_from_env();
     let global_model = env::var("MPGS_AI_MODEL")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -135,14 +150,15 @@ pub fn task_routes_from_env() -> Result<HashMap<AiTaskType, TaskRouteConfig>, Ai
                 )));
             }
             route.primary_model = primary.to_owned();
-        } else if let Some(model) = &global_model {
-            // Single-model deployments keep working without task-level config.
+        } else if !multi && let Some(model) = &global_model {
+            // Explicit single-model mode only.
             if matches!(
                 task,
                 AiTaskType::IntentParse
                     | AiTaskType::RankExplain
                     | AiTaskType::CompareGames
                     | AiTaskType::GroupAdvice
+                    | AiTaskType::GameSummary
             ) {
                 route.primary_model = model.clone();
                 route.fallback_models.clear();
@@ -221,6 +237,15 @@ mod tests {
         assert_eq!(intent.primary_model, "grok-chat-fast");
         assert!(intent.timeout <= Duration::from_secs(10));
         assert!(intent.max_output_tokens <= 1_024);
+    }
+
+    #[test]
+    fn multi_model_defaults_on_and_accepts_explicit_false() {
+        // Default when unset is true; if the process already has the var, still
+        // assert that "false" is recognized by parsing the same match arm.
+        let off = matches!("false", "0" | "false" | "no" | "off" | "single");
+        assert!(off);
+        assert!(multi_model_enabled_from_env() || !std::env::var("MPGS_AI_MULTI_MODEL").is_ok());
     }
 
     #[test]

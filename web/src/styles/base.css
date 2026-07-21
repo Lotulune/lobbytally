@@ -1645,6 +1645,24 @@ body::before {
   background: var(--danger);
 }
 
+.ai-route-list {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+.ai-route-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+}
+.ai-route-row strong {
+  min-width: 7.5rem;
+  font-weight: 600;
+}
 .ai-statusline {
   margin-top: 14px;
 }

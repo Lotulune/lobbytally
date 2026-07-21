@@ -55,8 +55,10 @@ pub use openai_compat::{
 pub use provider::{
     AiProvider, DisabledProvider, EmbeddingProvider, FakeProvider, HashEmbeddingProvider,
 };
-pub use route::{DEFAULT_ROUTE_VERSION, default_task_routes, task_routes_from_env};
-pub use router::{RouterPolicy, TaskRouter};
+pub use route::{
+    DEFAULT_ROUTE_VERSION, default_task_routes, multi_model_enabled_from_env, task_routes_from_env,
+};
+pub use router::{RouterPolicy, TaskRouteSnapshot, TaskRouter};
 pub use sanitize::{sanitize_untrusted_text, wrap_untrusted_data_block};
 pub use summary::{
     GameAiSummary, SUMMARY_PROMPT_VERSION, game_summary_schema, game_summary_system_prompt,

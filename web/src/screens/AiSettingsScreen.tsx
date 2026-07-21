@@ -190,11 +190,53 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
           ))}
         </div>
         {mode === "builtin" && (
-          <div className="statusline ai-statusline">
-            <span className={settings.builtin.available ? "chip ok" : "chip danger"}>{settings.builtin.available ? "可用" : "不可用"}</span>
-            <span className="chip">{settings.builtin.model}</span>
-            {settings.builtin.daily_remaining !== null && <span className="chip">剩余 {settings.builtin.daily_remaining}</span>}
-          </div>
+          <>
+            <div className="statusline ai-statusline">
+              <span className={settings.builtin.available ? "chip ok" : "chip danger"}>
+                {settings.builtin.available ? "可用" : "不可用"}
+              </span>
+              <span className="chip">
+                {settings.builtin.multi_model ? "多模型路由" : "单模型"}
+              </span>
+              {settings.builtin.provider && <span className="chip">{settings.builtin.provider}</span>}
+              {!settings.builtin.multi_model && settings.builtin.model && (
+                <span className="chip">{settings.builtin.model}</span>
+              )}
+              {settings.builtin.daily_remaining !== null && (
+                <span className="chip">剩余 {settings.builtin.daily_remaining}</span>
+              )}
+            </div>
+            {settings.builtin.routes && settings.builtin.routes.length > 0 && (
+              <div className="ai-routes" aria-label="内置任务模型路由">
+                <p className="cal-note">
+                  内置 AI 按任务选择模型（主模型 → 回退链）。自定义 API 仍为单模型，不会写入服务端路由表。
+                </p>
+                <ul className="ai-route-list">
+                  {settings.builtin.routes
+                    .filter((r) => r.enabled)
+                    .map((route) => (
+                      <li key={route.task} className="ai-route-row">
+                        <strong>{route.task}</strong>
+                        <span className="chip accent" title={route.primary_available ? "上游可用" : "上游未发现"}>
+                          {route.primary_model}
+                        </span>
+                        {route.fallback_models.length > 0 && (
+                          <span className="chip" title="回退链">
+                            → {route.fallback_models.join(" → ")}
+                          </span>
+                        )}
+                      </li>
+                    ))}
+                </ul>
+                {settings.builtin.discovered_models && settings.builtin.discovered_models.length > 0 && (
+                  <p className="cal-note">
+                    上游已发现：{settings.builtin.discovered_models.slice(0, 12).join(", ")}
+                    {settings.builtin.discovered_models.length > 12 ? "…" : ""}
+                  </p>
+                )}
+              </div>
+            )}
+          </>
         )}
         {mode === "custom" && (
           <div className="stack-form ai-custom-form">

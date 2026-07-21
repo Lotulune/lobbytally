@@ -115,6 +115,10 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
             {result.ai_provider && result.ai_provider !== "disabled" && (
               <span className="chip">Provider: {result.ai_provider}</span>
             )}
+            {result.ai_model && <span className="chip accent">模型 {result.ai_model}</span>}
+            {result.ai_multi_model && <span className="chip">多模型路由</span>}
+            {result.ai_used_model_fallback && <span className="chip warn">已走回退模型</span>}
+            {result.ai_protocol && <span className="chip">{result.ai_protocol}</span>}
             {result.ai_latency_ms !== undefined && (
               <span className="chip">AI 阶段 {result.ai_latency_ms} ms</span>
             )}

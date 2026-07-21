@@ -18,6 +18,21 @@ use crate::types::{
     AiTaskType, ApiProtocol, ModelCapabilities, RoutedCompletion, StructuredRequest,
     TaskRouteConfig,
 };
+use serde::{Deserialize, Serialize};
+
+/// Serializable task route for admin/settings UIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRouteSnapshot {
+    pub task: String,
+    pub primary_model: String,
+    pub fallback_models: Vec<String>,
+    pub protocol_preference: Vec<String>,
+    pub timeout_ms: u64,
+    pub max_output_tokens: u32,
+    pub enabled: bool,
+    pub route_version: String,
+    pub primary_available: bool,
+}
 
 /// Runtime budget + breaker policy applied around each model attempt.
 #[derive(Debug, Clone)]
@@ -126,11 +141,65 @@ impl TaskRouter {
         self.routes.get(&task)
     }
 
+    pub fn routes(&self) -> &HashMap<AiTaskType, TaskRouteConfig> {
+        &self.routes
+    }
+
     pub fn route_version(&self, task: AiTaskType) -> &str {
         self.routes
             .get(&task)
             .map(|r| r.route_version.as_str())
             .unwrap_or(crate::route::DEFAULT_ROUTE_VERSION)
+    }
+
+    /// Public snapshot for settings/meta UIs (no secrets).
+    pub fn route_snapshot(&self) -> Vec<TaskRouteSnapshot> {
+        let mut rows: Vec<_> = self
+            .routes
+            .values()
+            .map(|route| {
+                let allowed = self.registry.is_model_allowed(&route.primary_model);
+                TaskRouteSnapshot {
+                    task: route.task.as_str().to_owned(),
+                    primary_model: route.primary_model.clone(),
+                    fallback_models: route.fallback_models.clone(),
+                    protocol_preference: route
+                        .protocol_preference
+                        .iter()
+                        .map(|p| p.as_str().to_owned())
+                        .collect(),
+                    timeout_ms: route.timeout.as_millis() as u64,
+                    max_output_tokens: route.max_output_tokens,
+                    enabled: route.enabled,
+                    route_version: route.route_version.clone(),
+                    primary_available: allowed,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.task.cmp(&b.task));
+        rows
+    }
+
+    pub fn multi_model_active(&self) -> bool {
+        let online: Vec<_> = self
+            .routes
+            .values()
+            .filter(|r| {
+                matches!(
+                    r.task,
+                    AiTaskType::IntentParse
+                        | AiTaskType::RankExplain
+                        | AiTaskType::CompareGames
+                        | AiTaskType::GroupAdvice
+                ) && r.enabled
+            })
+            .collect();
+        if online.is_empty() {
+            return false;
+        }
+        let first = online[0].primary_model.as_str();
+        online.iter().any(|r| r.primary_model != first)
+            || online.iter().any(|r| !r.fallback_models.is_empty())
     }
 
     /// Refresh model availability from the upstream provider (`/v1/models`).
