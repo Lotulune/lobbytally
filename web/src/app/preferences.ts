@@ -2,7 +2,7 @@
 // settings screen only PUTs when something actually differs.
 
 import type { StorageLike, UserPreferences } from "../api/types";
-import { getClientStorage } from "../api/storage";
+import { getServiceStorage } from "../api/storage";
 
 const PENDING_PREFERENCES_KEY = "mpgs.preferences.pending.v1";
 
@@ -101,7 +101,7 @@ export function toggleMember(list: string[], id: string): string[] {
 /** Persist a preference edit before attempting network I/O. */
 export function queuePreferencePatch(
   patch: PendingPreferencesPatch,
-  storage: StorageLike = getClientStorage(),
+  storage: StorageLike = getServiceStorage(),
 ): boolean {
   try {
     storage.setItem(PENDING_PREFERENCES_KEY, JSON.stringify(patch));
@@ -112,7 +112,7 @@ export function queuePreferencePatch(
 }
 
 export function hasPendingPreferencePatch(
-  storage: StorageLike = getClientStorage(),
+  storage: StorageLike = getServiceStorage(),
 ): boolean {
   try {
     return storage.getItem(PENDING_PREFERENCES_KEY) !== null;
@@ -136,7 +136,7 @@ function loadPendingPreferencePatch(storage: StorageLike): PendingPreferencesPat
 
 export function applyPendingPreferencePatch(
   preferences: UserPreferences,
-  storage: StorageLike = getClientStorage(),
+  storage: StorageLike = getServiceStorage(),
 ): UserPreferences {
   const patch = loadPendingPreferencePatch(storage);
   return patch ? { ...preferences, ...patch, version: preferences.version } : preferences;
@@ -145,7 +145,7 @@ export function applyPendingPreferencePatch(
 /** Merge the locally queued edit onto the latest server version, then clear it. */
 export async function flushPendingPreferencePatch(
   api: PreferencesApi,
-  storage: StorageLike = getClientStorage(),
+  storage: StorageLike = getServiceStorage(),
 ): Promise<UserPreferences | null> {
   const patch = loadPendingPreferencePatch(storage);
   if (!patch) return null;

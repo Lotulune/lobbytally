@@ -97,6 +97,25 @@ AI 失败通常不返回 5xx，而是以成功响应中的 `ai_status=fallback` 
 
 ## 6. 健康与元数据
 
+### `GET /.well-known/mpgs`
+
+桌面客户端只持有服务 Origin 时使用的无认证发现端点。该端点不查询数据库，因此即使服务尚未 ready，也能识别 MPGS 服务并返回后续相对路径：
+
+```json
+{
+  "service": "mpgs-server",
+  "discovery_version": 1,
+  "service_version": "0.1.0",
+  "api_version": "v1",
+  "api_base_path": "/v1",
+  "readiness_path": "/health/ready",
+  "openapi_path": "/openapi.json",
+  "authentication": ["anonymous", "account"]
+}
+```
+
+客户端必须验证 `service`、`discovery_version` 和 `api_version`，忽略未知字段，并始终在用户输入且已验证的 Origin 上解析相对路径。不得接受发现响应把请求切换到另一个 Origin。完整连接流程见 [C/S 架构强化 PRD](PRD_CS.md)。
+
 ### `GET /health/live`
 
 只表示进程可响应，不检查外部依赖。

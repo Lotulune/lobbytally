@@ -47,7 +47,7 @@ curl -sS http://127.0.0.1:8080/health/ready
 
 ### 2.4 反向代理
 
-服务默认只监听本机。对外暴露时在前面放置 TLS 终止代理，并仅在入口清洗转发头后才设置 `MPGS_TRUST_PROXY_HEADERS=true`。
+服务默认只监听本机。对外暴露时在前面放置 TLS 终止代理，并仅在入口清洗转发头后才设置 `MPGS_TRUST_PROXY_HEADERS=true`。Docker 后端模式使用 `deploy/mpgs-api-host.nginx.conf` 反代到 `127.0.0.1:18081`；完整模式使用 `deploy/mpgs-host.nginx.conf` 反代到 Web 网关 `127.0.0.1:18082`。
 
 ## 3. 日常运维
 
@@ -55,6 +55,7 @@ curl -sS http://127.0.0.1:8080/health/ready
 
 - `GET /health/live`：进程存活。
 - `GET /health/ready`：迁移版本 + 数据库可读 + 最小目录就绪。
+- `GET /.well-known/mpgs`：客户端连接发现，不依赖数据库状态。
 - `GET /v1/meta`：版本、算法配置、schema、build SHA、数据新鲜度。
 
 ### 3.2 备份
@@ -101,7 +102,19 @@ mpgs-dbtool m7-data-audit <db> --allow-upcoming-shortfall='官方目录当日新
 
 ### 3.5 Docker / Compose
 
-`deploy/docker-compose.yml` 包含 `mpgs-server`、静态 Web 网关 `mpgs-web` 和周期执行租约任务的 `mpgs-worker`。SQLite 与头像通过同一宿主机目录挂载到 `/var/lib/mpgs`，不得改成网络共享卷。
+`deploy/docker-compose.yml` 包含 `mpgs-server`、可选静态 Web 网关 `mpgs-web` 和周期执行租约任务的 `mpgs-worker`。SQLite 与头像通过同一宿主机目录挂载到 `/var/lib/mpgs`，不得改成网络共享卷。
+
+复制环境模板后，在 `deploy/.env` 选择部署模式：
+
+```dotenv
+# 只运行 API + worker，通过 127.0.0.1:18081 反代
+MPGS_DEPLOY_MODE=backend
+
+# 或运行 API + worker + Web UI，通过 127.0.0.1:18082 反代
+MPGS_DEPLOY_MODE=full
+```
+
+生产默认保留 `full` 以兼容现有站点。只面向桌面客户端的新安装建议使用 `backend`。切换模式后执行 `deploy/update.sh`，脚本只拉取并启动该模式所需服务，`--remove-orphans` 会移除上一模式多出的容器。
 
 ```bash
 cp deploy/mpgs.env.example deploy/mpgs.env
@@ -109,6 +122,18 @@ chmod 600 deploy/mpgs.env
 docker compose -f deploy/docker-compose.yml up -d --build
 docker compose -f deploy/docker-compose.yml exec mpgs-server \
   mpgs-dbtool integrity /var/lib/mpgs/mpgs.db
+```
+
+直接使用 Compose 开发构建时，可显式选择服务：
+
+```bash
+# 后端，不启动 mpgs-web
+docker compose -f deploy/docker-compose.yml up -d --build mpgs-server mpgs-worker
+curl http://127.0.0.1:18081/.well-known/mpgs
+
+# 完整安装
+docker compose -f deploy/docker-compose.yml up -d --build
+curl http://127.0.0.1:18082/.well-known/mpgs
 ```
 
 迁移已有数据库时，先使用 `mpgs-dbtool backup <source> <backup>` 生成一致性副本，再把副本放到 `deploy/runtime/mpgs.db`。worker 默认每 60 秒领取一次任务；没有 `MPGS_STEAM_WEB_API_KEY` 时官方 AppList 同步保持禁用，但候选发现、商店详情、评价和 CCU 富化仍会执行。连续 7 天采集完成前，`m7-data-audit` 返回失败属于预期状态。
@@ -123,7 +148,7 @@ docker login ghcr.io
 ./deploy/update.sh
 ```
 
-`deploy/update.sh` 在源码目录是 Git checkout 时只允许 fast-forward 拉取；压缩包部署则跳过源码更新、直接拉镜像。它使用 `docker compose pull` 与 `up --no-build`，随后运行数据库完整性和 HTTP 健康检查。运行时密钥只保存在 `deploy/mpgs.env`，不得放入 `deploy/.env`、GitHub workflow 或镜像标签。
+`deploy/update.sh` 在源码目录是 Git checkout 时只允许 fast-forward 拉取；压缩包部署则跳过源码更新、直接拉镜像。它读取管理员维护的 `deploy/.env`，按 `MPGS_DEPLOY_MODE` 使用 `docker compose pull` 与 `up --no-build`，随后运行数据库完整性和对应入口的 HTTP 健康检查。运行时密钥只保存在 `deploy/mpgs.env`，不得放入 `deploy/.env`、GitHub workflow 或镜像标签。
 
 内置 AI 使用 OpenAI-compatible Provider 时配置 `MPGS_AI_PROVIDER=openai_compat`、`MPGS_AI_BASE_URL`、`MPGS_AI_API_KEY`、`MPGS_AI_MODEL` 和 `MPGS_AI_TIMEOUT_SECS`。Embedding 默认使用本地 `hash`，只有确认上游提供兼容 Embedding 接口时才切换为 `openai_compat`。AI 失败会回退到确定性推荐；更换模型后需重启 `mpgs-server`，并应先用 `/v1/meta` 和一条自然语言推荐请求验证 `ai_available`、`ai_status` 与延迟。
 

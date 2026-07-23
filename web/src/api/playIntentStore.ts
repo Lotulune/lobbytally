@@ -6,7 +6,7 @@
 // cache so clearing cache never drops an unsynced vote.
 
 import { ApiClient, ApiError } from "./client";
-import { getClientStorage } from "./storage";
+import { getServiceStorage } from "./storage";
 import type { StorageLike } from "./types";
 
 const STORE_KEY = "mpgs.playintent.v1";
@@ -32,7 +32,7 @@ export class PlayIntentStore {
   private listeners = new Set<PlayIntentListener>();
   private syncPromises = new Map<number, Promise<void>>();
 
-  constructor(client: ApiClient, storage: StorageLike = getClientStorage()) {
+  constructor(client: ApiClient, storage: StorageLike = getServiceStorage()) {
     this.client = client;
     this.storage = storage;
     this.load();

@@ -12,7 +12,7 @@ export async function readRuntime() {
 export async function stopSeedServer() {
   const runtime = await readRuntime();
   if (runtime.serverStopped) return;
-  const healthUrl = runtime.serverHealthUrl ?? "http://127.0.0.1:8080/health/live";
+  const healthUrl = runtime.serverHealthUrl ?? "http://127.0.0.1:17880/health/live";
 
   try {
     process.kill(runtime.serverPid, "SIGTERM");

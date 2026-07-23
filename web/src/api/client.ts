@@ -254,6 +254,8 @@ export class ApiClient {
         method,
         headers,
         body: args.body === undefined ? null : JSON.stringify(args.body),
+        // Tokens must never follow a cross-origin redirect (CS-008).
+        redirect: "manual",
       });
     } catch (cause) {
       throw new ApiError({
@@ -261,6 +263,22 @@ export class ApiClient {
         status: 0,
         message: cause instanceof Error ? cause.message : "network request failed",
         offline: true,
+      });
+    }
+    // 304 is not a redirect; only refuse true redirect statuses (CS-008).
+    const redirected =
+      response.type === "opaqueredirect" ||
+      response.status === 301 ||
+      response.status === 302 ||
+      response.status === 303 ||
+      response.status === 307 ||
+      response.status === 308;
+    if (redirected) {
+      throw new ApiError({
+        code: "network",
+        status: response.status,
+        message: "server redirected the request; refusing to follow with credentials",
+        offline: false,
       });
     }
     if (response.status === 401 && args.auth) {
@@ -274,6 +292,7 @@ export class ApiClient {
             method,
             headers,
             body: args.body === undefined ? null : JSON.stringify(args.body),
+            redirect: "manual",
           });
         } catch (cause) {
           throw new ApiError({

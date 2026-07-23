@@ -63,10 +63,10 @@ cargo run -p mpgs-server
 运行后验证：
 
 ```powershell
-Invoke-RestMethod 'http://127.0.0.1:8080/health/live'
-Invoke-RestMethod 'http://127.0.0.1:8080/health/ready'
-Invoke-RestMethod 'http://127.0.0.1:8080/v1/meta'
-Invoke-RestMethod 'http://127.0.0.1:8080/openapi.json'
+Invoke-RestMethod 'http://127.0.0.1:17880/health/live'
+Invoke-RestMethod 'http://127.0.0.1:17880/health/ready'
+Invoke-RestMethod 'http://127.0.0.1:17880/v1/meta'
+Invoke-RestMethod 'http://127.0.0.1:17880/openapi.json'
 ```
 
 数据库工具：
@@ -103,10 +103,10 @@ cargo run -p mpgs-dbtool -- restore .\backups\mpgs.db .\data-restored\mpgs.db
 
 2026-07-16 本地审计结果（`data/m3-real.db`）：候选 2091，`recommendation_ready_profiles=50`、`trusted_familiar_profiles=14`、`with_platforms=2091`、`with_languages=2090`、`with_reviews=2091`、`with_ccu=2091`、`with_price=2081`。`with_price` 只统计有实际金额的快照；免费游戏记 0 价，商店未返回币种或金额时不再伪造 USD 价格。数据库中历史 `US/USD` 快照不代表中国区价格覆盖完成，需继续按默认 `CN/schinese` 运行富化刷新。`with_typical_session=0`，典型局时长仍需人工校准。
 
-服务默认绑定 `127.0.0.1:8080`。仅在本地端口冲突时临时设置进程变量：
+服务默认绑定 `127.0.0.1:17880`（刻意避开常见 8080）。仅在本地端口冲突时临时设置进程变量：
 
 ```powershell
-$env:MPGS_BIND_ADDR = '127.0.0.1:8081'
+$env:MPGS_BIND_ADDR = '127.0.0.1:17881'
 cargo run -p mpgs-server
 ```
 
@@ -120,7 +120,7 @@ cargo run -p mpgs-server
 pnpm install
 # 另开终端启动带演示数据的服务端：
 $env:MPGS_SEED_DEMO = 'true'; cargo run -p mpgs-server
-# 浏览器开发（Vite 代理 /v1 到 127.0.0.1:8080）：
+# 浏览器开发（Vite 代理 /v1 到 127.0.0.1:17880）：
 pnpm --filter mpgs-web dev            # http://localhost:5173
 # 校验：
 pnpm --filter mpgs-web typecheck

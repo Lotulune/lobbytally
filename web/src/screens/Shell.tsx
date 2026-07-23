@@ -7,7 +7,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AccountProfile } from "../api/types";
 import { subscribeAccountGate } from "../app/auth";
-import { apiClient, feedbackQueue } from "../app/runtime";
+import { getConnectionManager, type ConnectionSnapshot } from "../app/connection";
+import { apiClient, feedbackQueue, requiresServiceConnect } from "../app/runtime";
 import { FeedScreen } from "./FeedScreen";
 import { GameDetailScreen } from "./GameDetailScreen";
 import { SearchScreen } from "./SearchScreen";
@@ -29,6 +30,8 @@ export function Shell() {
   const [profile, setProfile] = useState<AccountProfile | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
   const [demoMode, setDemoMode] = useState(false);
+  // Service link health for the offline/maintenance banner (PRD §5.2).
+  const [connection, setConnection] = useState<ConnectionSnapshot | null>(null);
   // Where the game detail returns to (the list the user opened it from).
   const lastListView = useRef<ListView>(DEFAULT_VIEW);
   useEffect(() => {
@@ -58,6 +61,11 @@ export function Shell() {
   }, []);
 
   useEffect(() => subscribeAccountGate(() => setAuthOpen(true)), []);
+
+  useEffect(() => {
+    if (!requiresServiceConnect) return;
+    return getConnectionManager().subscribe(setConnection);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -98,6 +106,23 @@ export function Shell() {
         onAiSettings={() => navigate({ kind: "ai-settings" })}
         onLogout={leaveAccountArea}
       />
+
+      {connection?.status === "offline" && (
+        <div className="connection-banner" role="status">
+          离线模式：暂时无法连接服务，正在展示本机缓存；写操作将在恢复后同步。
+          <button type="button" className="banner-retry" onClick={() => void getConnectionManager().recheck()}>
+            重试连接
+          </button>
+        </div>
+      )}
+      {connection?.status === "maintenance" && (
+        <div className="connection-banner" data-tone="maintenance" role="status">
+          服务维护中：部分功能可能不可用，请稍后再试。
+          <button type="button" className="banner-retry" onClick={() => void getConnectionManager().recheck()}>
+            重新检查
+          </button>
+        </div>
+      )}
 
       <main className="main">
         {view.kind === "feed" && <FeedScreen section={view.section} onOpenGame={openGame} />}

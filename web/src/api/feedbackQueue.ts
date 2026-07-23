@@ -3,7 +3,7 @@
 // drop unsynced user feedback (DEVELOPMENT.md §11).
 
 import { ApiClient, ApiError, newIdempotencyKey } from "./client";
-import { getClientStorage } from "./storage";
+import { getServiceStorage } from "./storage";
 import type { FeedbackRecord, FeedbackType, StorageLike } from "./types";
 
 const QUEUE_KEY = "mpgs.feedback.v1";
@@ -53,7 +53,7 @@ export class FeedbackQueue {
   /** In-flight flush; concurrent callers await the same promise. */
   private flushPromise: Promise<void> | null = null;
 
-  constructor(client: ApiClient, storage: StorageLike = getClientStorage()) {
+  constructor(client: ApiClient, storage: StorageLike = getServiceStorage()) {
     this.client = client;
     this.storage = storage;
     this.load();

@@ -137,6 +137,21 @@ struct ReadyResponse {
     schema_version: Option<i64>,
 }
 
+/// Stable, storage-independent handshake for clients configured with only a
+/// server base URL. Keep paths relative so the same response works behind any
+/// HTTPS reverse proxy without trusting forwarded host headers.
+#[derive(Debug, Serialize, ToSchema)]
+struct ClientDiscoveryResponse {
+    service: &'static str,
+    discovery_version: u8,
+    service_version: &'static str,
+    api_version: &'static str,
+    api_base_path: &'static str,
+    readiness_path: &'static str,
+    openapi_path: &'static str,
+    authentication: [&'static str; 2],
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 struct MetaResponse {
     api_version: &'static str,
@@ -500,6 +515,7 @@ impl utoipa::Modify for SecurityAddon {
         description = "Deterministic friend-group multiplayer game recommendation API"
     ),
     paths(
+        client_discovery,
         health_live,
         health_ready,
         meta,
@@ -535,6 +551,7 @@ impl utoipa::Modify for SecurityAddon {
         set_play_intent
     ),
     components(schemas(
+        ClientDiscoveryResponse,
         HealthResponse,
         ReadyResponse,
         MetaResponse,
@@ -605,6 +622,7 @@ pub fn build_router(state: AppState) -> Router {
     let cors_config = Arc::new(state.cors.clone());
     let state = Arc::new(state);
     Router::new()
+        .route("/.well-known/mpgs", get(client_discovery))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/openapi.json", get(openapi_json))
@@ -681,6 +699,25 @@ pub fn build_router(state: AppState) -> Router {
             crate::cors::middleware,
         ))
         .with_state(state)
+}
+
+#[utoipa::path(
+    get,
+    path = "/.well-known/mpgs",
+    responses((status = 200, description = "MPGS client connection discovery", body = ClientDiscoveryResponse)),
+    tag = "public"
+)]
+async fn client_discovery() -> Json<ClientDiscoveryResponse> {
+    Json(ClientDiscoveryResponse {
+        service: "mpgs-server",
+        discovery_version: 1,
+        service_version: env!("CARGO_PKG_VERSION"),
+        api_version: "v1",
+        api_base_path: "/v1",
+        readiness_path: "/health/ready",
+        openapi_path: "/openapi.json",
+        authentication: ["anonymous", "account"],
+    })
 }
 
 async fn request_id_middleware(mut req: axum::http::Request<Body>, next: Next) -> Response {

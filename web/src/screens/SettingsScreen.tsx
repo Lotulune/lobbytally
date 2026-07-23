@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../api/client";
 import type { UserPreferences } from "../api/types";
 import { requestAccountSignIn } from "../app/auth";
-import { apiClient, feedbackQueue } from "../app/runtime";
+import { apiClient, feedbackQueue, requiresServiceConnect } from "../app/runtime";
 import { useTheme } from "../app/ThemeProvider";
 import { useToast } from "../app/ToastProvider";
 import {
@@ -30,6 +30,7 @@ import { Chip } from "../components/Chip";
 import { Panel } from "../components/Panel";
 import { Skeleton } from "../components/Skeleton";
 import { AiSettingsScreen } from "./AiSettingsScreen";
+import { ServicePanel } from "./ServicePanel";
 
 const PARTY_CHOICES = [2, 3, 4, 5, 6, 8];
 const BUDGET_CHOICES: { label: string; minor: number | null }[] = [
@@ -388,6 +389,8 @@ export function SettingsScreen() {
           </div>
         )}
       </Panel>
+
+      {requiresServiceConnect && <ServicePanel />}
 
       <Panel title="数据与缓存">
         <div className="statusline settings-statusline">

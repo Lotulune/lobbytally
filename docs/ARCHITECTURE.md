@@ -76,10 +76,13 @@ flowchart TB
 
 职责：
 
+- 首次启动要求用户确认 HTTPS 服务地址，并通过 `/.well-known/mpgs`、`/health/ready` 和 `/v1/meta` 完成连接握手。
 - 首次偏好引导、推荐流、日历、搜索、详情和 AI 对话界面。
 - 保存离线推荐快照、静态详情、偏好副本和待同步反馈。
 - 通过 ETag/游标做增量同步。
 - 调用系统浏览器或 Steam 协议链接，不持有 Steam/AI 服务端 Key。
+
+客户端不捆绑或拉起 `mpgs-server`。认证令牌、离线缓存、ETag 和待同步写入必须按规范化服务 Origin 分区，服务切换时不得把旧 Origin 的凭据或数据发送给新 Origin。完整产品流程见 [C/S 架构强化 PRD](PRD_CS.md)。
 
 Tauri Rust 层只暴露明确命令，不提供任意文件读取或任意 HTTP 代理。Tauri capabilities 按最小权限配置。
 
@@ -173,6 +176,8 @@ docs/                     规格与决策
 - 数据目录、日志目录和密钥目录与可执行文件分离；环境模板见 `packaging/common/mpgs.env.example`。
 - 监听地址默认仅本机；正式部署由 HTTPS 反向代理或内建 TLS 终止层暴露。
 - 发布布局由 `scripts/package_server.ps1` 生成，含 `PROVENANCE.json` 与 `SHA256SUMS.txt`（见 [OPERATIONS.md](OPERATIONS.md)）。
+
+服务端部署可选择只运行 API + worker 的 `backend` 模式，也可选择额外提供浏览器 UI 的 `full` 模式。两种模式共享 API 契约与同机 SQLite；Web UI 和桌面客户端都不是后端运行依赖。
 
 ### 6.2 可选采集节点
 

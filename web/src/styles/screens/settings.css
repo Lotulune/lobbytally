@@ -246,3 +246,105 @@
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--danger) 8%, var(--surface));
 }
+
+/* ================= 服务连接页（首次启动） ================= */
+
+/* 复用 .onboarding 的居中骨架；表单卡片限宽与引导页一致 */
+.connect-screen .connect-panel {
+  width: 100%;
+  max-width: 560px;
+  padding: 20px 22px;
+}
+
+.connect-screen .connect-panel .stack-form {
+  max-width: none;
+}
+
+.connect-screen .connect-error {
+  padding: 8px 10px;
+  border: var(--bw) solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+}
+
+.connect-screen .connect-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ================= 设置页：服务管理 ================= */
+
+.settings-screen .service-current {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.settings-screen .service-origin {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.settings-screen .service-known-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.settings-screen .service-known-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  border: var(--bw) solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.settings-screen .service-known-item .service-origin {
+  color: var(--ink-muted);
+}
+
+.settings-screen .service-known-item.current {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+
+.settings-screen .service-known-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 离线 / 维护横幅：Shell 顶部的醒目提示，不阻断只读浏览 */
+.connection-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 7px 14px;
+  border-bottom: var(--bw) solid var(--border);
+  background: color-mix(in srgb, var(--warn, #b8860b) 10%, var(--surface));
+  color: var(--ink);
+  font-size: 12.5px;
+}
+
+.connection-banner[data-tone="maintenance"] {
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+}
+
+.connection-banner .banner-retry {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}

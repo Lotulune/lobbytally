@@ -21,7 +21,8 @@ use crate::api::{AppState, build_router};
 use crate::cors::CorsConfig;
 use crate::rate_limit::RateLimitConfig;
 
-const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+/// Default local bind. 17880 avoids the crowded 8080 range used by many other apps.
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1:17880";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -242,6 +243,19 @@ mod tests {
         test_repo_and_app(RateLimitConfig::default()).1
     }
 
+    fn test_app_without_repo() -> axum::Router {
+        build_router(AppState {
+            repo: None,
+            admin_token: None,
+            rate_limits: RateLimitConfig::default(),
+            cors: CorsConfig::default(),
+            account_ai_limits: AccountAiLimiter::default(),
+            ai: mpgs_ai::AiGateway::disabled(),
+            task_router: test_task_router(),
+            embedding: test_embedding(),
+        })
+    }
+
     #[test]
     fn m6_build_info_matches_compiled_release_metadata() {
         let info = build_info();
@@ -298,6 +312,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-request-id").is_some());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
         assert_eq!(
             response
                 .headers()
@@ -333,6 +355,40 @@ mod tests {
                 .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn client_discovery_is_storage_independent_and_cors_enabled() {
+        let app = test_app_without_repo();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/mpgs")
+                    .header(header::ORIGIN, "http://tauri.localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("http://tauri.localhost")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["service"], "mpgs-server");
+        assert_eq!(document["discovery_version"], 1);
+        assert_eq!(document["api_version"], "v1");
+        assert_eq!(document["api_base_path"], "/v1");
+        assert_eq!(document["readiness_path"], "/health/ready");
+        assert_eq!(document["authentication"][0], "anonymous");
+        assert_eq!(document["authentication"][1], "account");
     }
 
     #[tokio::test]
@@ -1643,6 +1699,7 @@ mod tests {
         let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(document["openapi"], "3.1.0");
         for path in [
+            "/.well-known/mpgs",
             "/health/live",
             "/health/ready",
             "/v1/meta",

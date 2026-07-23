@@ -17,6 +17,9 @@ services:
       MPGS_SEED_DEMO: "false"
     volumes:
       - ./runtime:/var/lib/mpgs
+    ports:
+      # Backend-only deployments terminate TLS on the host and proxy here.
+      - "127.0.0.1:${MPGS_API_PORT:-18081}:8080"
     expose:
       - "8080"
 

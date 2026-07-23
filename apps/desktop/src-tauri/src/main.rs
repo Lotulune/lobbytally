@@ -118,8 +118,13 @@ fn client_data_dir(app: &tauri::App) -> Result<PathBuf, String> {
     app.path().app_data_dir().map_err(|error| error.to_string())
 }
 
+/// Session tokens — including per-service scoped keys — must use the OS keyring.
+fn is_session_storage_key(key: &str) -> bool {
+    key == SESSION_KEY || key.ends_with(".mpgs.session.v1") || key.ends_with(SESSION_KEY)
+}
+
 fn validate_client_key(key: &str) -> Result<(), String> {
-    if key == SESSION_KEY {
+    if is_session_storage_key(key) {
         Err("session tokens must use secure credential storage".to_owned())
     } else if key.starts_with("mpgs.") {
         Ok(())

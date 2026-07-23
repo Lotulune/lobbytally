@@ -20,7 +20,7 @@ apps/desktop/src-tauri/  Tauri 2 壳（独立 cargo workspace，最小权限）
 ## 前置
 
 - Node.js LTS 与 pnpm。
-- 运行客户端前先启动服务端（默认 `http://127.0.0.1:8080`，见 `docs/DEVELOPMENT.md`）。
+- 运行客户端前先启动服务端（默认 `http://127.0.0.1:17880`，见 `docs/DEVELOPMENT.md`）。
 - 打包 Tauri 需要平台 WebView 工具链（Windows: MSVC Build Tools + WebView2；Linux: WebKitGTK 4.1）。
 
 ## 浏览器开发
@@ -29,7 +29,7 @@ apps/desktop/src-tauri/  Tauri 2 壳（独立 cargo workspace，最小权限）
 pnpm install
 # 另开一个终端启动服务端（带演示数据）：
 #   $env:MPGS_SEED_DEMO='true'; cargo run -p mpgs-server
-pnpm --filter mpgs-web dev     # http://localhost:5173，/v1 代理到 127.0.0.1:8080
+pnpm --filter mpgs-web dev     # http://localhost:5173，/v1 代理到 127.0.0.1:17880
 ```
 
 ## 校验
