@@ -131,7 +131,9 @@ body::before {
 
 .window-drag-overlay {
   position: fixed;
-  inset: 0 104px auto 0;
+  /* Leave room for 3×36px controls + gaps + right inset (8px) so drag never
+     sits under the min/max/close hit targets. */
+  inset: 0 128px auto 0;
   z-index: 1100;
   height: 36px;
   user-select: none;

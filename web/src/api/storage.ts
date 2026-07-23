@@ -119,15 +119,36 @@ class SqliteBackedStorage implements StorageLike {
 let activeStorage: StorageLike | null = null;
 let sqliteStorage: SqliteBackedStorage | null = null;
 
+/** Bound how long a stuck IPC write can delay shutdown before we destroy anyway. */
+const CLOSE_FLUSH_TIMEOUT_MS = 2000;
+
 async function installDesktopCloseGuard(): Promise<void> {
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
   const appWindow = getCurrentWindow();
   let closing = false;
   await appWindow.onCloseRequested((event) => {
+    // Always cancel the default close: we must flush SQLite/keyring first, then
+    // force-destroy. Without destroy permission this leaves the window stuck.
     event.preventDefault();
     if (closing) return;
     closing = true;
-    void flushClientStorage().finally(() => appWindow.destroy());
+
+    const flushWithTimeout = Promise.race([
+      flushClientStorage().catch((error: unknown) => {
+        console.error("flush client storage before close failed", error);
+      }),
+      new Promise<void>((resolve) => {
+        window.setTimeout(resolve, CLOSE_FLUSH_TIMEOUT_MS);
+      }),
+    ]);
+
+    void flushWithTimeout.finally(() => {
+      void appWindow.destroy().catch((error: unknown) => {
+        console.error("window destroy after flush failed", error);
+        // Destroy can fail (e.g. missing ACL). Reset so the next close retries.
+        closing = false;
+      });
+    });
   });
 }
 
