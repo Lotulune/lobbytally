@@ -15,7 +15,9 @@ export function App() {
   const [onboarded, setOnboarded] = useState(isOnboarded);
   // The packaged desktop client must connect to a user-confirmed MPGS Server
   // before any business UI (PRD_CS CS-001). Dev/e2e builds skip the gate.
-  const [connected, setConnected] = useState(
+  // Setter intentionally unused: successful connect reloads instead of flipping
+  // this flag in-place (avoids mounting business UI with empty apiClient).
+  const [connected] = useState(
     () => !requiresServiceConnect || activeServiceOrigin !== null,
   );
   const desktop = isTauri();

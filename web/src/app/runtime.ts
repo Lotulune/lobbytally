@@ -12,7 +12,7 @@ import { ApiClient } from "../api/client";
 import { FeedbackQueue } from "../api/feedbackQueue";
 import { PlayIntentStore } from "../api/playIntentStore";
 import { getCurrentServiceOrigin } from "../api/serverOrigin";
-import { activateServiceScope, getClientStorage, getServiceStorage } from "../api/storage";
+import { activateServiceScope, getClientStorage } from "../api/storage";
 import type { StorageLike } from "../api/types";
 import { flushPendingPreferencePatch } from "./preferences";
 

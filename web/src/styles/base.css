@@ -137,49 +137,83 @@ body::before {
   user-select: none;
 }
 
+/* Shell: topbar chrome next to 登录. Per-button hover border (not a group frame). */
 .window-controls {
   display: grid;
   flex: 0 0 auto;
-  grid-template-columns: repeat(3, 34px);
+  grid-template-columns: repeat(3, 36px);
+  gap: 4px;
+  align-items: center;
+  margin-left: 6px;
+  background: transparent;
   user-select: none;
 }
 
+/* Connect / onboarding: no topbar — compact fixed strip. */
 .window-controls.floating,
 .window-controls.elevated {
   position: fixed;
-  top: 2px;
-  right: 2px;
-  /* Above modal (400) / toast (500) so min/max/close stay usable. */
+  top: 8px;
+  right: 8px;
   z-index: 1101;
-  background: color-mix(in srgb, var(--surface) 72%, transparent);
 }
 
 .window-control {
   display: grid;
-  width: 34px;
-  height: 32px;
+  width: 36px;
+  height: 36px;
   padding: 0;
   place-items: center;
-  border: 0;
+  border: var(--bw) solid transparent;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--ink-muted);
   cursor: pointer;
   font: 16px/1 var(--font-body);
+  /* Quiet rest state → soft glow / border fade-in on hover */
+  opacity: 0.72;
+  box-shadow: none;
+  transition:
+    opacity 200ms var(--ease),
+    color 200ms var(--ease),
+    background 220ms var(--ease),
+    border-color 220ms var(--ease),
+    box-shadow 260ms var(--ease),
+    transform 180ms var(--ease);
 }
 
 .window-control:hover {
-  background: var(--surface-hover);
+  opacity: 1;
   color: var(--ink);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface-2));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent),
+    0 0 14px color-mix(in srgb, var(--accent) 28%, transparent);
+  transform: translateY(-0.5px);
 }
 
 .window-control.close:hover {
-  background: var(--danger);
   color: #fff;
+  border-color: color-mix(in srgb, var(--danger) 70%, var(--border));
+  background: color-mix(in srgb, var(--danger) 82%, var(--surface));
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--danger) 30%, transparent),
+    0 0 14px color-mix(in srgb, var(--danger) 35%, transparent);
+}
+
+.window-control:active {
+  transform: translateY(0) scale(0.96);
+  transition-duration: 80ms;
 }
 
 .window-control:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
+  opacity: 1;
+  outline: none;
+  border-color: var(--accent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent),
+    0 0 12px color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 /* FX canvas layers */
