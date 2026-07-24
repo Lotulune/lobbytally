@@ -1828,6 +1828,94 @@ fn feed_sections_use_earliest_known_release_date() {
 }
 
 #[test]
+fn media_backfill_is_coverage_gated_and_attempt_limited() {
+    let (repo, clock) = repo_with_clock(100_000);
+    // Seed two multiplayer candidates via store ingest with categories.
+    for (app_id, name) in [(10_u32, "Game A"), (20, "Game B")] {
+        let raw = RawResponse::validate(
+            200,
+            format!(
+                r#"{{"{app_id}":{{"success":true,"data":{{"steam_appid":{app_id},"type":"game","name":"{name}","categories":[{{"description":"Online Co-op"}}],"header_image":"https://shared.akamai.steamstatic.com/h.jpg"}}}}}}"#
+            )
+            .into_bytes(),
+            Some("application/json".into()),
+            4096,
+        )
+        .unwrap();
+        let parsed = parse_store_details(&StoreDetailsRequest::new(app_id), &raw).unwrap();
+        repo.ingest_store_details(&parsed.details, &parsed.relations)
+            .unwrap();
+    }
+    // No media assets yet → coverage 0, backfill due.
+    let stats = repo.media_coverage_stats().unwrap();
+    assert_eq!(stats.candidate_apps, 2);
+    assert_eq!(stats.apps_with_media, 0);
+    assert!(stats.coverage_ratio < 0.1);
+
+    let policy = crate::MediaBackfillPolicy {
+        enabled: true,
+        coverage_threshold: 0.95,
+        max_attempts: 2,
+        cooldown_ms: 60_000,
+    };
+    let filter = crate::EnrichmentNeedFilter {
+        store: false,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: true,
+    };
+    let due = repo
+        .list_enrichment_targets_after_filtered_with_media(10, None, "CN", "schinese", filter, policy)
+        .unwrap();
+    assert_eq!(due.len(), 2);
+    assert!(due.iter().all(|t| t.needs_media_backfill));
+
+    // Above threshold → no backfill work.
+    let high_threshold = crate::MediaBackfillPolicy {
+        coverage_threshold: 0.0, // always "covered enough" when threshold is 0... wait, coverage 0 < 0 is false
+        ..policy
+    };
+    // coverage_ratio 0.0 + eps < 0.0 is false, so want_media = 0
+    let none = repo
+        .list_enrichment_targets_after_filtered_with_media(
+            10,
+            None,
+            "CN",
+            "schinese",
+            filter,
+            high_threshold,
+        )
+        .unwrap();
+    assert!(none.iter().all(|t| !t.needs_media_backfill));
+
+    // Attempt limits: mark exhausted.
+    repo.begin_media_backfill_attempt(10).unwrap();
+    repo.finish_media_backfill_attempt(10, crate::MediaBackfillOutcome::Failed, 2)
+        .unwrap();
+    repo.begin_media_backfill_attempt(10).unwrap();
+    repo.finish_media_backfill_attempt(10, crate::MediaBackfillOutcome::Failed, 2)
+        .unwrap();
+    clock.advance_ms(120_000);
+    let after_fail = repo
+        .list_enrichment_targets_after_filtered_with_media(10, None, "CN", "schinese", filter, policy)
+        .unwrap();
+    assert!(!after_fail.iter().any(|t| t.app_id == 10 && t.needs_media_backfill));
+    assert!(after_fail.iter().any(|t| t.app_id == 20 && t.needs_media_backfill));
+
+    // Terminal none stops retries.
+    repo.begin_media_backfill_attempt(20).unwrap();
+    repo.finish_media_backfill_attempt(20, crate::MediaBackfillOutcome::NoneAvailable, 2)
+        .unwrap();
+    clock.advance_ms(120_000);
+    let after_none = repo
+        .list_enrichment_targets_after_filtered_with_media(10, None, "CN", "schinese", filter, policy)
+        .unwrap();
+    assert!(!after_none.iter().any(|t| t.needs_media_backfill));
+}
+
+#[test]
 fn store_media_gallery_ingest_replace_preserve_and_clear() {
     let (repo, clock) = repo_with_clock(50_000);
     let raw = RawResponse::validate(

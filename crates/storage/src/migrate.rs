@@ -84,6 +84,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0016_steam_media_gallery",
         include_str!("../../../migrations/0016_steam_media_gallery.sql"),
     ),
+    (
+        17,
+        "0017_media_backfill_state",
+        include_str!("../../../migrations/0017_media_backfill_state.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {

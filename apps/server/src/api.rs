@@ -4871,6 +4871,7 @@ async fn start_bootstrap(
                 review_excerpts: false,
                 ccu: false,
                 price: false,
+                media_backfill: false,
             },
         )
     })

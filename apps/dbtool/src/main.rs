@@ -53,6 +53,45 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+/// Explicit disable via `0/false/off`; default is enabled when unset.
+fn env_flag_default_true(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+fn configured_media_backfill_policy() -> mpgs_storage::MediaBackfillPolicy {
+    let defaults = mpgs_storage::MediaBackfillPolicy::DEFAULT;
+    if !env_flag_default_true("MPGS_MEDIA_BACKFILL_ENABLED") {
+        return mpgs_storage::MediaBackfillPolicy::DISABLED;
+    }
+    let coverage_threshold = env::var("MPGS_MEDIA_BACKFILL_COVERAGE_THRESHOLD")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| (0.05..=1.0).contains(value))
+        .unwrap_or(defaults.coverage_threshold);
+    let max_attempts = env::var("MPGS_MEDIA_BACKFILL_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| (1..=10).contains(value))
+        .unwrap_or(defaults.max_attempts);
+    let cooldown_ms = env::var("MPGS_MEDIA_BACKFILL_COOLDOWN_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| (60_000..=7 * 24 * 60 * 60 * 1_000).contains(value))
+        .unwrap_or(defaults.cooldown_ms);
+    mpgs_storage::MediaBackfillPolicy {
+        enabled: true,
+        coverage_threshold,
+        max_attempts,
+        cooldown_ms,
+    }
+}
+
 fn enrich_inter_request_ms() -> u64 {
     env::var("MPGS_ENRICH_INTER_REQUEST_MS")
         .ok()
@@ -462,20 +501,23 @@ fn run() -> Result<(), String> {
             let skip_reviews = store_only || env_flag("MPGS_ENRICH_SKIP_REVIEWS");
             let skip_ccu = store_only || env_flag("MPGS_ENRICH_SKIP_CCU");
             let skip_store = env_flag("MPGS_ENRICH_SKIP_STORE");
+            let media_policy = configured_media_backfill_policy();
             let need_filter = EnrichmentNeedFilter {
                 store: !skip_store,
                 reviews: !skip_reviews,
                 review_excerpts: !store_only,
                 ccu: !skip_ccu,
                 price: !skip_store,
+                media_backfill: !skip_store && media_policy.enabled,
             };
             let mut targets = repo
-                .list_enrichment_targets_after_filtered(
+                .list_enrichment_targets_after_filtered_with_media(
                     limit,
                     Some(cursor.after_app_id),
                     &country_code,
                     &language,
                     need_filter,
+                    media_policy,
                 )
                 .map_err(err)?;
             targets.retain(|target| target.matches_filter(need_filter));
@@ -1034,17 +1076,38 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
         .transpose()
         .map_err(|_| worker_task_error("invalid_payload", "invalid stored enrichment cursor"))?
         .unwrap_or_default();
+    let media_policy = configured_media_backfill_policy();
+    let need_filter = EnrichmentNeedFilter {
+        store: true,
+        reviews: true,
+        review_excerpts: true,
+        ccu: true,
+        price: true,
+        media_backfill: media_policy.enabled,
+    };
     let targets = repo
-        .list_enrichment_targets_after(limit, Some(cursor.after_app_id), &country_code, &language)
+        .list_enrichment_targets_after_filtered_with_media(
+            limit,
+            Some(cursor.after_app_id),
+            &country_code,
+            &language,
+            need_filter,
+            media_policy,
+        )
         .map_err(worker_storage_error)?;
+    let coverage = repo.media_coverage_stats().map_err(worker_storage_error)?;
     let run_id = repo
         .start_source_run(
             STORE_SOURCE_NAME,
             "candidate_enrichment",
             STORE_ADAPTER_VERSION,
             Some(&format!(
-                "worker=true;limit={limit};targets={};country={country_code};language={language};after_app_id={}",
-                targets.len(), cursor.after_app_id
+                "worker=true;limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{}",
+                targets.len(),
+                cursor.after_app_id,
+                coverage.coverage_ratio,
+                coverage.apps_with_media,
+                coverage.candidate_apps
             )),
         )
         .map_err(worker_storage_error)?;
@@ -1778,8 +1841,11 @@ fn enrich_steam_candidates(
         stats.apps_attempted = stats.apps_attempted.saturating_add(1);
         let mut app_ok = 0_i64;
 
-        // Price comes from appdetails; re-fetch store when platforms or price missing.
-        if !skip_store && (target.needs_store_details || target.needs_price) {
+        // Price/media come from appdetails; re-fetch store when those dimensions are due.
+        if !skip_store && target.needs_store_fetch() {
+            if target.needs_media_backfill {
+                let _ = repo.begin_media_backfill_attempt(target.app_id);
+            }
             match enrich_store_details(
                 &client,
                 repo,
@@ -1791,10 +1857,31 @@ fn enrich_steam_candidates(
                 Ok(StoreDetailsOutcome::Ingested) => {
                     stats.store_ok = stats.store_ok.saturating_add(1);
                     app_ok = app_ok.saturating_add(1);
+                    if target.needs_media_backfill {
+                        let has_media = repo.app_has_media_assets(target.app_id).unwrap_or(false);
+                        let outcome = if has_media {
+                            mpgs_storage::MediaBackfillOutcome::Complete
+                        } else {
+                            // Successful parse/ingest with no rows ⇒ Steam has none usable.
+                            mpgs_storage::MediaBackfillOutcome::NoneAvailable
+                        };
+                        let _ = repo.finish_media_backfill_attempt(
+                            target.app_id,
+                            outcome,
+                            configured_media_backfill_policy().max_attempts,
+                        );
+                    }
                 }
                 Ok(StoreDetailsOutcome::NotFound) => {
                     stats.store_not_found = stats.store_not_found.saturating_add(1);
                     app_ok = app_ok.saturating_add(1);
+                    if target.needs_media_backfill {
+                        let _ = repo.finish_media_backfill_attempt(
+                            target.app_id,
+                            mpgs_storage::MediaBackfillOutcome::NoneAvailable,
+                            configured_media_backfill_policy().max_attempts,
+                        );
+                    }
                 }
                 Err(error) => {
                     stats.error_count = stats.error_count.saturating_add(1);
@@ -1802,6 +1889,13 @@ fn enrich_steam_candidates(
                         "warn app_id={} store_details: {} ({})",
                         target.app_id, error.message, error.category
                     );
+                    if target.needs_media_backfill {
+                        let _ = repo.finish_media_backfill_attempt(
+                            target.app_id,
+                            mpgs_storage::MediaBackfillOutcome::Failed,
+                            configured_media_backfill_policy().max_attempts,
+                        );
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(inter_request_ms));
@@ -1858,8 +1952,7 @@ fn enrich_steam_candidates(
             // CCU uses the separate Steam Web API host. When this app also had
             // Store work, the preceding Store delay already spaces the next
             // appdetails request. Preserve pacing for CCU-only refresh passes.
-            if !(target.needs_store_details
-                || target.needs_price
+            if !(target.needs_store_fetch()
                 || target.needs_reviews
                 || target.needs_review_excerpts)
             {

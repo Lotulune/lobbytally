@@ -10,13 +10,14 @@ use crate::jobs;
 use crate::models::{
     AppRecord, CreateOverrideRequest, CurationOverride, EffectiveFeatureValue, EnqueueJob,
     EnrichmentNeedFilter, EnrichmentTarget, JobRecord, M3CatalogCoverage, M7DataCoverage,
-    MultiplayerProfile,
+    MediaBackfillOutcome, MediaBackfillPolicy, MediaCoverageStats, MultiplayerProfile,
 };
 use crate::quality::{self, QualityFinding};
 use mpgs_steam_source::{
     AppCatalogProposal, AppListPage, AppListRequest, AppRelationProposal, CcuProposal, GoldenGame,
     PopularReviewsProposal, ReviewSummaryProposal, StoreDetailsProposal, StoreSearchPage,
 };
+use rusqlite::OptionalExtension;
 use std::path::Path;
 
 pub const REVIEW_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -234,6 +235,9 @@ impl Repository {
 
     /// Select due targets after a rotating app-id cursor, wrapping at the end.
     /// Dynamic snapshots become due again after their refresh interval.
+    ///
+    /// Media gallery backfill is **not** included here; workers should call
+    /// [`Self::list_enrichment_targets_after_filtered_with_media`].
     pub fn list_enrichment_targets_after(
         &self,
         limit: u32,
@@ -241,12 +245,13 @@ impl Repository {
         country_code: &str,
         language: &str,
     ) -> StorageResult<Vec<EnrichmentTarget>> {
-        self.list_enrichment_targets_after_filtered(
+        self.list_enrichment_targets_after_filtered_with_media(
             limit,
             after_app_id,
             country_code,
             language,
             EnrichmentNeedFilter::ALL,
+            MediaBackfillPolicy::DISABLED,
         )
     }
 
@@ -260,6 +265,26 @@ impl Repository {
         country_code: &str,
         language: &str,
         filter: EnrichmentNeedFilter,
+    ) -> StorageResult<Vec<EnrichmentTarget>> {
+        self.list_enrichment_targets_after_filtered_with_media(
+            limit,
+            after_app_id,
+            country_code,
+            language,
+            filter,
+            MediaBackfillPolicy::DEFAULT,
+        )
+    }
+
+    /// Like [`list_enrichment_targets_after_filtered`] with an explicit media backfill policy.
+    pub fn list_enrichment_targets_after_filtered_with_media(
+        &self,
+        limit: u32,
+        after_app_id: Option<u32>,
+        country_code: &str,
+        language: &str,
+        filter: EnrichmentNeedFilter,
+        media_policy: MediaBackfillPolicy,
     ) -> StorageResult<Vec<EnrichmentTarget>> {
         if !filter.any() {
             return Ok(Vec::new());
@@ -277,6 +302,23 @@ impl Repository {
         let want_excerpts = i64::from(filter.review_excerpts);
         let want_ccu = i64::from(filter.ccu);
         let want_price = i64::from(filter.price);
+
+        // Coverage gate: only schedule media backfill when below threshold.
+        let want_media = if filter.media_backfill && media_policy.enabled {
+            let coverage = self.media_coverage_stats()?;
+            if coverage.candidate_apps > 0
+                && coverage.coverage_ratio + f64::EPSILON < media_policy.coverage_threshold
+            {
+                1_i64
+            } else {
+                0_i64
+            }
+        } else {
+            0_i64
+        };
+        let media_max_attempts = i64::from(media_policy.max_attempts.max(1));
+        let media_cooldown_cutoff = now.saturating_sub(media_policy.cooldown_ms.max(0));
+
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "WITH candidates AS (
@@ -353,22 +395,38 @@ impl Repository {
                                AND refresh.language = ?7
                                AND refresh.status IN ('succeeded', 'not_found')
                                AND refresh.captured_at_ms >= ?4
-                         ) THEN 1 ELSE 0 END AS needs_price
+                         ) THEN 1 ELSE 0 END AS needs_price,
+                         CASE WHEN ?13 = 1
+                                   AND NOT EXISTS (
+                                       SELECT 1 FROM app_media_assets media
+                                       WHERE media.app_id = candidates.app_id
+                                   )
+                                   AND COALESCE(backfill.status, 'pending') IN ('pending', 'failed')
+                                   AND COALESCE(backfill.attempts, 0) < ?14
+                                   AND (
+                                       backfill.last_attempt_at_ms IS NULL
+                                       OR backfill.last_attempt_at_ms < ?15
+                                   )
+                              THEN 1 ELSE 0 END AS needs_media_backfill
                      FROM candidates
                      LEFT JOIN app_availability v ON v.app_id = candidates.app_id
+                     LEFT JOIN app_media_backfill_state backfill
+                         ON backfill.app_id = candidates.app_id
                  )
                  SELECT
                      app_id, needs_store_details, needs_reviews, needs_review_excerpts,
-                     needs_ccu, needs_price
+                     needs_ccu, needs_price, needs_media_backfill
                  FROM due
                  WHERE (needs_store_details = 1 AND ?8 = 1)
                     OR (needs_reviews = 1 AND ?9 = 1)
                     OR (needs_review_excerpts = 1 AND ?10 = 1)
                     OR (needs_ccu = 1 AND ?11 = 1)
                     OR (needs_price = 1 AND ?12 = 1)
+                    OR (needs_media_backfill = 1 AND ?13 = 1)
                  ORDER BY
                      (
-                         CASE WHEN needs_store_details = 1 AND ?8 = 1 THEN 3 ELSE 0 END
+                         CASE WHEN needs_media_backfill = 1 AND ?13 = 1 THEN 5 ELSE 0 END
+                       + CASE WHEN needs_store_details = 1 AND ?8 = 1 THEN 3 ELSE 0 END
                        + CASE WHEN needs_price = 1 AND ?12 = 1 THEN 3 ELSE 0 END
                        + CASE WHEN needs_reviews = 1 AND ?9 = 1 THEN 4 ELSE 0 END
                        + CASE WHEN needs_review_excerpts = 1 AND ?10 = 1 THEN 1 ELSE 0 END
@@ -392,6 +450,9 @@ impl Repository {
                     want_excerpts,
                     want_ccu,
                     want_price,
+                    want_media,
+                    media_max_attempts,
+                    media_cooldown_cutoff,
                 ],
                 |row| {
                     Ok(EnrichmentTarget {
@@ -401,6 +462,7 @@ impl Repository {
                         needs_review_excerpts: row.get::<_, i64>(3)? != 0,
                         needs_ccu: row.get::<_, i64>(4)? != 0,
                         needs_price: row.get::<_, i64>(5)? != 0,
+                        needs_media_backfill: row.get::<_, i64>(6)? != 0,
                     })
                 },
             )?;
@@ -409,6 +471,134 @@ impl Repository {
                 targets.push(row?);
             }
             Ok(targets)
+        })
+    }
+
+    /// Media coverage among multiplayer enrichment candidates.
+    pub fn media_coverage_stats(&self) -> StorageResult<MediaCoverageStats> {
+        self.db.with_conn(|conn| {
+            let (candidates, with_media): (i64, i64) = conn.query_row(
+                "WITH candidates AS (
+                     SELECT a.app_id
+                     FROM apps a
+                     WHERE a.app_type IN ('game', 'demo', 'playtest')
+                       AND (
+                           EXISTS (
+                               SELECT 1 FROM feature_evidence e
+                               WHERE e.app_id = a.app_id
+                                 AND e.feature_name = 'category_hint'
+                                 AND e.is_active = 1
+                                 AND e.confidence >= 0.3
+                           )
+                           OR EXISTS (
+                               SELECT 1 FROM multiplayer_profiles profile
+                               WHERE profile.app_id = a.app_id
+                                 AND (
+                                     profile.dominant_mode IS NOT NULL
+                                     OR profile.private_session IS NOT NULL
+                                     OR profile.online_coop IS NOT NULL
+                                     OR profile.self_hosted_server IS NOT NULL
+                                     OR profile.drop_in_out IS NOT NULL
+                                     OR profile.crossplay IS NOT NULL
+                                     OR profile.recommended_max_players IS NOT NULL
+                                 )
+                           )
+                       )
+                 )
+                 SELECT
+                     (SELECT COUNT(*) FROM candidates),
+                     (SELECT COUNT(*) FROM candidates c
+                      WHERE EXISTS (
+                          SELECT 1 FROM app_media_assets m WHERE m.app_id = c.app_id
+                      ))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let candidate_apps = candidates.max(0) as u32;
+            let apps_with_media = with_media.max(0) as u32;
+            let coverage_ratio = if candidate_apps == 0 {
+                1.0
+            } else {
+                f64::from(apps_with_media) / f64::from(candidate_apps)
+            };
+            Ok(MediaCoverageStats {
+                candidate_apps,
+                apps_with_media,
+                coverage_ratio,
+            })
+        })
+    }
+
+    /// Mark a media backfill attempt as starting (increments attempts, status failed/pending).
+    pub fn begin_media_backfill_attempt(&self, app_id: u32) -> StorageResult<()> {
+        let now = self.db.now_ms();
+        self.db.with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO app_media_backfill_state (
+                     app_id, attempts, last_attempt_at_ms, status, updated_at_ms
+                 ) VALUES (?1, 1, ?2, 'pending', ?2)
+                 ON CONFLICT(app_id) DO UPDATE SET
+                     attempts = app_media_backfill_state.attempts + 1,
+                     last_attempt_at_ms = excluded.last_attempt_at_ms,
+                     status = CASE
+                         WHEN app_media_backfill_state.status IN ('complete', 'none', 'exhausted')
+                             THEN app_media_backfill_state.status
+                         ELSE 'pending'
+                     END,
+                     updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![app_id, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record terminal/retryable outcome after a media backfill store fetch.
+    pub fn finish_media_backfill_attempt(
+        &self,
+        app_id: u32,
+        outcome: MediaBackfillOutcome,
+        max_attempts: u32,
+    ) -> StorageResult<()> {
+        let now = self.db.now_ms();
+        let max_attempts = max_attempts.max(1) as i64;
+        self.db.with_conn_mut(|conn| {
+            let attempts: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(attempts, 0) FROM app_media_backfill_state WHERE app_id = ?1",
+                    rusqlite::params![app_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let status = match outcome {
+                MediaBackfillOutcome::Complete => "complete",
+                MediaBackfillOutcome::NoneAvailable => "none",
+                MediaBackfillOutcome::Failed if attempts >= max_attempts => "exhausted",
+                MediaBackfillOutcome::Failed => "failed",
+            };
+            conn.execute(
+                "INSERT INTO app_media_backfill_state (
+                     app_id, attempts, last_attempt_at_ms, status, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?3)
+                 ON CONFLICT(app_id) DO UPDATE SET
+                     attempts = excluded.attempts,
+                     last_attempt_at_ms = excluded.last_attempt_at_ms,
+                     status = excluded.status,
+                     updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![app_id, attempts.max(1), now, status],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn app_has_media_assets(&self, app_id: u32) -> StorageResult<bool> {
+        self.db.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM app_media_assets WHERE app_id = ?1",
+                rusqlite::params![app_id],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
         })
     }
 

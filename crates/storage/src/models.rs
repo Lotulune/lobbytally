@@ -143,6 +143,8 @@ pub struct EnrichmentTarget {
     pub needs_review_excerpts: bool,
     pub needs_ccu: bool,
     pub needs_price: bool,
+    /// Missing gallery media and eligible for a bounded store re-fetch.
+    pub needs_media_backfill: bool,
 }
 
 /// Which enrichment dimensions should be selected and prioritized.
@@ -156,6 +158,7 @@ pub struct EnrichmentNeedFilter {
     pub review_excerpts: bool,
     pub ccu: bool,
     pub price: bool,
+    pub media_backfill: bool,
 }
 
 impl EnrichmentNeedFilter {
@@ -165,11 +168,51 @@ impl EnrichmentNeedFilter {
         review_excerpts: true,
         ccu: true,
         price: true,
+        media_backfill: true,
     };
 
     pub fn any(self) -> bool {
-        self.store || self.reviews || self.review_excerpts || self.ccu || self.price
+        self.store
+            || self.reviews
+            || self.review_excerpts
+            || self.ccu
+            || self.price
+            || self.media_backfill
     }
+}
+
+/// Policy for coverage-gated, attempt-limited media gallery backfill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MediaBackfillPolicy {
+    pub enabled: bool,
+    /// When candidate media coverage is at or above this ratio, skip backfill.
+    pub coverage_threshold: f64,
+    pub max_attempts: u32,
+    pub cooldown_ms: i64,
+}
+
+impl MediaBackfillPolicy {
+    pub const DEFAULT: Self = Self {
+        enabled: true,
+        coverage_threshold: 0.95,
+        max_attempts: 3,
+        cooldown_ms: 6 * 60 * 60 * 1_000,
+    };
+
+    pub const DISABLED: Self = Self {
+        enabled: false,
+        coverage_threshold: 1.0,
+        max_attempts: 0,
+        cooldown_ms: i64::MAX,
+    };
+}
+
+/// Snapshot of media gallery coverage among multiplayer enrichment candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MediaCoverageStats {
+    pub candidate_apps: u32,
+    pub apps_with_media: u32,
+    pub coverage_ratio: f64,
 }
 
 impl EnrichmentTarget {
@@ -179,6 +222,11 @@ impl EnrichmentTarget {
             || self.needs_review_excerpts
             || self.needs_ccu
             || self.needs_price
+            || self.needs_media_backfill
+    }
+
+    pub fn needs_store_fetch(self) -> bool {
+        self.needs_store_details || self.needs_price || self.needs_media_backfill
     }
 
     pub fn missing_count(self) -> u8 {
@@ -187,6 +235,7 @@ impl EnrichmentTarget {
             + u8::from(self.needs_review_excerpts)
             + u8::from(self.needs_ccu)
             + u8::from(self.needs_price)
+            + u8::from(self.needs_media_backfill)
     }
 
     pub fn matches_filter(self, filter: EnrichmentNeedFilter) -> bool {
@@ -195,7 +244,19 @@ impl EnrichmentTarget {
             || (filter.review_excerpts && self.needs_review_excerpts)
             || (filter.ccu && self.needs_ccu)
             || (filter.price && self.needs_price)
+            || (filter.media_backfill && self.needs_media_backfill)
     }
+}
+
+/// Outcome recorded after a media backfill store attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaBackfillOutcome {
+    /// At least one screenshot/movie row is present.
+    Complete,
+    /// Store succeeded but Steam returned no usable media; stop retrying.
+    NoneAvailable,
+    /// Transient failure; may retry until max attempts.
+    Failed,
 }
 
 /// Observable state for each controlled M7 data-refresh task.

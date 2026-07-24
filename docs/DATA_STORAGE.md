@@ -213,6 +213,25 @@ updated_at_ms
 - 旧库升级后表为空属正常；`app_media` 封面必须继续可用。
 - `latest_data_update_ms` 包含 `app_media_assets.updated_at_ms`。
 
+#### `app_media_backfill_state`（migration `0017_media_backfill_state`）
+
+有界媒体补全账本（只服务联机富化候选）：
+
+```text
+app_id PK
+attempts
+last_attempt_at_ms
+status ∈ {pending, complete, none, failed, exhausted}
+updated_at_ms
+```
+
+Worker 策略（可用环境变量覆盖）：
+
+- 当候选媒体覆盖率 **低于** `MPGS_MEDIA_BACKFILL_COVERAGE_THRESHOLD`（默认 `0.95`）时，才把缺媒体 App 排进 store 重拉队列。
+- 每 App 最多 `MPGS_MEDIA_BACKFILL_MAX_ATTEMPTS`（默认 3）次；冷却 `MPGS_MEDIA_BACKFILL_COOLDOWN_MS`（默认 6h）。
+- store 成功且已有 `app_media_assets` → `complete`；成功但无可用媒体 → `none`（停止）；失败 → `failed` / 达上限 `exhausted`。
+- `MPGS_MEDIA_BACKFILL_ENABLED=false` 可关闭。仍不下载二进制，只再拉 appdetails 元数据。
+
 #### `feature_evidence`
 
 ```text
