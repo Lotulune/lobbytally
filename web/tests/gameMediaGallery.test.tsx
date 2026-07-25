@@ -1,6 +1,6 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GameMediaBlock } from "../src/api/types";
 import {
   buildGalleryItems,
@@ -8,6 +8,37 @@ import {
 } from "../src/components/GameMediaGallery";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const hlsTestState = vi.hoisted(() => ({
+  instances: 0,
+  destroyed: 0,
+}));
+
+vi.mock("hls.js", () => {
+  class MockHls {
+    static Events = { ERROR: "error" };
+
+    static isSupported() {
+      return true;
+    }
+
+    constructor() {
+      hlsTestState.instances += 1;
+    }
+
+    loadSource() {}
+
+    attachMedia() {}
+
+    on() {}
+
+    destroy() {
+      hlsTestState.destroyed += 1;
+    }
+  }
+
+  return { default: MockHls };
+});
 
 const fullMedia: GameMediaBlock = {
   updated_at_ms: 1_700_000_000_000,
@@ -74,7 +105,15 @@ function mountGallery(props: {
   };
 }
 
+beforeEach(() => {
+  hlsTestState.instances = 0;
+  hlsTestState.destroyed = 0;
+  vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+  vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
+});
+
 afterEach(() => {
+  vi.restoreAllMocks();
   document.body.innerHTML = "";
 });
 
@@ -147,6 +186,24 @@ describe("GameMediaGallery", () => {
     unmount();
   });
 
+  it("falls back through Steam cover CDN candidates before removing the cover", () => {
+    const { host, unmount } = mountGallery({
+      coverUrl: "https://shared.akamai.steamstatic.com/broken.jpg",
+      media: { updated_at_ms: null, screenshots: [], videos: [] },
+    });
+    const image = host.querySelector<HTMLImageElement>(".gallery-stage-image img")!;
+
+    act(() => {
+      image.dispatchEvent(new Event("error"));
+    });
+
+    expect(image.getAttribute("src")).toBe(
+      "https://cdn.akamai.steamstatic.com/steam/apps/892970/header.jpg",
+    );
+    expect(host.querySelector(".gallery-fallback")).toBeNull();
+    unmount();
+  });
+
   it("supports click and keyboard thumbnail switching with accessible current state", () => {
     const { host, unmount } = mountGallery({ media: fullMedia });
     const thumbs = host.querySelectorAll<HTMLButtonElement>(".gallery-thumb");
@@ -185,10 +242,18 @@ describe("GameMediaGallery", () => {
   it("skips failed images without breaking the gallery", () => {
     const { host, unmount } = mountGallery({ media: fullMedia });
     const mainImg = host.querySelector<HTMLImageElement>(".gallery-stage-image img")!;
+
     act(() => {
       mainImg.dispatchEvent(new Event("error"));
     });
-    // After cover fails, next item becomes active (highlight video).
+    expect(host.querySelector(".gallery-stage-image")).toBeTruthy();
+
+    // Exhaust the four remaining Steam CDN candidates before dropping the cover.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      act(() => {
+        mainImg.dispatchEvent(new Event("error"));
+      });
+    }
     expect(host.querySelector(".gallery-stage-video")).toBeTruthy();
     unmount();
   });
@@ -265,6 +330,48 @@ describe("GameMediaGallery", () => {
     unmount();
   });
 
+  it("deduplicates concurrent HLS startup and destroys the active player on unmount", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+    const { host, unmount } = mountGallery({
+      media: {
+        updated_at_ms: 1,
+        screenshots: [],
+        videos: [
+          {
+            id: "hls-only",
+            title: "HLS Trailer",
+            poster_url: "https://shared.akamai.steamstatic.com/p.jpg",
+            highlight: true,
+            mp4_url: null,
+            hls_h264_url: "https://video.akamai.steamstatic.com/only.m3u8",
+            dash_h264_url: null,
+          },
+        ],
+      },
+    });
+    const videoThumb = Array.from(host.querySelectorAll<HTMLButtonElement>(".gallery-thumb")).find(
+      (button) => button.classList.contains("is-video"),
+    )!;
+    act(() => videoThumb.click());
+
+    const play = host.querySelector<HTMLButtonElement>(".gallery-play-btn")!;
+    act(() => {
+      play.click();
+    });
+    expect(play.disabled).toBe(true);
+    // A disabled loading control must not start a second dynamic HLS initialization.
+    play.click();
+    await act(async () => {
+      await vi.dynamicImportSettled();
+      await Promise.resolve();
+    });
+
+    expect(hlsTestState.instances).toBe(1);
+    unmount();
+    expect(hlsTestState.destroyed).toBe(1);
+  });
+
   it("opens a full-viewport zoom lightbox and Escape closes without going back", () => {
     const { host, unmount } = mountGallery({ media: fullMedia });
     const underlying = vi.fn();
@@ -335,5 +442,30 @@ describe("GameMediaGallery", () => {
     expect(document.querySelector(".gallery-lightbox-scale")?.textContent).toBe("100%");
 
     unmount();
+  });
+
+  it("traps Tab focus inside the lightbox", () => {
+    const underlying = document.createElement("button");
+    underlying.textContent = "Underlying action";
+    document.body.append(underlying);
+    const { host, unmount } = mountGallery({ media: fullMedia });
+    act(() => {
+      host.querySelector<HTMLButtonElement>(".gallery-stage-image")?.click();
+    });
+
+    const close = document.querySelector<HTMLButtonElement>(".gallery-lightbox-close")!;
+    expect(document.activeElement).toBe(close);
+    underlying.focus();
+    expect(document.activeElement).toBe(underlying);
+
+    act(() => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }),
+      );
+    });
+    expect(document.activeElement).toBe(close);
+
+    unmount();
+    underlying.remove();
   });
 });

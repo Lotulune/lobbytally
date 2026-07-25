@@ -1905,7 +1905,7 @@ fn enrich_steam_candidates(
 
         // CN/EN dual-name search: once per app, fill the missing English display name
         // without rewriting apps.canonical_name (which stays the primary storefront name).
-        if !skip_store {
+        if target.needs_english_name && !skip_store {
             match ensure_english_search_name(&client, repo, target.app_id, &mut stats) {
                 Ok(true) => {
                     app_ok = app_ok.saturating_add(1);
@@ -1913,7 +1913,7 @@ fn enrich_steam_candidates(
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    // Non-fatal: search still works on canonical Chinese name.
+                    stats.error_count = stats.error_count.saturating_add(1);
                     eprintln!(
                         "warn app_id={} english_name: {} ({})",
                         target.app_id, error.message, error.category
@@ -2001,6 +2001,7 @@ fn enrich_steam_candidates(
     Ok(stats)
 }
 
+#[derive(Debug)]
 struct SoftEnrichError {
     category: &'static str,
     message: String,
@@ -2096,24 +2097,17 @@ fn ensure_english_search_name(
             });
         }
     };
-    let name = parsed
-        .details
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(name) = name {
-        let short = parsed.details.short_description.as_deref();
-        persist_with_retry(|| {
-            repo.upsert_app_localization(
-                app_id,
-                "english",
-                Some(name),
-                short,
-                "steam_store_appdetails_en",
-            )
-        })?;
-    }
+    let name = require_english_search_name(parsed.details.name.as_deref())?;
+    let short = parsed.details.short_description.as_deref();
+    persist_with_retry(|| {
+        repo.upsert_app_localization(
+            app_id,
+            "english",
+            Some(name),
+            short,
+            "steam_store_appdetails_en",
+        )
+    })?;
     persist_with_retry(|| {
         repo.record_store_details_succeeded_locale(
             app_id,
@@ -2123,6 +2117,15 @@ fn ensure_english_search_name(
         )
     })?;
     Ok(true)
+}
+
+fn require_english_search_name(name: Option<&str>) -> Result<&str, SoftEnrichError> {
+    name.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| SoftEnrichError {
+            category: "invalid_structure",
+            message: "English store response is missing a non-empty name".into(),
+        })
 }
 
 fn enrich_reviews(
@@ -2451,6 +2454,18 @@ mod tests {
             ),
             Duration::from_secs(2)
         );
+    }
+
+    #[test]
+    fn english_search_name_requires_a_non_empty_value() {
+        assert_eq!(
+            require_english_search_name(Some("  Deep Rock Galactic  ")).unwrap(),
+            "Deep Rock Galactic"
+        );
+        for missing in [None, Some(""), Some("   ")] {
+            let error = require_english_search_name(missing).unwrap_err();
+            assert_eq!(error.category, "invalid_structure");
+        }
     }
 
     fn app_list_request() -> AppListRequest {

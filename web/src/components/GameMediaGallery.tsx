@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type KeyboardEvent,
@@ -19,6 +20,8 @@ export type GalleryImageItem = {
   id: string;
   thumbnailUrl: string;
   fullUrl: string;
+  /** Ordered full-size candidates; covers retain the legacy multi-CDN fallback chain. */
+  sourceCandidates: string[];
   alt: string;
 };
 
@@ -56,6 +59,7 @@ export function buildGalleryItems(input: {
       id: "cover",
       thumbnailUrl: coverUrl,
       fullUrl: coverUrl,
+      sourceCandidates: coverCandidatesList,
       alt: `${input.name} 封面`,
     });
     seenUrls.add(coverUrl);
@@ -86,6 +90,7 @@ export function buildGalleryItems(input: {
       id: `shot-${shot.id}`,
       thumbnailUrl: shot.thumbnail_url,
       fullUrl: shot.full_url,
+      sourceCandidates: [shot.full_url],
       alt: `${input.name} 截图`,
     });
   }
@@ -133,7 +138,9 @@ function VideoStage({
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<HlsLike | null>(null);
+  const playbackGenerationRef = useRef(0);
   const [playing, setPlaying] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const destroyPlayer = useCallback(() => {
@@ -159,20 +166,33 @@ function VideoStage({
 
   useEffect(() => {
     if (!active) {
+      playbackGenerationRef.current += 1;
       destroyPlayer();
       setPlaying(false);
+      setLoading(false);
       setError(null);
     }
   }, [active, destroyPlayer]);
 
-  useEffect(() => () => destroyPlayer(), [destroyPlayer]);
+  useEffect(
+    () => () => {
+      playbackGenerationRef.current += 1;
+      destroyPlayer();
+    },
+    [destroyPlayer],
+  );
 
   const startPlayback = useCallback(async () => {
+    if (loading) return;
+    const generation = playbackGenerationRef.current + 1;
+    playbackGenerationRef.current = generation;
     setError(null);
     const el = videoRef.current;
     if (!el) return;
 
     destroyPlayer();
+    const isCurrent = () =>
+      playbackGenerationRef.current === generation && videoRef.current === el;
 
     if (item.mp4Url) {
       el.src = item.mp4Url;
@@ -180,6 +200,7 @@ function VideoStage({
       try {
         await el.play();
       } catch {
+        if (!isCurrent()) return;
         setError("当前环境无法播放预告片");
         setPlaying(false);
       }
@@ -192,6 +213,7 @@ function VideoStage({
       try {
         await el.play();
       } catch {
+        if (!isCurrent()) return;
         setError("当前环境无法播放预告片");
         setPlaying(false);
       }
@@ -199,35 +221,44 @@ function VideoStage({
     }
 
     if (item.hlsUrl) {
+      setLoading(true);
       const Hls = await loadHlsConstructor();
+      if (!isCurrent()) return;
       if (Hls && Hls.isSupported()) {
         const hls = new Hls({ enableWorker: true, autoStartLoad: true });
         hlsRef.current = hls;
         hls.loadSource(item.hlsUrl);
         hls.attachMedia(el);
         hls.on(Hls.Events.ERROR, (...args: unknown[]) => {
+          if (!isCurrent()) return;
           const data = args[1] as { fatal?: boolean } | undefined;
           if (data?.fatal) {
             setError("当前环境无法播放预告片");
             setPlaying(false);
+            setLoading(false);
             destroyPlayer();
           }
         });
         setPlaying(true);
+        setLoading(false);
         try {
           await el.play();
         } catch {
+          if (!isCurrent()) return;
           setError("当前环境无法播放预告片");
           setPlaying(false);
+          setLoading(false);
           destroyPlayer();
         }
         return;
       }
+      setLoading(false);
     }
 
+    if (!isCurrent()) return;
     setError("当前环境无法播放预告片");
     setPlaying(false);
-  }, [destroyPlayer, item.hlsUrl, item.mp4Url]);
+  }, [destroyPlayer, item.hlsUrl, item.mp4Url, loading]);
 
   return (
     <div className="gallery-stage-video">
@@ -252,12 +283,13 @@ function VideoStage({
           type="button"
           className="gallery-play-btn"
           onClick={() => void startPlayback()}
+          disabled={loading}
           aria-label={`播放 ${item.title}`}
         >
           <span className="gallery-play-icon" aria-hidden="true">
             ▶
           </span>
-          <span>播放预告片</span>
+          <span>{loading ? "正在加载…" : "播放预告片"}</span>
         </button>
       )}
       {error && (
@@ -275,6 +307,8 @@ function VideoStage({
 const LIGHTBOX_MIN_SCALE = 1;
 const LIGHTBOX_MAX_SCALE = 5;
 const LIGHTBOX_WHEEL_STEP = 0.12;
+const LIGHTBOX_FOCUSABLE =
+  "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])";
 
 function clampLightboxScale(value: number): number {
   return Math.min(LIGHTBOX_MAX_SCALE, Math.max(LIGHTBOX_MIN_SCALE, value));
@@ -290,6 +324,7 @@ function GalleryLightbox({
   alt: string;
   onClose: () => void;
 }) {
+  const lightboxRef = useRef<HTMLDivElement | null>(null);
   const closeRef = useRef<HTMLButtonElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const onCloseRef = useRef(onClose);
@@ -364,6 +399,29 @@ function GalleryLightbox({
         event.preventDefault();
         event.stopPropagation();
         onCloseRef.current();
+        return;
+      }
+      if (event.key === "Tab") {
+        const lightbox = lightboxRef.current;
+        if (!lightbox) return;
+        const items = Array.from(
+          lightbox.querySelectorAll<HTMLElement>(LIGHTBOX_FOCUSABLE),
+        ).filter((element) => !(element as HTMLButtonElement).disabled);
+        if (items.length === 0) {
+          event.preventDefault();
+          return;
+        }
+        const first = items[0]!;
+        const last = items[items.length - 1]!;
+        const active = document.activeElement;
+        const inside = lightbox.contains(active);
+        if (event.shiftKey && (active === first || !inside)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (active === last || !inside)) {
+          event.preventDefault();
+          first.focus();
+        }
         return;
       }
       if (event.key === "+" || event.key === "=") {
@@ -455,6 +513,7 @@ function GalleryLightbox({
 
   return (
     <div
+      ref={lightboxRef}
       className={`gallery-lightbox${zoomed ? " is-zoomed" : ""}${dragging ? " is-dragging" : ""}`}
       role="dialog"
       aria-modal="true"
@@ -507,6 +566,59 @@ function GalleryLightbox({
   );
 }
 
+type GalleryMediaState = {
+  failedIds: Set<string>;
+  candidateIndexes: Map<string, number>;
+};
+
+type GalleryMediaAction =
+  | { type: "reset" }
+  | { type: "fail-item"; id: string }
+  | {
+      type: "fail-candidate";
+      id: string;
+      candidates: string[];
+      failedUrl: string;
+    };
+
+const INITIAL_GALLERY_MEDIA_STATE: GalleryMediaState = {
+  failedIds: new Set(),
+  candidateIndexes: new Map(),
+};
+
+function galleryMediaReducer(
+  state: GalleryMediaState,
+  action: GalleryMediaAction,
+): GalleryMediaState {
+  if (action.type === "reset") {
+    return {
+      failedIds: new Set(),
+      candidateIndexes: new Map(),
+    };
+  }
+  if (action.type === "fail-item") {
+    if (state.failedIds.has(action.id)) return state;
+    const failedIds = new Set(state.failedIds);
+    failedIds.add(action.id);
+    return { ...state, failedIds };
+  }
+
+  const currentIndex = state.candidateIndexes.get(action.id) ?? 0;
+  if (action.candidates[currentIndex] !== action.failedUrl) {
+    // A second <img> may report an error for the candidate that was already advanced.
+    return state;
+  }
+  if (currentIndex + 1 < action.candidates.length) {
+    const candidateIndexes = new Map(state.candidateIndexes);
+    candidateIndexes.set(action.id, currentIndex + 1);
+    return { ...state, candidateIndexes };
+  }
+  if (state.failedIds.has(action.id)) return state;
+  const failedIds = new Set(state.failedIds);
+  failedIds.add(action.id);
+  return { ...state, failedIds };
+}
+
 export function GameMediaGallery({
   appId,
   name,
@@ -526,18 +638,21 @@ export function GameMediaGallery({
   );
 
   const [index, setIndex] = useState(0);
-  const [failedIds, setFailedIds] = useState<Set<string>>(() => new Set());
+  const [mediaState, dispatchMedia] = useReducer(
+    galleryMediaReducer,
+    INITIAL_GALLERY_MEDIA_STATE,
+  );
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const thumbRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   const visibleItems = useMemo(
-    () => items.filter((item) => !failedIds.has(item.id)),
-    [items, failedIds],
+    () => items.filter((item) => !mediaState.failedIds.has(item.id)),
+    [items, mediaState.failedIds],
   );
 
   useEffect(() => {
     setIndex(0);
-    setFailedIds(new Set());
+    dispatchMedia({ type: "reset" });
     setLightboxOpen(false);
   }, [appId, items]);
 
@@ -561,12 +676,7 @@ export function GameMediaGallery({
   );
 
   const markFailed = useCallback((id: string) => {
-    setFailedIds((prev) => {
-      if (prev.has(id)) return prev;
-      const next = new Set(prev);
-      next.add(id);
-      return next;
-    });
+    dispatchMedia({ type: "fail-item", id });
   }, []);
 
   const onRailKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -601,6 +711,11 @@ export function GameMediaGallery({
 
   const isImage = current.kind === "cover" || current.kind === "screenshot";
   const imageCurrent = isImage ? (current as GalleryImageItem) : null;
+  const imageCurrentUrl = imageCurrent
+    ? (imageCurrent.sourceCandidates[
+        mediaState.candidateIndexes.get(imageCurrent.id) ?? 0
+      ] ?? imageCurrent.fullUrl)
+    : null;
   const videoCurrent = current.kind === "video" ? current : null;
 
   return (
@@ -614,12 +729,19 @@ export function GameMediaGallery({
             aria-label={`放大查看：${imageCurrent.alt}`}
           >
             <img
-              src={imageCurrent.fullUrl}
+              src={imageCurrentUrl ?? imageCurrent.fullUrl}
               alt={imageCurrent.alt}
               loading="lazy"
               decoding="async"
               referrerPolicy="no-referrer"
-              onError={() => markFailed(imageCurrent.id)}
+              onError={() =>
+                dispatchMedia({
+                  type: "fail-candidate",
+                  id: imageCurrent.id,
+                  candidates: imageCurrent.sourceCandidates,
+                  failedUrl: imageCurrentUrl ?? imageCurrent.fullUrl,
+                })
+              }
             />
             <span className="gallery-zoom-hint" aria-hidden="true">
               点击放大
@@ -640,7 +762,13 @@ export function GameMediaGallery({
           {visibleItems.map((item, i) => {
             const selected = i === index;
             const thumbSrc =
-              item.kind === "video" ? item.posterUrl : item.thumbnailUrl;
+              item.kind === "video"
+                ? item.posterUrl
+                : item.kind === "cover"
+                  ? (item.sourceCandidates[
+                      mediaState.candidateIndexes.get(item.id) ?? 0
+                    ] ?? item.thumbnailUrl)
+                  : item.thumbnailUrl;
             const label =
               item.kind === "video"
                 ? `预告片：${item.title}`
@@ -669,7 +797,18 @@ export function GameMediaGallery({
                   loading="lazy"
                   decoding="async"
                   referrerPolicy="no-referrer"
-                  onError={() => markFailed(item.id)}
+                  onError={() => {
+                    if (item.kind === "cover") {
+                      dispatchMedia({
+                        type: "fail-candidate",
+                        id: item.id,
+                        candidates: item.sourceCandidates,
+                        failedUrl: thumbSrc,
+                      });
+                    } else {
+                      markFailed(item.id);
+                    }
+                  }}
                 />
                 {item.kind === "video" && (
                   <span className="gallery-thumb-play" aria-hidden="true">
@@ -684,7 +823,7 @@ export function GameMediaGallery({
 
       {lightboxOpen && imageCurrent && (
         <GalleryLightbox
-          src={imageCurrent.fullUrl}
+          src={imageCurrentUrl ?? imageCurrent.fullUrl}
           alt={imageCurrent.alt}
           onClose={() => setLightboxOpen(false)}
         />
