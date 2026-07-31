@@ -345,6 +345,29 @@ restart_previous_release() {
 backup_rel=
 backup_created=0
 
+# The init container deliberately makes the bind-mounted runtime private to the
+# in-container mpgs user. The host deployment user may therefore be unable to
+# traverse the directory, and a host-side `[ -f ]` would silently report that a
+# real database is absent. Probe through the already-validated server image so
+# permission checks use the same mount namespace as backup and restore.
+if ! runtime_db_state=$(
+  docker run --rm --user 0:0 --network none --read-only \
+    --entrypoint /bin/sh \
+    --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs,readonly" \
+    "$new_server_image" \
+    -c 'if [ -f /var/lib/mpgs/mpgs.db ]; then printf present; else printf absent; fi'
+); then
+  printf 'Could not inspect the runtime database through the release image; refusing the upgrade.\n' >&2
+  exit 1
+fi
+case "$runtime_db_state" in
+  present|absent) ;;
+  *)
+    printf 'Runtime database probe returned an invalid state; refusing the upgrade.\n' >&2
+    exit 1
+    ;;
+esac
+
 if [ -n "$old_server_container" ]; then
   # Quiesce every writer before the backup so rollback cannot lose requests
   # accepted between an online backup and container replacement.
@@ -355,7 +378,7 @@ if [ -n "$old_server_container" ]; then
     restart_previous_release || true
     exit 1
   fi
-  if [ -f "$runtime_dir/mpgs.db" ]; then
+  if [ "$runtime_db_state" = present ]; then
     old_short=unknown
     if validate_release_sha "$old_release_sha" >/dev/null 2>&1; then
       old_short=$(printf '%s' "$old_release_sha" | cut -c1-12)
@@ -390,7 +413,7 @@ if [ -n "$old_server_container" ]; then
     fi
     backup_created=1
   fi
-elif [ -f "$runtime_dir/mpgs.db" ]; then
+elif [ "$runtime_db_state" = present ]; then
   printf 'Database exists but mpgs-server is not running; refusing an unbacked upgrade.\n' >&2
   exit 1
 fi
