@@ -244,12 +244,20 @@ deployment_healthcheck() {
   meta=
   curl --fail --silent --show-error \
       "http://127.0.0.1:${health_port}/health/ready" >/dev/null 2>&1 \
-    && meta=$(curl --fail --silent --show-error \
-      "http://127.0.0.1:${health_port}/v1/meta" 2>/dev/null) \
-    && printf '%s' "$meta" \
-      | grep -F "\"build_git_sha\":\"$release_sha\"" >/dev/null \
-    && "$compose_runner" exec -T mpgs-worker \
-      /usr/local/bin/mpgs-worker-loop --healthcheck >/dev/null 2>&1
+    || return 1
+  meta=$(curl --fail --silent --show-error \
+    "http://127.0.0.1:${health_port}/v1/meta" 2>/dev/null) \
+    || return 1
+  if ! printf '%s' "$meta" \
+    | grep -F "\"build_git_sha\":\"$release_sha\"" >/dev/null; then
+    # The old service set has already been stopped before the replacement is
+    # started, so a responsive endpoint with another immutable revision cannot
+    # become the requested release by waiting. Distinguish this fatal mismatch
+    # from temporary startup/worker-health failures.
+    return 2
+  fi
+  "$compose_runner" exec -T mpgs-worker \
+    /usr/local/bin/mpgs-worker-loop --healthcheck >/dev/null 2>&1
 }
 
 advance_source_checkout() {
@@ -483,9 +491,17 @@ validate_deployment() {
   attempt=1
   while [ "$attempt" -le 45 ]; do
     if new_compose exec -T mpgs-server \
-        mpgs-dbtool integrity /var/lib/mpgs/mpgs.db >/dev/null 2>&1 \
-      && deployment_healthcheck new_compose; then
-      return 0
+      mpgs-dbtool integrity /var/lib/mpgs/mpgs.db >/dev/null 2>&1; then
+      health_result=0
+      deployment_healthcheck new_compose || health_result=$?
+      case "$health_result" in
+        0) return 0 ;;
+        2)
+          printf 'Deployment reports a build revision other than %s; refusing to retry it.\n' \
+            "$release_sha" >&2
+          return 1
+          ;;
+      esac
     fi
     sleep 2
     attempt=$((attempt + 1))
