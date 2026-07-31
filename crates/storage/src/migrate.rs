@@ -100,12 +100,35 @@ pub fn current_version(conn: &Connection) -> StorageResult<i64> {
     if !exists {
         return Ok(0);
     }
-    let version: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(version)
+    let mut statement =
+        conn.prepare("SELECT version, name FROM schema_migrations ORDER BY version ASC")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut current = 0;
+    for (index, row) in rows.enumerate() {
+        let (version, name) = row?;
+        let expected_version = i64::try_from(index)
+            .map_err(|_| StorageError::migration("migration history is too large"))?
+            .saturating_add(1);
+        if version != expected_version {
+            return Err(StorageError::migration(format!(
+                "migration history is not contiguous: expected version {expected_version}, found {version}"
+            )));
+        }
+        let Some((_, expected_name, _)) = MIGRATIONS.get(index) else {
+            return Err(StorageError::migration(format!(
+                "database contains unknown migration version {version} ({name})"
+            )));
+        };
+        if name != *expected_name {
+            return Err(StorageError::migration(format!(
+                "migration {version} name mismatch: expected {expected_name}, found {name}"
+            )));
+        }
+        current = version;
+    }
+    Ok(current)
 }
 
 pub fn migrate_to_latest(conn: &mut Connection, now_ms: i64) -> StorageResult<i64> {
@@ -177,4 +200,34 @@ fn ensure_migrations_table(conn: &Connection) -> StorageResult<()> {
 /// Re-running migrate on an already-current database is a no-op.
 pub fn migrate_idempotent(conn: &mut Connection, now_ms: i64) -> StorageResult<i64> {
     migrate_to_latest(conn, now_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_history_must_be_contiguous_and_named_exactly() {
+        let mut gap = Connection::open_in_memory().unwrap();
+        migrate_to_latest(&mut gap, 1).unwrap();
+        gap.execute("DELETE FROM schema_migrations WHERE version = 2", [])
+            .unwrap();
+        assert!(matches!(
+            current_version(&gap),
+            Err(StorageError::Migration { .. })
+        ));
+
+        let mut renamed = Connection::open_in_memory().unwrap();
+        migrate_to_latest(&mut renamed, 1).unwrap();
+        renamed
+            .execute(
+                "UPDATE schema_migrations SET name = 'tampered' WHERE version = 2",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            current_version(&renamed),
+            Err(StorageError::Migration { .. })
+        ));
+    }
 }

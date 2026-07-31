@@ -14,7 +14,7 @@ import { PlayIntentStore } from "../api/playIntentStore";
 import { getCurrentServiceOrigin } from "../api/serverOrigin";
 import { activateServiceScope, getClientStorage } from "../api/storage";
 import type { StorageLike } from "../api/types";
-import { flushPendingPreferencePatch } from "./preferences";
+import { flushPendingPreferencePatch, setPreferenceOwnerResolver } from "./preferences";
 
 const BAKED_API_BASE = import.meta.env.VITE_MPGS_API_BASE;
 const baseStorage = getClientStorage();
@@ -48,6 +48,18 @@ const storage = serviceScoped
 /** The service origin this build/session is bound to (null in dev/e2e). */
 export const activeServiceOrigin: string | null = serviceScoped ? persistedOrigin : null;
 
+/** Stable service identity used to scope device-local credentials. */
+export const localCredentialServiceOrigin: string = (() => {
+  if (activeServiceOrigin) return activeServiceOrigin;
+  const documentOrigin =
+    typeof globalThis.location !== "undefined" ? globalThis.location.origin : "http://localhost";
+  try {
+    return new URL(resolvedBaseUrl || documentOrigin, documentOrigin).origin;
+  } catch {
+    return documentOrigin;
+  }
+})();
+
 /** True when the app must show the connect page before any business UI. */
 export const requiresServiceConnect: boolean =
   !BAKED_API_BASE && !import.meta.env.DEV && isTauri();
@@ -55,18 +67,36 @@ export const requiresServiceConnect: boolean =
 export const apiClient = new ApiClient({ baseUrl: resolvedBaseUrl, storage });
 export const feedbackQueue = new FeedbackQueue(apiClient, storage);
 export const playIntentStore = new PlayIntentStore(apiClient, storage);
+setPreferenceOwnerResolver(() =>
+  apiClient.isAccountAuthenticated() ? apiClient.sessionUserId() : null,
+);
 
 // Replay pending feedback and votes when connectivity returns. The storage
 // namespace guarantees these writes only ever go to the service that queued
 // them (PRD §5.2: revalidate origin before replay).
-if (typeof window !== "undefined") {
+function flushPendingWrites(): void {
   void feedbackQueue.flush();
   void playIntentStore.flush();
   void flushPendingPreferencePatch(apiClient).catch(() => undefined);
+}
+
+let lastAuthenticatedUserId = apiClient.isAccountAuthenticated()
+  ? apiClient.sessionUserId()
+  : null;
+apiClient.subscribeAuth(() => {
+  const nextAuthenticatedUserId = apiClient.isAccountAuthenticated()
+    ? apiClient.sessionUserId()
+    : null;
+  const becameAuthenticated =
+    nextAuthenticatedUserId !== null && nextAuthenticatedUserId !== lastAuthenticatedUserId;
+  lastAuthenticatedUserId = nextAuthenticatedUserId;
+  if (becameAuthenticated) flushPendingWrites();
+});
+
+if (typeof window !== "undefined") {
+  flushPendingWrites();
   window.addEventListener("online", () => {
-    void feedbackQueue.flush();
-    void playIntentStore.flush();
-    void flushPendingPreferencePatch(apiClient).catch(() => undefined);
+    flushPendingWrites();
   });
 }
 

@@ -231,7 +231,16 @@ impl RateLimiter {
         if path.starts_with("/v1/session/") || path.starts_with("/v1/auth/") {
             return Some((Bucket::Session, self.config.session_per_minute));
         }
-        if path == "/v1/search" {
+        if matches!(
+            path,
+            "/v1/search"
+                | "/v1/recommendations/natural-language"
+                | "/v1/ai/search"
+                | "/v1/ai/compare"
+                | "/v1/ai/group-advice"
+                | "/v1/me/ai-settings/test"
+                | "/v1/me/ai-settings/discover"
+        ) {
             return Some((Bucket::Search, self.config.search_per_minute));
         }
         if method == Method::POST && path.starts_with("/v1/feedback") {
@@ -409,6 +418,30 @@ mod tests {
                 Bucket::Session,
                 RateLimitConfig::default().session_per_minute
             ))
+        );
+    }
+
+    #[test]
+    fn expensive_search_and_ai_routes_use_the_stricter_search_bucket() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+        for path in [
+            "/v1/search",
+            "/v1/recommendations/natural-language",
+            "/v1/ai/search",
+            "/v1/ai/compare",
+            "/v1/ai/group-advice",
+            "/v1/me/ai-settings/test",
+            "/v1/me/ai-settings/discover",
+        ] {
+            assert_eq!(
+                limiter.classify(&Method::POST, path),
+                Some((Bucket::Search, RateLimitConfig::default().search_per_minute)),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            limiter.classify(&Method::GET, "/v1/ai/analyses/analysis-id"),
+            Some((Bucket::Read, RateLimitConfig::default().read_per_minute))
         );
     }
 }

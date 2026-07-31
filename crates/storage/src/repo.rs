@@ -17,12 +17,13 @@ use mpgs_steam_source::{
     AppCatalogProposal, AppListPage, AppListRequest, AppRelationProposal, CcuProposal, GoldenGame,
     PopularReviewsProposal, ReviewSummaryProposal, StoreDetailsProposal, StoreSearchPage,
 };
-use rusqlite::OptionalExtension;
 use std::path::Path;
 
 pub const REVIEW_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CCU_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
 pub const PRICE_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
+pub const ENGLISH_NAME_RETRY_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+const MEDIA_BACKFILL_CLAIM_TIMEOUT_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Clone)]
 pub struct Repository {
@@ -294,6 +295,7 @@ impl Repository {
         let review_cutoff = now.saturating_sub(REVIEW_REFRESH_INTERVAL_MS);
         let ccu_cutoff = now.saturating_sub(CCU_REFRESH_INTERVAL_MS);
         let price_cutoff = now.saturating_sub(PRICE_REFRESH_INTERVAL_MS);
+        let english_name_cutoff = now.saturating_sub(ENGLISH_NAME_RETRY_INTERVAL_MS);
         let after_app_id = i64::from(after_app_id.unwrap_or(0));
         let country_code = country_code.trim().to_ascii_uppercase();
         let language = language.trim().to_ascii_lowercase();
@@ -422,6 +424,7 @@ impl Repository {
                                        WHERE en_refresh.app_id = candidates.app_id
                                          AND en_refresh.country_code = 'US'
                                          AND en_refresh.language = 'english'
+                                         AND en_refresh.captured_at_ms >= ?17
                                    )
                               THEN 1 ELSE 0 END AS needs_english_name
                      FROM candidates
@@ -472,6 +475,7 @@ impl Repository {
                     media_max_attempts,
                     media_cooldown_cutoff,
                     want_english_name,
+                    english_name_cutoff,
                 ],
                 |row| {
                     Ok(EnrichmentTarget {
@@ -549,26 +553,31 @@ impl Repository {
         })
     }
 
-    /// Mark a media backfill attempt as starting (increments attempts, status failed/pending).
-    pub fn begin_media_backfill_attempt(&self, app_id: u32) -> StorageResult<()> {
+    /// Atomically claim a media backfill attempt.
+    ///
+    /// Returns `false` when another worker has a recent pending claim or the row
+    /// is already terminal. A stale pending claim becomes eligible again.
+    pub fn begin_media_backfill_attempt(&self, app_id: u32) -> StorageResult<bool> {
         let now = self.db.now_ms();
+        let stale_claim_cutoff = now.saturating_sub(MEDIA_BACKFILL_CLAIM_TIMEOUT_MS);
         self.db.with_conn_mut(|conn| {
-            conn.execute(
+            let changed = conn.execute(
                 "INSERT INTO app_media_backfill_state (
                      app_id, attempts, last_attempt_at_ms, status, updated_at_ms
                  ) VALUES (?1, 1, ?2, 'pending', ?2)
                  ON CONFLICT(app_id) DO UPDATE SET
                      attempts = app_media_backfill_state.attempts + 1,
                      last_attempt_at_ms = excluded.last_attempt_at_ms,
-                     status = CASE
-                         WHEN app_media_backfill_state.status IN ('complete', 'none', 'exhausted')
-                             THEN app_media_backfill_state.status
-                         ELSE 'pending'
-                     END,
-                     updated_at_ms = excluded.updated_at_ms",
-                rusqlite::params![app_id, now],
+                     status = 'pending',
+                     updated_at_ms = excluded.updated_at_ms
+                 WHERE app_media_backfill_state.status IN ('pending', 'failed')
+                   AND (
+                       app_media_backfill_state.last_attempt_at_ms IS NULL
+                       OR app_media_backfill_state.last_attempt_at_ms <= ?3
+                   )",
+                rusqlite::params![app_id, now, stale_claim_cutoff],
             )?;
-            Ok(())
+            Ok(changed == 1)
         })
     }
 
@@ -582,30 +591,38 @@ impl Repository {
         let now = self.db.now_ms();
         let max_attempts = max_attempts.max(1) as i64;
         self.db.with_conn_mut(|conn| {
-            let attempts: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(attempts, 0) FROM app_media_backfill_state WHERE app_id = ?1",
-                    rusqlite::params![app_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .unwrap_or(0);
             let status = match outcome {
                 MediaBackfillOutcome::Complete => "complete",
                 MediaBackfillOutcome::NoneAvailable => "none",
-                MediaBackfillOutcome::Failed if attempts >= max_attempts => "exhausted",
+                MediaBackfillOutcome::Failed if max_attempts == 1 => "exhausted",
                 MediaBackfillOutcome::Failed => "failed",
             };
             conn.execute(
                 "INSERT INTO app_media_backfill_state (
                      app_id, attempts, last_attempt_at_ms, status, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?3)
-                 ON CONFLICT(app_id) DO UPDATE SET
-                     attempts = excluded.attempts,
-                     last_attempt_at_ms = excluded.last_attempt_at_ms,
-                     status = excluded.status,
-                     updated_at_ms = excluded.updated_at_ms",
-                rusqlite::params![app_id, attempts.max(1), now, status],
+                  ) VALUES (?1, 1, ?2, ?3, ?2)
+                  ON CONFLICT(app_id) DO UPDATE SET
+                      last_attempt_at_ms = CASE
+                          WHEN app_media_backfill_state.status IN ('complete', 'none', 'exhausted')
+                               AND excluded.status = 'failed'
+                              THEN app_media_backfill_state.last_attempt_at_ms
+                          ELSE excluded.last_attempt_at_ms
+                      END,
+                      status = CASE
+                          WHEN app_media_backfill_state.status = 'complete'
+                               OR excluded.status = 'complete'
+                              THEN 'complete'
+                          WHEN app_media_backfill_state.status = 'none'
+                               OR excluded.status = 'none'
+                              THEN 'none'
+                          WHEN app_media_backfill_state.status = 'exhausted'
+                              THEN 'exhausted'
+                          WHEN app_media_backfill_state.attempts >= ?4
+                              THEN 'exhausted'
+                          ELSE 'failed'
+                      END,
+                      updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![app_id, now, status, max_attempts],
             )?;
             Ok(())
         })
@@ -639,7 +656,10 @@ impl Repository {
         })
     }
 
-    /// Whether any store-detail refresh row exists for a locale (success or not_found).
+    /// Whether a recent store-detail refresh row exists for a locale.
+    ///
+    /// Negative or structurally incomplete English responses are retried after
+    /// a cooldown; a non-empty localization name remains the terminal signal.
     pub fn has_store_detail_refresh(
         &self,
         app_id: u32,
@@ -648,11 +668,16 @@ impl Repository {
     ) -> StorageResult<bool> {
         let country_code = country_code.trim().to_ascii_uppercase();
         let language = language.trim().to_ascii_lowercase();
+        let cutoff = self
+            .db
+            .now_ms()
+            .saturating_sub(ENGLISH_NAME_RETRY_INTERVAL_MS);
         self.db.with_conn(|conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM store_detail_refresh_state
-                 WHERE app_id = ?1 AND country_code = ?2 AND language = ?3",
-                rusqlite::params![app_id, country_code, language],
+                 WHERE app_id = ?1 AND country_code = ?2 AND language = ?3
+                   AND captured_at_ms >= ?4",
+                rusqlite::params![app_id, country_code, language, cutoff],
                 |row| row.get(0),
             )?;
             Ok(count > 0)

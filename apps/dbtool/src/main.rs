@@ -114,6 +114,31 @@ struct StoreSearchCursor {
     complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateCollectionPlan {
+    /// At/above the minimum target, process at most one continuation page.
+    refresh_mode: bool,
+    /// Also refresh page zero without disturbing the continuation cursor.
+    refresh_top: bool,
+    continuation_start: u32,
+}
+
+fn candidate_collection_plan(
+    candidate_count: i64,
+    target: u32,
+    cursor: Option<&StoreSearchCursor>,
+) -> CandidateCollectionPlan {
+    let continuation_start = cursor
+        .filter(|cursor| !cursor.complete)
+        .map_or(0, |cursor| cursor.next_start);
+    let refresh_mode = candidate_count >= i64::from(target);
+    CandidateCollectionPlan {
+        refresh_mode,
+        refresh_top: refresh_mode && continuation_start > 0,
+        continuation_start,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct EnrichmentCursor {
     after_app_id: u32,
@@ -412,16 +437,6 @@ fn run() -> Result<(), String> {
             db.migrate().map_err(err)?;
             let repo = Repository::new(db);
             repo.ensure_runtime_defaults().map_err(err)?;
-            let before = repo.m3_catalog_coverage().map_err(err)?;
-            if before.normalized_multiplayer_candidates >= i64::from(target) {
-                println!("path={}", db_path.display());
-                println!(
-                    "normalized_multiplayer_candidates={}",
-                    before.normalized_multiplayer_candidates
-                );
-                println!("steam_candidate_collection=already_satisfied");
-                return Ok(());
-            }
 
             let run_id = repo
                 .start_source_run(
@@ -439,7 +454,7 @@ fn run() -> Result<(), String> {
                         stats.request_count,
                         stats.success_count,
                         None,
-                        Some("target reached"),
+                        Some("target reached or bounded refresh completed"),
                     )
                     .map_err(err)?;
                     let after = repo.m3_catalog_coverage().map_err(err)?;
@@ -1045,7 +1060,7 @@ fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
                 stats.request_count,
                 stats.success_count,
                 None,
-                Some("target reached or already satisfied"),
+                Some("target reached or bounded refresh completed"),
             )
             .map_err(worker_storage_error),
         Err(failure) => {
@@ -1577,7 +1592,9 @@ fn fetch_app_list_page(
             message: "Steam Web API response read failed".into(),
         })?;
     let raw = RawResponse::validate(status, body, content_type, RawResponse::DEFAULT_MAX_BYTES)?;
-    parse_app_list_page(&raw)
+    let page = parse_app_list_page(&raw)?;
+    page.validate_for_request(request)?;
+    Ok(page)
 }
 
 fn app_list_url(request: &AppListRequest, api_key: &str) -> Result<reqwest::Url, SourceError> {
@@ -1615,10 +1632,6 @@ fn collect_steam_candidates(
             message: error.to_string(),
             stats: CollectionStats::default(),
         })?;
-    if coverage.normalized_multiplayer_candidates >= i64::from(target) {
-        return Ok(stats);
-    }
-
     let stored_cursor = repo
         .source_cursor(STORE_SEARCH_CURSOR_KEY)
         .map_err(|error| CollectionError {
@@ -1633,21 +1646,46 @@ fn collect_steam_candidates(
             message: format!("invalid stored cursor: {error}"),
             stats: CollectionStats::default(),
         })?;
-    let mut start = stored_cursor
-        .as_ref()
-        .filter(|cursor| !cursor.complete)
-        .map_or(0, |cursor| cursor.next_start);
+    // Once the minimum coverage target is met, keep discovery fresh without
+    // turning a scheduled job into an unbounded full-catalog crawl.
+    let plan = candidate_collection_plan(
+        coverage.normalized_multiplayer_candidates,
+        target,
+        stored_cursor.as_ref(),
+    );
+    let refresh_mode = plan.refresh_mode;
+    let mut start = plan.continuation_start;
+
+    // Refresh the volatile top-ranked page every scheduled pass while retaining
+    // the durable continuation cursor. This catches newly popular games quickly
+    // and still advances one deeper page per bounded refresh run.
+    if plan.refresh_top {
+        let request = StoreSearchRequest::new(0, 100).map_err(|error| CollectionError {
+            category: source_error_category(&error),
+            message: error.to_string(),
+            stats,
+        })?;
+        let page = fetch_store_search_page_with_retry(&client, &request, &mut stats)?;
+        let current = ingest_candidate_page(repo, &page, &mut stats)?;
+        println!(
+            "progress candidates={current} target={target} page_start={} rows={} refresh=top",
+            page.start, page.result_count
+        );
+        thread::sleep(Duration::from_millis(1_100));
+    }
 
     loop {
-        let current = repo
-            .m3_catalog_coverage()
-            .map_err(|error| CollectionError {
-                category: "storage",
-                message: error.to_string(),
-                stats,
-            })?;
-        if current.normalized_multiplayer_candidates >= i64::from(target) {
-            return Ok(stats);
+        if !refresh_mode {
+            let current = repo
+                .m3_catalog_coverage()
+                .map_err(|error| CollectionError {
+                    category: "storage",
+                    message: error.to_string(),
+                    stats,
+                })?;
+            if current.normalized_multiplayer_candidates >= i64::from(target) {
+                return Ok(stats);
+            }
         }
 
         let request = StoreSearchRequest::new(start, 100).map_err(|error| CollectionError {
@@ -1656,23 +1694,7 @@ fn collect_steam_candidates(
             stats,
         })?;
         let page = fetch_store_search_page_with_retry(&client, &request, &mut stats)?;
-        let ingested = repo
-            .ingest_store_search_page(&page)
-            .map_err(|error| CollectionError {
-                category: "storage",
-                message: error.to_string(),
-                stats,
-            })?;
-        // Refresh multiplayer dominant_mode from the Multi-player search hint
-        // (and any co-op / PvP category_hint evidence already stored).
-        let _ = repo
-            .materialize_store_category_profiles()
-            .map_err(|error| CollectionError {
-                category: "storage",
-                message: error.to_string(),
-                stats,
-            })?;
-        stats.success_count = stats.success_count.saturating_add(ingested as i64);
+        let current = ingest_candidate_page(repo, &page, &mut stats)?;
 
         let next_start = page.next_start();
         let cursor = StoreSearchCursor {
@@ -1696,18 +1718,11 @@ fn collect_steam_candidates(
             stats,
         })?;
 
-        let current = repo
-            .m3_catalog_coverage()
-            .map_err(|error| CollectionError {
-                category: "storage",
-                message: error.to_string(),
-                stats,
-            })?;
         println!(
             "progress candidates={} target={} page_start={} rows={}",
-            current.normalized_multiplayer_candidates, target, page.start, page.result_count
+            current, target, page.start, page.result_count
         );
-        if current.normalized_multiplayer_candidates >= i64::from(target) {
+        if refresh_mode || current >= i64::from(target) {
             return Ok(stats);
         }
         if page.is_complete() {
@@ -1715,7 +1730,7 @@ fn collect_steam_candidates(
                 category: "insufficient_results",
                 message: format!(
                     "Steam search exhausted at {} candidates before target {target}",
-                    current.normalized_multiplayer_candidates
+                    current
                 ),
                 stats,
             });
@@ -1723,6 +1738,37 @@ fn collect_steam_candidates(
         start = next_start;
         thread::sleep(Duration::from_millis(1_100));
     }
+}
+
+fn ingest_candidate_page(
+    repo: &Repository,
+    page: &StoreSearchPage,
+    stats: &mut CollectionStats,
+) -> Result<i64, CollectionError> {
+    let ingested = repo
+        .ingest_store_search_page(page)
+        .map_err(|error| CollectionError {
+            category: "storage",
+            message: error.to_string(),
+            stats: *stats,
+        })?;
+    // Refresh multiplayer dominant_mode from the Multi-player search hint
+    // (and any co-op / PvP category_hint evidence already stored).
+    let _ = repo
+        .materialize_store_category_profiles()
+        .map_err(|error| CollectionError {
+            category: "storage",
+            message: error.to_string(),
+            stats: *stats,
+        })?;
+    stats.success_count = stats.success_count.saturating_add(ingested as i64);
+    repo.m3_catalog_coverage()
+        .map(|coverage| coverage.normalized_multiplayer_candidates)
+        .map_err(|error| CollectionError {
+            category: "storage",
+            message: error.to_string(),
+            stats: *stats,
+        })
 }
 
 fn fetch_store_search_page_with_retry(
@@ -1856,15 +1902,21 @@ fn enrich_steam_candidates(
                 language,
                 &mut stats,
             ) {
-                Ok(StoreDetailsOutcome::Ingested) => {
+                Ok(StoreDetailsOutcome::Ingested { media_unusable }) => {
                     stats.store_ok = stats.store_ok.saturating_add(1);
                     app_ok = app_ok.saturating_add(1);
                     if target.needs_media_backfill {
                         let has_media = repo.app_has_media_assets(target.app_id).unwrap_or(false);
                         let outcome = if has_media {
                             mpgs_storage::MediaBackfillOutcome::Complete
+                        } else if media_unusable {
+                            // A non-empty upstream media field failed validation.
+                            // Retry later instead of recording an authoritative
+                            // "Steam has no media" result.
+                            mpgs_storage::MediaBackfillOutcome::Failed
                         } else {
-                            // Successful parse/ingest with no rows ⇒ Steam has none usable.
+                            // Missing/explicitly empty fields with no rejected
+                            // rows are an authoritative no-media observation.
                             mpgs_storage::MediaBackfillOutcome::NoneAvailable
                         };
                         let _ = repo.finish_media_backfill_attempt(
@@ -1973,9 +2025,7 @@ fn enrich_steam_candidates(
             // CCU uses the separate Steam Web API host. When this app also had
             // Store work, the preceding Store delay already spaces the next
             // appdetails request. Preserve pacing for CCU-only refresh passes.
-            if !(target.needs_store_fetch()
-                || target.needs_reviews
-                || target.needs_review_excerpts)
+            if !(target.needs_store_fetch() || target.needs_reviews || target.needs_review_excerpts)
             {
                 thread::sleep(Duration::from_millis(inter_request_ms));
             }
@@ -2008,7 +2058,7 @@ struct SoftEnrichError {
 }
 
 enum StoreDetailsOutcome {
-    Ingested,
+    Ingested { media_unusable: bool },
     NotFound,
 }
 
@@ -2047,8 +2097,28 @@ fn enrich_store_details(
             });
         }
     };
+    let media_stats = parsed.media_stats;
+    let media_unusable = (parsed.details.screenshots.is_none()
+        && media_stats.screenshots_rejected > 0)
+        || (parsed.details.movies.is_none() && media_stats.movies_rejected > 0);
+    if media_stats.screenshots_rejected > 0
+        || media_stats.movies_rejected > 0
+        || media_stats.urls_rejected > 0
+    {
+        eprintln!(
+            "warn app_id={} media_parse screenshots_rejected={} movies_rejected={} urls_rejected={} screenshots_deduped={} movies_deduped={} screenshots_truncated={} movies_truncated={}",
+            app_id,
+            media_stats.screenshots_rejected,
+            media_stats.movies_rejected,
+            media_stats.urls_rejected,
+            media_stats.screenshots_deduped,
+            media_stats.movies_deduped,
+            media_stats.screenshots_truncated,
+            media_stats.movies_truncated,
+        );
+    }
     persist_with_retry(|| repo.ingest_store_details(&parsed.details, &parsed.relations))?;
-    Ok(StoreDetailsOutcome::Ingested)
+    Ok(StoreDetailsOutcome::Ingested { media_unusable })
 }
 
 /// Fetch English store name into `app_localizations` for dual-name search.
@@ -2466,6 +2536,56 @@ mod tests {
             let error = require_english_search_name(missing).unwrap_err();
             assert_eq!(error.category, "invalid_structure");
         }
+    }
+
+    #[test]
+    fn candidate_collection_keeps_a_bounded_refresh_after_reaching_target() {
+        let in_progress = StoreSearchCursor {
+            next_start: 2_100,
+            total_count: Some(50_000),
+            target: STORE_SEARCH_TARGET_DEFAULT,
+            complete: false,
+        };
+        let refresh = candidate_collection_plan(
+            i64::from(STORE_SEARCH_TARGET_DEFAULT),
+            STORE_SEARCH_TARGET_DEFAULT,
+            Some(&in_progress),
+        );
+        assert_eq!(
+            refresh,
+            CandidateCollectionPlan {
+                refresh_mode: true,
+                refresh_top: true,
+                continuation_start: 2_100,
+            }
+        );
+
+        let complete = StoreSearchCursor {
+            complete: true,
+            ..in_progress
+        };
+        let restart = candidate_collection_plan(
+            i64::from(STORE_SEARCH_TARGET_DEFAULT),
+            STORE_SEARCH_TARGET_DEFAULT,
+            Some(&complete),
+        );
+        assert_eq!(
+            restart,
+            CandidateCollectionPlan {
+                refresh_mode: true,
+                refresh_top: false,
+                continuation_start: 0,
+            }
+        );
+
+        let bootstrap = candidate_collection_plan(
+            i64::from(STORE_SEARCH_TARGET_DEFAULT - 1),
+            STORE_SEARCH_TARGET_DEFAULT,
+            Some(&in_progress),
+        );
+        assert!(!bootstrap.refresh_mode);
+        assert!(!bootstrap.refresh_top);
+        assert_eq!(bootstrap.continuation_start, 2_100);
     }
 
     fn app_list_request() -> AppListRequest {

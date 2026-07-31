@@ -12,7 +12,11 @@ import { useEffect, useState, type FormEvent } from "react";
 import { ApiError } from "../api/client";
 import type { NaturalLanguageRecommendationResponse } from "../api/types";
 import { formatAgo, formatPrice, isStale, platformLabels } from "../app/format";
-import { apiClient, feedbackQueue } from "../app/runtime";
+import {
+  apiClient,
+  feedbackQueue,
+  localCredentialServiceOrigin,
+} from "../app/runtime";
 import { loadLocalCustomAiSettings } from "../app/localAiSettings";
 import { Button } from "../components/Button";
 import { Chip } from "../components/Chip";
@@ -108,14 +112,28 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
     setLoading(true);
     setError(null);
     try {
-      const userId = apiClient.sessionUserId();
-      const custom = userId ? await loadLocalCustomAiSettings(userId) : null;
+      await apiClient.ensureSession();
+      const userId = apiClient.isAccountAuthenticated() ? apiClient.sessionUserId() : null;
+      const custom = userId
+        ? await loadLocalCustomAiSettings(userId, localCredentialServiceOrigin)
+        : null;
+      const currentAccountUserId = apiClient.isAccountAuthenticated()
+        ? apiClient.sessionUserId()
+        : null;
+      if (userId !== currentAccountUserId) {
+        throw new ApiError({
+          code: "unauthenticated",
+          status: 401,
+          message: "account changed while loading local AI settings",
+        });
+      }
       setResult(
         await apiClient.naturalLanguageRecommendations(
           text,
           6,
           custom
             ? {
+                ownerUserId: custom.userId,
                 provider: "openai_compat",
                 baseUrl: custom.baseUrl,
                 model: custom.model,

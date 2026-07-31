@@ -35,6 +35,15 @@ pub struct GroupAdviceResult {
     pub evidence_ids: Vec<String>,
 }
 
+fn looks_like_html_or_url(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains('<')
+        || lower.contains('>')
+        || lower.contains("javascript:")
+        || lower.contains("http://")
+        || lower.contains("https://")
+}
+
 pub fn parse_group_advice(
     value: &Value,
     allowed_app_ids: &[u32],
@@ -56,6 +65,14 @@ pub fn parse_group_advice(
             )));
         }
     }
+    let mut selected = std::collections::HashSet::from([result.primary_app_id]);
+    for app_id in &result.alternatives {
+        if !selected.insert(*app_id) {
+            return Err(AiError::InvalidOutput(
+                "alternatives must be unique and exclude primary_app_id".into(),
+            ));
+        }
+    }
     if result.alternatives.len() > 4 {
         return Err(AiError::InvalidOutput(
             "alternatives exceeds 4 entries".into(),
@@ -66,14 +83,37 @@ pub fn parse_group_advice(
             "compromise_reason exceeds 500 chars".into(),
         ));
     }
+    if looks_like_html_or_url(&result.compromise_reason) {
+        return Err(AiError::InvalidOutput(
+            "compromise_reason contains disallowed content".into(),
+        ));
+    }
     if result.conflicts.len() > 8 {
         return Err(AiError::InvalidOutput("conflicts exceeds 8 entries".into()));
     }
+    for conflict in &result.conflicts {
+        if conflict.chars().count() > 400 || looks_like_html_or_url(conflict) {
+            return Err(AiError::InvalidOutput(
+                "group advice conflict contains disallowed content".into(),
+            ));
+        }
+    }
+    if result.evidence_ids.len() > 16 {
+        return Err(AiError::InvalidOutput(
+            "group advice evidence_ids exceeds 16 entries".into(),
+        ));
+    }
+    let mut seen_evidence = std::collections::HashSet::new();
     for id in &result.evidence_ids {
-        if !allowed_evidence.contains(id) {
+        if id.chars().count() > 120 || !allowed_evidence.contains(id) {
             return Err(AiError::InvalidOutput(format!(
                 "group advice evidence_id '{id}' is not allowed"
             )));
+        }
+        if !seen_evidence.insert(id) {
+            return Err(AiError::InvalidOutput(
+                "group advice evidence_ids must be unique".into(),
+            ));
         }
     }
     if (!result.compromise_reason.is_empty() || !result.conflicts.is_empty())
@@ -108,12 +148,21 @@ pub fn deterministic_group_advice(
     scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let primary = scored[0].0;
     let alternatives: Vec<u32> = scored.iter().skip(1).take(2).map(|(id, _)| *id).collect();
+    let has_primary_vote_evidence = votes.iter().any(|row| row.app_id == primary);
     Some(GroupAdviceResult {
         primary_app_id: primary,
         alternatives,
-        compromise_reason: "按聚合想玩票数与稳定排序给出确定性折中。".into(),
+        compromise_reason: if has_primary_vote_evidence {
+            "按聚合想玩票数与稳定排序给出确定性折中。".into()
+        } else {
+            String::new()
+        },
         conflicts: vec![],
-        evidence_ids: vec![format!("vote:aggregate:{primary}")],
+        evidence_ids: if has_primary_vote_evidence {
+            vec![format!("vote:aggregate:{primary}")]
+        } else {
+            vec![]
+        },
     })
 }
 
@@ -176,5 +225,24 @@ mod tests {
         .unwrap();
         assert_eq!(advice.primary_app_id, 20);
         assert_eq!(advice.alternatives, vec![10, 30]);
+    }
+
+    #[test]
+    fn rejects_duplicate_or_primary_alternatives() {
+        let value = json!({
+            "primary_app_id": 1,
+            "alternatives": [1, 2, 2],
+            "compromise_reason": "",
+            "conflicts": [],
+            "evidence_ids": []
+        });
+        assert!(parse_group_advice(&value, &[1, 2], &HashSet::new()).is_err());
+    }
+
+    #[test]
+    fn deterministic_advice_does_not_invent_vote_evidence() {
+        let advice = deterministic_group_advice(&[10, 20], &[]).unwrap();
+        assert!(advice.compromise_reason.is_empty());
+        assert!(advice.evidence_ids.is_empty());
     }
 }

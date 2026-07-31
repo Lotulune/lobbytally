@@ -26,7 +26,7 @@
 }
 ```
 
-访问令牌通过 `Authorization: Bearer <token>` 发送。公开目录端点可允许无令牌读取，但偏好、反馈和 AI 配额必须关联匿名会话。
+访问令牌通过 `Authorization: Bearer <token>` 发送。公开目录端点可允许无令牌读取；匿名会话仍可获得确定性推荐，但反馈写入和付费 AI 调用要求账号身份，AI 配额按账号及实际上游调用计数。
 
 ### `POST /v1/session/refresh`
 

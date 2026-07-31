@@ -1,4 +1,17 @@
 services:
+  mpgs-init:
+    image: ${MPGS_SERVER_IMAGE:-mpgs-server:local}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        install -d -o mpgs -g mpgs -m 0750
+        /var/lib/mpgs /var/lib/mpgs/avatars /var/lib/mpgs/backups
+        && chown -R mpgs:mpgs /var/lib/mpgs
+    volumes:
+      - ./runtime:/var/lib/mpgs
+    restart: "no"
+
   mpgs-server:
     build:
       context: ..
@@ -6,6 +19,7 @@ services:
       target: server
       args:
         MPGS_BUILD_PROFILE: ${MPGS_BUILD_PROFILE:-release}
+        MPGS_BUILD_GIT_SHA: ${MPGS_BUILD_GIT_SHA:-unknown}
     image: ${MPGS_SERVER_IMAGE:-mpgs-server:local}
     restart: unless-stopped
     env_file:
@@ -22,6 +36,9 @@ services:
       - "127.0.0.1:${MPGS_API_PORT:-18081}:8080"
     expose:
       - "8080"
+    depends_on:
+      mpgs-init:
+        condition: service_completed_successfully
 
   mpgs-worker:
     image: ${MPGS_SERVER_IMAGE:-mpgs-server:local}
@@ -35,8 +52,17 @@ services:
     volumes:
       - ./runtime:/var/lib/mpgs
     entrypoint: ["/usr/local/bin/mpgs-worker-loop"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/mpgs-worker-loop", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     depends_on:
-      - mpgs-server
+      mpgs-init:
+        condition: service_completed_successfully
+      mpgs-server:
+        condition: service_started
 
   mpgs-web:
     build:

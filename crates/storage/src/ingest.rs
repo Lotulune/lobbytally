@@ -11,7 +11,7 @@ use mpgs_steam_source::{
     STORE_SEARCH_SOURCE_NAME, StoreDetailsProposal, StoreSearchPage, content_hash,
 };
 
-use crate::catalog::{self, upsert_app, upsert_relation};
+use crate::catalog::{self, upsert_app, upsert_catalog_app, upsert_relation};
 use crate::curation::{
     has_active_override, insert_feature_evidence, insert_feature_evidence_with_document,
 };
@@ -25,14 +25,11 @@ pub fn ingest_app_catalog(
 ) -> StorageResult<()> {
     let app_type = app_type_str(proposal.app_type);
     let source_modified = proposal.last_modified.map(|s| i64::from(s) * 1000);
-    upsert_app(
+    upsert_catalog_app(
         conn,
         proposal.app_id,
         app_type,
         &proposal.name,
-        "unknown",
-        None,
-        None,
         source_modified,
         now_ms,
     )?;
@@ -49,7 +46,8 @@ pub fn ingest_app_catalog(
          ON CONFLICT(app_id) DO UPDATE SET
              capsule_url = excluded.capsule_url,
              source = excluded.source,
-             updated_at_ms = excluded.updated_at_ms",
+             updated_at_ms = excluded.updated_at_ms
+         WHERE app_media.capsule_url IS NULL OR trim(app_media.capsule_url) = ''",
         params![proposal.app_id, capsule_url, now_ms],
     )?;
     Ok(())

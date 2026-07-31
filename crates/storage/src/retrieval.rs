@@ -1,6 +1,7 @@
 //! Game retrieval documents, FTS sync, embeddings, hybrid search, and AI cache.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -96,6 +97,35 @@ pub struct HybridHit {
     pub score: f64,
     pub fts_rank: Option<f64>,
     pub vector_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VectorRank {
+    app_id: u32,
+    score: f64,
+}
+
+impl PartialEq for VectorRank {
+    fn eq(&self, other: &Self) -> bool {
+        self.app_id == other.app_id && self.score.to_bits() == other.score.to_bits()
+    }
+}
+
+impl Eq for VectorRank {}
+
+impl PartialOrd for VectorRank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VectorRank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            // For equal scores, the lower app id is the deterministic better rank.
+            .then_with(|| other.app_id.cmp(&self.app_id))
+    }
 }
 
 impl Repository {
@@ -620,26 +650,53 @@ impl Repository {
             query_vector.to_vec()
         };
         let dims = qvec.len();
-        let embeddings = self.list_embeddings_for_provider(provider, model, 10_000)?;
+        let vector_capacity = (limit as usize).saturating_mul(3).max(limit as usize);
         let mut vector_best: HashMap<u32, f64> = HashMap::new();
-        for emb in &embeddings {
-            if emb.dimensions != dims {
-                continue;
+        let mut vector_min_heap: BinaryHeap<Reverse<VectorRank>> = BinaryHeap::new();
+        self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT d.app_id, e.vector_blob, e.dimensions
+                 FROM game_embeddings e
+                 JOIN game_documents d ON d.document_id = e.document_id
+                 WHERE e.provider = ?1 AND e.model = ?2
+                   AND e.content_hash = d.content_hash
+                   AND d.visibility = 'public'
+                 ORDER BY e.rowid ASC",
+            )?;
+            let rows = stmt.query_map(params![provider, model], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u32,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)? as usize,
+                ))
+            })?;
+            for row in rows {
+                let (app_id, vector_blob, dimensions) = row?;
+                if dimensions != dims {
+                    continue;
+                }
+                let Ok(vector) = decode_f32_le(&vector_blob, dimensions) else {
+                    continue;
+                };
+                let score = cosine_similarity(&qvec, &vector);
+                if !score.is_finite() {
+                    continue;
+                }
+                offer_bounded_vector_score(
+                    &mut vector_best,
+                    &mut vector_min_heap,
+                    vector_capacity,
+                    app_id,
+                    score,
+                );
             }
-            let Ok(vec) = decode_f32_le(&emb.vector_blob, emb.dimensions) else {
-                continue;
-            };
-            let score = cosine_similarity(&qvec, &vec);
-            let entry = vector_best.entry(emb.app_id).or_insert(score);
-            if score > *entry {
-                *entry = score;
-            }
-        }
+            Ok(())
+        })?;
         let mut vector_order: Vec<(u32, f64)> = vector_best.iter().map(|(k, v)| (*k, *v)).collect();
-        vector_order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        vector_order.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let vector_ids: Vec<u32> = vector_order
             .into_iter()
-            .take((limit as usize).saturating_mul(3).max(limit as usize))
+            .take(vector_capacity)
             .map(|(id, _)| id)
             .collect();
 
@@ -654,6 +711,58 @@ impl Repository {
             });
         }
         Ok(out)
+    }
+}
+
+fn offer_bounded_vector_score(
+    best: &mut HashMap<u32, f64>,
+    min_heap: &mut BinaryHeap<Reverse<VectorRank>>,
+    capacity: usize,
+    app_id: u32,
+    score: f64,
+) {
+    if capacity == 0 {
+        return;
+    }
+    if let Some(previous) = best.get_mut(&app_id) {
+        if score.total_cmp(previous).is_gt() {
+            *previous = score;
+            min_heap.push(Reverse(VectorRank { app_id, score }));
+        }
+        return;
+    }
+
+    discard_stale_vector_ranks(best, min_heap);
+    let candidate = VectorRank { app_id, score };
+    if best.len() < capacity {
+        best.insert(app_id, score);
+        min_heap.push(Reverse(candidate));
+        return;
+    }
+    let Some(Reverse(worst)) = min_heap.peek().copied() else {
+        return;
+    };
+    if candidate <= worst {
+        return;
+    }
+    min_heap.pop();
+    best.remove(&worst.app_id);
+    best.insert(app_id, score);
+    min_heap.push(Reverse(candidate));
+}
+
+fn discard_stale_vector_ranks(
+    best: &HashMap<u32, f64>,
+    min_heap: &mut BinaryHeap<Reverse<VectorRank>>,
+) {
+    while let Some(Reverse(rank)) = min_heap.peek().copied() {
+        if best
+            .get(&rank.app_id)
+            .is_some_and(|score| score.to_bits() == rank.score.to_bits())
+        {
+            break;
+        }
+        min_heap.pop();
     }
 }
 
@@ -905,7 +1014,7 @@ fn reciprocal_rank_fusion(ranked_lists: &[Vec<u32>], k: u32) -> Vec<(u32, f64)> 
         }
     }
     let mut items: Vec<(u32, f64)> = scores.into_iter().collect();
-    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    items.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     items
 }
 
@@ -1125,6 +1234,81 @@ mod tests {
         // After sync with embeddings, current hashes should already be embedded.
         assert!(missing.is_empty());
         assert!(repo.embedding_count().unwrap() > 0);
+    }
+
+    #[test]
+    fn hybrid_search_scans_embeddings_older_than_the_first_ten_thousand() {
+        let repo = repo();
+        let target_app_id = 4_200_000_000_u32;
+        let filler_app_id = 4_200_000_001_u32;
+        let target_blob = encode_f32_le(&[1.0, 0.0]);
+        let filler_blob = encode_f32_le(&[-1.0, 0.0]);
+        repo.database()
+            .with_conn_mut(|conn| {
+                let tx = conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO apps (
+                         app_id, app_type, canonical_name, release_state,
+                         created_at_ms, updated_at_ms
+                     ) VALUES
+                         (?1, 'game', 'Old Vector Target', 'released', 1, 1),
+                         (?2, 'game', 'Recent Vector Fillers', 'released', 1, 1)",
+                    params![target_app_id, filler_app_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO game_documents (
+                         document_id, app_id, doc_type, language, title, body,
+                         content_hash, visibility, updated_at_ms
+                     ) VALUES (
+                         'bulk-target', ?1, 'identity', 'en', 'target', '',
+                         'bulk-target-hash', 'public', 1
+                     )",
+                    params![target_app_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO game_embeddings (
+                         document_id, provider, model, dimensions, vector_blob,
+                         is_l2_normalized, content_hash, created_at_ms
+                     ) VALUES (
+                         'bulk-target', 'bulk-provider', 'bulk-model', 2, ?1,
+                         1, 'bulk-target-hash', 1
+                     )",
+                    params![target_blob],
+                )?;
+                for index in 0..10_000_i64 {
+                    let document_id = format!("bulk-filler-{index:05}");
+                    tx.execute(
+                        "INSERT INTO game_documents (
+                             document_id, app_id, doc_type, language, title, body,
+                             content_hash, visibility, updated_at_ms
+                         ) VALUES (
+                             ?1, ?2, 'identity', 'en', 'filler', '',
+                             'bulk-filler-hash', 'public', ?3
+                         )",
+                        params![document_id, filler_app_id, index + 2],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO game_embeddings (
+                             document_id, provider, model, dimensions, vector_blob,
+                             is_l2_normalized, content_hash, created_at_ms
+                         ) VALUES (
+                             ?1, 'bulk-provider', 'bulk-model', 2, ?2,
+                             1, 'bulk-filler-hash', ?3
+                         )",
+                        params![document_id, filler_blob, index + 2],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        let hits = repo
+            .hybrid_search_with_vector("", &[1.0, 0.0], "bulk-provider", "bulk-model", 1)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].app_id, target_app_id);
+        assert_eq!(hits[0].vector_score, Some(1.0));
     }
 
     #[test]

@@ -190,4 +190,75 @@ describe("FeedbackQueue", () => {
     await queue.undo(entry.localId);
     expect(changes).toBe(2);
   });
+
+  it("quarantines account A feedback instead of replaying it as account B", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(
+      "mpgs.session.v1",
+      JSON.stringify(sessionBody({ user_id: "u_a", access_token: "token-a" })),
+    );
+    const { fetchFn: fetchA } = makeFetchStub({
+      "POST /v1/feedback": () => {
+        throw new TypeError("offline");
+      },
+    });
+    const queueA = new FeedbackQueue(
+      new ApiClient({ baseUrl: "http://x", fetchFn: fetchA, storage }),
+      storage,
+    );
+    queueA.submit(7, "like");
+    await queueA.flush();
+    expect(queueA.pendingCount()).toBe(1);
+
+    storage.setItem(
+      "mpgs.session.v1",
+      JSON.stringify(sessionBody({ user_id: "u_b", access_token: "token-b" })),
+    );
+    const { fetchFn: fetchB, calls: callsB } = makeFetchStub({
+      "POST /v1/feedback": () => feedbackRecord(99, 7, "like"),
+    });
+    const queueB = new FeedbackQueue(
+      new ApiClient({ baseUrl: "http://x", fetchFn: fetchB, storage }),
+      storage,
+    );
+
+    await queueB.flush();
+
+    expect(callsB.filter((call) => call.url.endsWith("/v1/feedback"))).toHaveLength(0);
+    expect(queueB.pendingCount()).toBe(0);
+    expect(queueB.snapshot()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ ownerUserId: "u_a", cancelled: false })]),
+    );
+  });
+
+  it("adopts a legacy ownerless queue only when the persisted account is present", () => {
+    const storage = new MemoryStorage();
+    seedAccountSession(storage, { user_id: "legacy-owner" });
+    storage.setItem(
+      "mpgs.feedback.v1",
+      JSON.stringify({
+        entries: [
+          {
+            localId: "legacy-local",
+            appId: 4,
+            type: "like",
+            idempotencyKey: "legacy-idem",
+            clientCreatedAtMs: 1,
+            feedbackId: null,
+            cancelled: false,
+            undone: false,
+            syncError: null,
+          },
+        ],
+      }),
+    );
+    const { fetchFn } = makeFetchStub({});
+    const queue = new FeedbackQueue(
+      new ApiClient({ baseUrl: "http://x", fetchFn, storage }),
+      storage,
+    );
+
+    expect(queue.snapshot()[0]?.ownerUserId).toBe("legacy-owner");
+    expect(storage.getItem("mpgs.feedback.v1")).toContain('"ownerUserId":"legacy-owner"');
+  });
 });

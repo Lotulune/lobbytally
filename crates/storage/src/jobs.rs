@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::{EnqueueJob, JobRecord};
@@ -87,32 +87,48 @@ pub fn lease_jobs(
         ));
     }
 
-    // Recover expired leases first.
-    conn.execute(
+    // BEGIN IMMEDIATE makes recovery, selection, and lease acquisition one
+    // writer-serialized operation even when multiple Database handles point at
+    // the same SQLite file.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
+    // A lease consumes an attempt when it is acquired. An expired final
+    // attempt must therefore become dead instead of being recycled forever.
+    tx.execute(
         "UPDATE jobs
-         SET status = 'pending', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
-         WHERE status = 'leased' AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?1",
+         SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
+         WHERE status = 'leased'
+           AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?1)",
+        params![now_ms],
+    )?;
+    // Repair pending rows left over by older recovery logic.
+    tx.execute(
+        "UPDATE jobs
+         SET status = 'dead', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
+         WHERE status = 'pending' AND attempts >= max_attempts",
         params![now_ms],
     )?;
 
     let sql = if source_filter.is_some() {
         "SELECT job_id FROM jobs
-         WHERE status = 'pending' AND due_at_ms <= ?1 AND source = ?2
+         WHERE status = 'pending' AND attempts < max_attempts
+           AND due_at_ms <= ?1 AND source = ?2
          ORDER BY priority ASC, due_at_ms ASC, job_id ASC
          LIMIT ?3"
     } else {
         "SELECT job_id FROM jobs
-         WHERE status = 'pending' AND due_at_ms <= ?1
+         WHERE status = 'pending' AND attempts < max_attempts AND due_at_ms <= ?1
          ORDER BY priority ASC, due_at_ms ASC, job_id ASC
          LIMIT ?2"
     };
 
     let ids: Vec<i64> = if let Some(source) = source_filter {
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = tx.prepare(sql)?;
         let rows = stmt.query_map(params![now_ms, source, limit], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     } else {
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = tx.prepare(sql)?;
         let rows = stmt.query_map(params![now_ms, limit], |row| row.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
@@ -120,19 +136,20 @@ pub fn lease_jobs(
     let mut leased = Vec::new();
     let expires = now_ms.saturating_add(lease_ms);
     for id in ids {
-        let changed = conn.execute(
+        let changed = tx.execute(
             "UPDATE jobs
              SET status = 'leased', lease_owner = ?1, lease_expires_at_ms = ?2,
                  attempts = attempts + 1, updated_at_ms = ?3
-             WHERE job_id = ?4 AND status = 'pending'",
+             WHERE job_id = ?4 AND status = 'pending' AND attempts < max_attempts",
             params![owner, expires, now_ms, id],
         )?;
         if changed == 1
-            && let Some(job) = get_job(conn, id)?
+            && let Some(job) = get_job(&tx, id)?
         {
             leased.push(job);
         }
     }
+    tx.commit()?;
     Ok(leased)
 }
 
@@ -143,44 +160,39 @@ pub fn complete_job(
     idempotency_key: &str,
     now_ms: i64,
 ) -> StorageResult<JobRecord> {
+    if owner.trim().is_empty() {
+        return Err(StorageError::validation("lease owner is required"));
+    }
     if idempotency_key.trim().is_empty() || idempotency_key.len() > 128 {
         return Err(StorageError::validation(
             "completion idempotency_key must be between 1 and 128 bytes",
         ));
     }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE jobs
+         SET status = 'completed', lease_owner = NULL, lease_expires_at_ms = NULL,
+             completion_idempotency_key = ?1, updated_at_ms = ?2
+         WHERE job_id = ?3 AND status = 'leased' AND lease_owner = ?4
+           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?2",
+        params![idempotency_key, now_ms, job_id, owner],
+    )?;
     let job =
-        get_job(conn, job_id)?.ok_or_else(|| StorageError::not_found(format!("job {job_id}")))?;
+        get_job(&tx, job_id)?.ok_or_else(|| StorageError::not_found(format!("job {job_id}")))?;
+    if changed == 1 {
+        tx.commit()?;
+        return Ok(job);
+    }
     if job.status == "completed" {
         if job.completion_idempotency_key.as_deref() == Some(idempotency_key) {
+            tx.commit()?;
             return Ok(job);
         }
         return Err(StorageError::conflict(
             "job already completed with different idempotency context",
         ));
     }
-    if job.status != "leased" {
-        return Err(StorageError::lease(format!(
-            "job {job_id} is not leased (status={})",
-            job.status
-        )));
-    }
-    if job.lease_owner.as_deref() != Some(owner) {
-        return Err(StorageError::lease(format!(
-            "job {job_id} is leased by another owner"
-        )));
-    }
-    if job.lease_expires_at_ms.is_some_and(|exp| exp <= now_ms) {
-        return Err(StorageError::lease(format!("job {job_id} lease expired")));
-    }
-
-    conn.execute(
-        "UPDATE jobs
-         SET status = 'completed', lease_owner = NULL, lease_expires_at_ms = NULL,
-             completion_idempotency_key = ?1, updated_at_ms = ?2
-         WHERE job_id = ?3",
-        params![idempotency_key, now_ms, job_id],
-    )?;
-    get_job(conn, job_id)?.ok_or_else(|| StorageError::not_found(format!("job {job_id}")))
+    Err(lease_state_error(&job, owner, now_ms, "completed"))
 }
 
 pub fn fail_job(
@@ -191,15 +203,8 @@ pub fn fail_job(
     retry_delay_ms: i64,
     now_ms: i64,
 ) -> StorageResult<JobRecord> {
-    let job =
-        get_job(conn, job_id)?.ok_or_else(|| StorageError::not_found(format!("job {job_id}")))?;
-    if job.status != "leased" || job.lease_owner.as_deref() != Some(owner) {
-        return Err(StorageError::lease(format!(
-            "job {job_id} cannot be failed by {owner}"
-        )));
-    }
-    if job.lease_expires_at_ms.is_some_and(|exp| exp <= now_ms) {
-        return Err(StorageError::lease(format!("job {job_id} lease expired")));
+    if owner.trim().is_empty() {
+        return Err(StorageError::validation("lease owner is required"));
     }
     if !matches!(
         error_category,
@@ -217,26 +222,34 @@ pub fn fail_job(
         error_category,
         "auth" | "not_found" | "invalid_payload" | "parse_changed"
     );
-    let dead = permanent || job.attempts >= job.max_attempts;
-    if dead {
-        conn.execute(
-            "UPDATE jobs
-             SET status = 'dead', last_error_category = ?1,
-                 lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?2
-             WHERE job_id = ?3",
-            params![error_category, now_ms, job_id],
-        )?;
-    } else {
-        let due = now_ms.saturating_add(retry_delay_ms.max(1));
-        conn.execute(
-            "UPDATE jobs
-             SET status = 'pending', last_error_category = ?1, due_at_ms = ?2,
-                 lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3
-             WHERE job_id = ?4",
-            params![error_category, due, now_ms, job_id],
-        )?;
+    let due = now_ms.saturating_add(retry_delay_ms.max(1));
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE jobs
+         SET status = CASE WHEN ?1 = 1 OR attempts >= max_attempts
+                           THEN 'dead' ELSE 'pending' END,
+             last_error_category = ?2,
+             due_at_ms = CASE WHEN ?1 = 1 OR attempts >= max_attempts
+                              THEN due_at_ms ELSE ?3 END,
+             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?4
+         WHERE job_id = ?5 AND status = 'leased' AND lease_owner = ?6
+           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?4",
+        params![
+            i64::from(permanent),
+            error_category,
+            due,
+            now_ms,
+            job_id,
+            owner
+        ],
+    )?;
+    let job =
+        get_job(&tx, job_id)?.ok_or_else(|| StorageError::not_found(format!("job {job_id}")))?;
+    if changed == 1 {
+        tx.commit()?;
+        return Ok(job);
     }
-    get_job(conn, job_id)?.ok_or_else(|| StorageError::not_found(format!("job {job_id}")))
+    Err(lease_state_error(&job, owner, now_ms, "failed"))
 }
 
 pub fn get_job(conn: &Connection, job_id: i64) -> StorageResult<Option<JobRecord>> {
@@ -305,6 +318,25 @@ pub fn has_active_job(
     .map_err(Into::into)
 }
 
+fn lease_state_error(job: &JobRecord, owner: &str, now_ms: i64, action: &str) -> StorageError {
+    if job.status != "leased" {
+        return StorageError::lease(format!(
+            "job {} cannot be {action} (status={})",
+            job.job_id, job.status
+        ));
+    }
+    if job.lease_owner.as_deref() != Some(owner) {
+        return StorageError::lease(format!("job {} is leased by another owner", job.job_id));
+    }
+    if job
+        .lease_expires_at_ms
+        .is_none_or(|expires| expires <= now_ms)
+    {
+        return StorageError::lease(format!("job {} lease expired", job.job_id));
+    }
+    StorageError::lease(format!("job {} lease state changed", job.job_id))
+}
+
 fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
     Ok(JobRecord {
         job_id: row.get(0)?,
@@ -323,4 +355,100 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {
         payload_json: row.get(13)?,
         last_error_category: row.get(14)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn an_expired_final_attempt_is_recovered_as_dead() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            let job_id = enqueue_job(
+                conn,
+                &EnqueueJob {
+                    source: "test".into(),
+                    task_type: "refresh".into(),
+                    entity_key: "42".into(),
+                    priority: 1,
+                    due_at_ms: 0,
+                    idempotency_key: "final-attempt".into(),
+                    payload_json: None,
+                    max_attempts: 1,
+                },
+                0,
+            )?;
+            let first = lease_jobs(conn, "worker-a", 1, 1_000, 0, None)?;
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].attempts, 1);
+
+            let retried = lease_jobs(conn, "worker-b", 1, 1_000, 1_000, None)?;
+            assert!(retried.is_empty());
+            let recovered = get_job(conn, job_id)?.expect("job");
+            assert_eq!(recovered.status, "dead");
+            assert_eq!(recovered.attempts, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn concurrent_complete_and_fail_have_one_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("jobs.db");
+        let completing_db = Database::open(&path).unwrap();
+        completing_db.migrate().unwrap();
+        let job_id = completing_db
+            .with_conn_mut(|conn| {
+                let job_id = enqueue_job(
+                    conn,
+                    &EnqueueJob {
+                        source: "test".into(),
+                        task_type: "refresh".into(),
+                        entity_key: "42".into(),
+                        priority: 1,
+                        due_at_ms: 0,
+                        idempotency_key: "complete-fail-race".into(),
+                        payload_json: None,
+                        max_attempts: 3,
+                    },
+                    0,
+                )?;
+                assert_eq!(lease_jobs(conn, "worker", 1, 10_000, 0, None)?.len(), 1);
+                Ok(job_id)
+            })
+            .unwrap();
+        let failing_db = Database::open(&path).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+
+        let complete_barrier = barrier.clone();
+        let complete = std::thread::spawn(move || {
+            complete_barrier.wait();
+            completing_db
+                .with_conn_mut(|conn| complete_job(conn, job_id, "worker", "completion", 1))
+        });
+        let fail_barrier = barrier.clone();
+        let fail = std::thread::spawn(move || {
+            fail_barrier.wait();
+            failing_db.with_conn_mut(|conn| fail_job(conn, job_id, "worker", "network", 1_000, 1))
+        });
+        barrier.wait();
+        let complete_result = complete.join().unwrap();
+        let fail_result = fail.join().unwrap();
+        assert_eq!(
+            usize::from(complete_result.is_ok()) + usize::from(fail_result.is_ok()),
+            1
+        );
+
+        let final_db = Database::open(&path).unwrap();
+        let final_job = final_db
+            .with_conn(|conn| get_job(conn, job_id))
+            .unwrap()
+            .expect("job");
+        assert!(matches!(final_job.status.as_str(), "completed" | "pending"));
+    }
 }

@@ -194,11 +194,12 @@ export async function checkServiceConnection(
   }
   if (
     discovery.discovery_version !== SUPPORTED_DISCOVERY_VERSION ||
-    discovery.api_version !== SUPPORTED_API_VERSION
+    discovery.api_version !== SUPPORTED_API_VERSION ||
+    discovery.api_base_path !== `/${SUPPORTED_API_VERSION}`
   ) {
     return failure(
       "incompatible",
-      `unsupported discovery_version=${discovery.discovery_version} api_version=${discovery.api_version}`,
+      `unsupported discovery_version=${discovery.discovery_version} api_version=${discovery.api_version} api_base_path=${discovery.api_base_path}`,
     );
   }
 

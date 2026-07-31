@@ -278,3 +278,17 @@ jobs:
           path: e2e-tests/artifacts/
           if-no-files-found: warn
           retention-days: 14
+
+  publish-containers:
+    name: Publish paired production containers
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - web
+      - quality
+      - build-linux
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/container-images.yml
+    with:
+      release_sha: ${{ github.sha }}

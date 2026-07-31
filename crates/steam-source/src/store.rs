@@ -271,6 +271,10 @@ struct FullGameDto {
 pub struct StoreDetailsParseResult {
     pub details: StoreDetailsProposal,
     pub relations: Vec<AppRelationProposal>,
+    /// Aggregate media rejections observed while parsing this response.
+    ///
+    /// Callers can surface these counters without logging raw third-party URLs.
+    pub media_stats: MediaParseStats,
 }
 
 pub fn parse_store_details(
@@ -376,14 +380,19 @@ pub fn parse_store_details(
     );
 
     let mut media_stats = MediaParseStats::default();
-    let screenshots = data
-        .screenshots
-        .map(|items| normalize_screenshots(items, &mut media_stats));
-    let movies = data
-        .movies
-        .map(|items| normalize_movies(items, &mut media_stats));
-    // Counters are intentional for observability in tests / future metrics hooks.
-    let _ = media_stats;
+    let screenshots = data.screenshots.and_then(|items| {
+        let explicitly_empty = items.is_empty();
+        let normalized = normalize_screenshots(items, &mut media_stats);
+        // Only an explicit upstream [] is authoritative empty. If Steam sent
+        // entries but every one was rejected, treat the field as unusable so
+        // ingest preserves the last known-good snapshot.
+        (explicitly_empty || !normalized.is_empty()).then_some(normalized)
+    });
+    let movies = data.movies.and_then(|items| {
+        let explicitly_empty = items.is_empty();
+        let normalized = normalize_movies(items, &mut media_stats);
+        (explicitly_empty || !normalized.is_empty()).then_some(normalized)
+    });
 
     let details = StoreDetailsProposal {
         app_id,
@@ -444,7 +453,11 @@ pub fn parse_store_details(
         });
     }
 
-    Ok(StoreDetailsParseResult { details, relations })
+    Ok(StoreDetailsParseResult {
+        details,
+        relations,
+        media_stats,
+    })
 }
 
 fn normalize_price(
@@ -580,10 +593,6 @@ fn normalize_screenshots(
             continue;
         };
         let source_id = id.to_string();
-        if !seen.insert(source_id.clone()) {
-            stats.screenshots_deduped += 1;
-            continue;
-        }
         let thumb = normalize_image_url(item.path_thumbnail.as_deref());
         let full = normalize_image_url(item.path_full.as_deref());
         let (Some(thumbnail_url), Some(full_url)) = (thumb, full) else {
@@ -591,6 +600,12 @@ fn normalize_screenshots(
             stats.urls_rejected += 1;
             continue;
         };
+        // Do not let an invalid first occurrence suppress a later usable row
+        // carrying the same Steam source id.
+        if !seen.insert(source_id.clone()) {
+            stats.screenshots_deduped += 1;
+            continue;
+        }
         let sort_order = out.len() as u16;
         out.push(StoreScreenshotProposal {
             source_id,
@@ -602,10 +617,7 @@ fn normalize_screenshots(
     out
 }
 
-fn normalize_movies(
-    items: Vec<MovieDto>,
-    stats: &mut MediaParseStats,
-) -> Vec<StoreMovieProposal> {
+fn normalize_movies(items: Vec<MovieDto>, stats: &mut MediaParseStats) -> Vec<StoreMovieProposal> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for item in items {
@@ -618,10 +630,6 @@ fn normalize_movies(
             continue;
         };
         let source_id = id.to_string();
-        if !seen.insert(source_id.clone()) {
-            stats.movies_deduped += 1;
-            continue;
-        }
         let Some(poster_url) = normalize_image_url(item.thumbnail.as_deref()) else {
             stats.movies_rejected += 1;
             stats.urls_rejected += 1;
@@ -669,6 +677,11 @@ fn normalize_movies(
         stats.urls_rejected += url_rejections;
         if mp4_url.is_none() && hls_h264_url.is_none() && dash_h264_url.is_none() {
             stats.movies_rejected += 1;
+            continue;
+        }
+        // As with screenshots, only a usable row claims the source id.
+        if !seen.insert(source_id.clone()) {
+            stats.movies_deduped += 1;
             continue;
         }
 
@@ -1256,7 +1269,10 @@ mod tests {
         let movies = result.details.movies.expect("movies present");
         assert_eq!(movies.len(), 2);
         assert_eq!(movies[0].source_id, "257363622");
-        assert_eq!(movies[0].title.as_deref(), Some("1.0 Release Date Reveal Trailer"));
+        assert_eq!(
+            movies[0].title.as_deref(),
+            Some("1.0 Release Date Reveal Trailer")
+        );
         assert!(movies[0].highlight);
         assert!(movies[0].mp4_url.is_none());
         assert_eq!(
@@ -1280,7 +1296,8 @@ mod tests {
     fn missing_media_fields_yield_none_not_empty_vecs() {
         let raw = RawResponse::validate(
             200,
-            br#"{"42":{"success":true,"data":{"steam_appid":42,"type":"game","name":"No Media"}}}"#.to_vec(),
+            br#"{"42":{"success":true,"data":{"steam_appid":42,"type":"game","name":"No Media"}}}"#
+                .to_vec(),
             Some("application/json".into()),
             1024,
         )
@@ -1355,6 +1372,38 @@ mod tests {
         )
         .unwrap();
         let result = parse_store_details(&StoreDetailsRequest::new(42), &raw).unwrap();
-        assert_eq!(result.details.movies.as_deref(), Some(&[][..]));
+        assert_eq!(result.details.movies, None);
+        assert_eq!(result.media_stats.movies_rejected, 1);
+        assert_eq!(result.media_stats.urls_rejected, 1);
+    }
+
+    #[test]
+    fn nonempty_all_invalid_media_is_not_an_authoritative_empty_snapshot() {
+        let raw = RawResponse::validate(
+            200,
+            br#"{"42":{"success":true,"data":{"steam_appid":42,"type":"game","screenshots":[{"id":1,"path_thumbnail":"https://example.com/t.jpg","path_full":"https://example.com/f.jpg"}],"movies":[{"id":2,"thumbnail":"https://shared.akamai.steamstatic.com/p.jpg","hls_h264":"https://example.com/m.m3u8"}]}}}"#.to_vec(),
+            Some("application/json".into()),
+            4096,
+        )
+        .unwrap();
+        let result = parse_store_details(&StoreDetailsRequest::new(42), &raw).unwrap();
+        assert_eq!(result.details.screenshots, None);
+        assert_eq!(result.details.movies, None);
+        assert_eq!(result.media_stats.screenshots_rejected, 1);
+        assert_eq!(result.media_stats.movies_rejected, 1);
+    }
+
+    #[test]
+    fn invalid_duplicate_does_not_hide_later_usable_media() {
+        let raw = RawResponse::validate(
+            200,
+            br#"{"42":{"success":true,"data":{"steam_appid":42,"type":"game","screenshots":[{"id":1,"path_thumbnail":"https://example.com/t.jpg","path_full":"https://example.com/f.jpg"},{"id":1,"path_thumbnail":"https://shared.akamai.steamstatic.com/t.jpg","path_full":"https://shared.akamai.steamstatic.com/f.jpg"}],"movies":[{"id":2,"thumbnail":"https://shared.akamai.steamstatic.com/p.jpg","hls_h264":"https://example.com/m.m3u8"},{"id":2,"thumbnail":"https://shared.akamai.steamstatic.com/p.jpg","hls_h264":"https://video.akamai.steamstatic.com/m.m3u8"}]}}}"#.to_vec(),
+            Some("application/json".into()),
+            4096,
+        )
+        .unwrap();
+        let result = parse_store_details(&StoreDetailsRequest::new(42), &raw).unwrap();
+        assert_eq!(result.details.screenshots.as_ref().map(Vec::len), Some(1));
+        assert_eq!(result.details.movies.as_ref().map(Vec::len), Some(1));
     }
 }

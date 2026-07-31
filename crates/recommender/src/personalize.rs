@@ -22,14 +22,12 @@ pub fn hard_filter(
         }
     }
 
-    // Party size completely disjoint => drop.
-    if let (Some(min), Some(max)) = (recommended_min, recommended_max) {
-        let party = prefs.party_size;
-        if party < min || party > max {
-            // Allow soft mismatch only if ranges overlap poorly? Spec says hard filter on
-            // complete non-intersection. Party outside [min,max] is non-intersecting.
-            return false;
-        }
+    // A known bound is enough to prove a mismatch; the other bound may remain unknown.
+    let party = prefs.party_size;
+    if recommended_min.is_some_and(|min| party < min)
+        || recommended_max.is_some_and(|max| party > max)
+    {
+        return false;
     }
 
     // Require some multiplayer evidence confidence.
@@ -109,7 +107,7 @@ pub fn apply_personalization(
     let party = prefs.party_size;
     let (size_fit, size_mismatch) = match (recommended_min, recommended_max) {
         (Some(min), Some(max)) if party >= min && party <= max => {
-            let mid = f64::from(min + max) / 2.0;
+            let mid = (f64::from(min) + f64::from(max)) / 2.0;
             let span = f64::from(max.saturating_sub(min).max(1));
             let dist = (f64::from(party) - mid).abs() / span;
             (unit(1.0 - dist * 0.5), 0.0)
@@ -122,7 +120,11 @@ pub fn apply_personalization(
             };
             (0.2, unit(outside / 8.0))
         }
-        _ => (0.5, 0.0),
+        (Some(min), None) if party >= min => (0.75, 0.0),
+        (Some(min), None) => (0.2, unit(f64::from(min - party) / 8.0)),
+        (None, Some(max)) if party <= max => (0.75, 0.0),
+        (None, Some(max)) => (0.2, unit(f64::from(party - max) / 8.0)),
+        (None, None) => (0.5, 0.0),
     };
     signals.multiplayer.group_size_fit = size_fit;
     signals.multiplayer.group_size_mismatch = size_mismatch;
@@ -205,5 +207,106 @@ fn availability_fit(prefs: &UserPreferences, availability: &CandidateAvailabilit
         0.5
     } else {
         total / f64::from(known)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_personalization, hard_filter};
+    use mpgs_domain::{CandidateAvailability, MultiplayerSignals, RankingSignals, UserPreferences};
+
+    fn multiplayer_candidate() -> RankingSignals {
+        RankingSignals {
+            multiplayer: MultiplayerSignals {
+                private_session: 1.0,
+                ..Default::default()
+            },
+            data_confidence: 1.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_sided_player_bounds_filter_known_mismatches() {
+        let availability = CandidateAvailability::default();
+        let signals = multiplayer_candidate();
+
+        let one_player = UserPreferences {
+            party_size: 1,
+            ..UserPreferences::default()
+        };
+        assert!(!hard_filter(
+            &one_player,
+            Some(2),
+            None,
+            None,
+            &signals,
+            &availability,
+        ));
+
+        let five_players = UserPreferences {
+            party_size: 5,
+            ..UserPreferences::default()
+        };
+        assert!(!hard_filter(
+            &five_players,
+            None,
+            Some(4),
+            None,
+            &signals,
+            &availability,
+        ));
+
+        let four_players = UserPreferences::default();
+        assert!(hard_filter(
+            &four_players,
+            Some(2),
+            None,
+            None,
+            &signals,
+            &availability,
+        ));
+        assert!(hard_filter(
+            &four_players,
+            None,
+            Some(4),
+            None,
+            &signals,
+            &availability,
+        ));
+    }
+
+    #[test]
+    fn one_sided_player_bounds_contribute_partial_fit() {
+        let availability = CandidateAvailability::default();
+        let prefs = UserPreferences {
+            party_size: 4,
+            ..UserPreferences::default()
+        };
+
+        let mut min_only = multiplayer_candidate();
+        apply_personalization(&prefs, &mut min_only, Some(2), None, &availability);
+        assert_eq!(min_only.multiplayer.group_size_fit, 0.75);
+        assert_eq!(min_only.multiplayer.group_size_mismatch, 0.0);
+
+        let mut max_only = multiplayer_candidate();
+        apply_personalization(&prefs, &mut max_only, None, Some(4), &availability);
+        assert_eq!(max_only.multiplayer.group_size_fit, 0.75);
+        assert_eq!(max_only.multiplayer.group_size_mismatch, 0.0);
+    }
+
+    #[test]
+    fn player_range_midpoint_does_not_overflow_u8() {
+        let availability = CandidateAvailability::default();
+        let prefs = UserPreferences {
+            party_size: 2,
+            ..UserPreferences::default()
+        };
+        let mut signals = multiplayer_candidate();
+
+        apply_personalization(&prefs, &mut signals, Some(2), Some(u8::MAX), &availability);
+
+        assert_eq!(signals.multiplayer.group_size_fit, 0.75);
+        assert!(signals.multiplayer.group_size_fit.is_finite());
     }
 }

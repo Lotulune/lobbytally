@@ -147,6 +147,120 @@ describe("ApiClient session", () => {
     expect(ids[0]).toBeDefined();
     expect(new Set(ids).size).toBe(1);
   });
+
+  it("does not retry a credential-verification 401", async () => {
+    const storage = new MemoryStorage();
+    let loginAttempts = 0;
+    const { fetchFn, calls } = makeFetchStub({
+      "POST /v1/session/anonymous": () =>
+        jsonResponse(sessionBody({ account: false, user_id: "anon-1" })),
+      "POST /v1/auth/login": () => {
+        loginAttempts += 1;
+        return jsonResponse(
+          { error: { code: "unauthenticated", message: "invalid username or password" } },
+          { status: 401 },
+        );
+      },
+      "POST /v1/session/refresh": () =>
+        jsonResponse(sessionBody({ account: false, user_id: "anon-1" })),
+    });
+    const client = new ApiClient({ baseUrl: "http://x", fetchFn, storage });
+
+    await expect(client.login({ username: "alice", password: "wrong-password" })).rejects.toMatchObject({
+      status: 401,
+    });
+
+    expect(loginAttempts).toBe(1);
+    expect(calls.filter((call) => call.url.endsWith("/v1/session/refresh"))).toHaveLength(0);
+  });
+
+  it("clears the local account immediately even when remote logout never settles", async () => {
+    const storage = new MemoryStorage();
+    seedAccountSession(storage);
+    const never = new Promise<Response>(() => undefined);
+    const { fetchFn, calls } = makeFetchStub({
+      "POST /v1/auth/logout": () => never,
+    });
+    const client = new ApiClient({ baseUrl: "http://x", fetchFn, storage });
+
+    await client.logout();
+
+    expect(client.isAccountAuthenticated()).toBe(false);
+    expect(storage.getItem("mpgs.session.v1")).toBeNull();
+    expect(calls.filter((call) => call.url.endsWith("/v1/auth/logout"))).toHaveLength(1);
+  });
+
+  it("does not let an in-flight refresh restore a session after local logout", async () => {
+    const storage = new MemoryStorage();
+    seedAccountSession(storage, { expires_at_ms: 0 });
+    let resolveRefresh!: (response: Response) => void;
+    const refreshResponse = new Promise<Response>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const { fetchFn } = makeFetchStub({
+      "POST /v1/auth/refresh": () => refreshResponse,
+      "POST /v1/auth/logout": () => new Response(null, { status: 204 }),
+    });
+    const client = new ApiClient({ baseUrl: "http://x", fetchFn, storage });
+    const refreshing = client.ensureSession();
+
+    await client.logout();
+    resolveRefresh(jsonResponse(sessionBody({ access_token: "late-token", account: true })));
+    await refreshing;
+
+    expect(client.isAccountAuthenticated()).toBe(false);
+    expect(storage.getItem("mpgs.session.v1")).toBeNull();
+  });
+
+  it("does not retry an old account request with a newly signed-in account", async () => {
+    const storage = new MemoryStorage();
+    seedAccountSession(storage, {
+      access_token: "old-access",
+      refresh_token: "old-refresh",
+      user_id: "u_old",
+    });
+    let resolveVote!: (response: Response) => void;
+    let markVoteStarted!: () => void;
+    const voteStarted = new Promise<void>((resolve) => {
+      markVoteStarted = resolve;
+    });
+    const voteResponse = new Promise<Response>((resolve) => {
+      resolveVote = resolve;
+    });
+    const { fetchFn, calls } = makeFetchStub({
+      "POST /v1/games/42/play-intent": () => {
+        markVoteStarted();
+        return voteResponse;
+      },
+      "POST /v1/auth/login": () =>
+        jsonResponse(
+          sessionBody({
+            access_token: "new-access",
+            refresh_token: "new-refresh",
+            user_id: "u_new",
+            account: true,
+          }),
+        ),
+    });
+    const client = new ApiClient({ baseUrl: "http://x", fetchFn, storage });
+
+    const pendingVote = client.setPlayIntent(42, true);
+    await voteStarted;
+    await client.login({ username: "new-user", password: "new-password-long" });
+    resolveVote(
+      jsonResponse(
+        { error: { code: "unauthenticated", message: "old token expired" } },
+        { status: 401 },
+      ),
+    );
+
+    await expect(pendingVote).rejects.toMatchObject({ status: 401 });
+    expect(client.sessionUserId()).toBe("u_new");
+    expect(
+      calls.filter((call) => call.url.endsWith("/v1/games/42/play-intent")),
+    ).toHaveLength(1);
+    expect(calls.filter((call) => call.url.endsWith("/v1/auth/refresh"))).toHaveLength(0);
+  });
 });
 
 describe("ApiClient ETag cache", () => {
@@ -289,6 +403,7 @@ describe("ApiClient natural-language recommendations", () => {
     const client = new ApiClient({ baseUrl: "http://x", fetchFn, storage });
 
     await client.naturalLanguageRecommendations("自建服合作", 6, {
+      ownerUserId: "u_test",
       provider: "openai_compat",
       baseUrl: "https://provider.example/v1",
       model: "model-a",
@@ -307,5 +422,46 @@ describe("ApiClient natural-language recommendations", () => {
         multi_model: false,
       },
     });
+  });
+
+  it("never sends a custom AI secret under a different account", async () => {
+    const storage = new MemoryStorage();
+    seedAccountSession(storage, { user_id: "u_new" });
+    const { fetchFn, calls } = makeFetchStub({
+      "POST /v1/recommendations/natural-language": () =>
+        jsonResponse({ items: [], ai_status: "used" }),
+    });
+    const client = new ApiClient({ baseUrl: "http://x", fetchFn, storage });
+
+    await expect(
+      client.naturalLanguageRecommendations("自建服合作", 6, {
+        ownerUserId: "u_old",
+        provider: "openai_compat",
+        baseUrl: "https://provider.example/v1",
+        model: "model-a",
+        apiKey: "old-account-secret",
+      }),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("does not send AI settings probe credentials after an account switch", async () => {
+    const storage = new MemoryStorage();
+    seedAccountSession(storage, { user_id: "u_new" });
+    const { fetchFn, calls } = makeFetchStub({
+      "POST /v1/me/ai-settings/test": () => new Response(null, { status: 204 }),
+    });
+    const client = new ApiClient({ baseUrl: "http://x", fetchFn, storage });
+
+    await expect(
+      client.testAiSettings({
+        ownerUserId: "u_old",
+        provider: "openai_compat",
+        baseUrl: "https://provider.example/v1",
+        model: "model-a",
+        apiKey: "old-account-secret",
+      }),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(calls).toHaveLength(0);
   });
 });

@@ -20,8 +20,10 @@ pub struct CandidateEvidence {
 
 /// Expand the evidence ids a model may cite for one feed candidate.
 ///
-/// Models frequently invent ids like `feature:online_coop:{app}` or bare app
-/// ids; allow those when the corresponding facts appear in the prompt payload.
+/// Models frequently emit normalized ids like `feature:online_coop:{app}` or
+/// bare app ids. Only add an alias when the exact corresponding fact is present
+/// in the prompt payload; a generic profile object must never authorize facts
+/// that were not sent.
 pub fn expand_candidate_evidence_ids(
     app_id: u32,
     prompt_item: &Value,
@@ -29,55 +31,85 @@ pub fn expand_candidate_evidence_ids(
 ) -> HashSet<String> {
     let mut ids = base;
     ids.insert(format!("app:{app_id}:identity"));
-    ids.insert(format!("app:{app_id}:profile"));
     ids.insert(format!("app:{app_id}"));
     ids.insert(app_id.to_string());
-    ids.insert(format!("review:{app_id}:summary"));
 
     if prompt_item
         .get("name")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.trim().is_empty())
+        .is_some_and(evidence_value_is_present)
     {
         ids.insert(format!("app:{app_id}:name"));
     }
-    if !prompt_item
-        .get("party")
-        .map(|value| value.is_null())
-        .unwrap_or(true)
-    {
+
+    let party = prompt_item.get("party").and_then(Value::as_object);
+    let party_min_present = party.is_some_and(|party| {
+        ["recommended_min", "min"]
+            .iter()
+            .any(|key| party.get(*key).is_some_and(evidence_value_is_present))
+    });
+    let party_max_present = party.is_some_and(|party| {
+        ["recommended_max", "max"]
+            .iter()
+            .any(|key| party.get(*key).is_some_and(evidence_value_is_present))
+    });
+    if party_min_present || party_max_present {
         ids.insert(format!("app:{app_id}:party"));
         ids.insert(format!("feature:party:{app_id}"));
+    }
+    if party_min_present {
         ids.insert(format!("feature:recommended_min_players:{app_id}"));
+    }
+    if party_max_present {
         ids.insert(format!("feature:recommended_max_players:{app_id}"));
     }
-    if !prompt_item
-        .get("multiplayer")
-        .map(|value| value.is_null())
-        .unwrap_or(true)
-    {
-        ids.insert(format!("app:{app_id}:multiplayer"));
-        ids.insert(format!("feature:dominant_mode:{app_id}"));
-        // Common model-invented feature ids for multiplayer facts in the prompt.
-        ids.insert(format!("feature:online_coop:{app_id}"));
-        ids.insert(format!("feature:private_session:{app_id}"));
-        ids.insert(format!("feature:self_hosted_server:{app_id}"));
-        ids.insert(format!("feature:crossplay:{app_id}"));
-        ids.insert(format!("feature:drop_in_out:{app_id}"));
+
+    let multiplayer = prompt_item.get("multiplayer").and_then(Value::as_object);
+    let multiplayer_aliases = [
+        ("dominant_mode", "dominant_mode"),
+        ("online_coop", "online_coop"),
+        ("private_session", "private_session"),
+        ("self_hosted_server", "self_hosted_server"),
+        ("crossplay", "crossplay"),
+        ("drop_in_out", "drop_in_out"),
+    ];
+    let mut multiplayer_present = false;
+    for (field, alias) in multiplayer_aliases {
+        if multiplayer
+            .and_then(|values| values.get(field))
+            .is_some_and(evidence_value_is_present)
+        {
+            multiplayer_present = true;
+            ids.insert(format!("feature:{alias}:{app_id}"));
+        }
     }
-    if !prompt_item
+    if multiplayer_present {
+        ids.insert(format!("app:{app_id}:multiplayer"));
+    }
+
+    if prompt_item
         .get("release_date")
-        .map(|value| value.is_null())
-        .unwrap_or(true)
-        || !prompt_item
-            .get("section")
-            .map(|value| value.is_null())
-            .unwrap_or(true)
+        .is_some_and(evidence_value_is_present)
     {
         ids.insert(format!("app:{app_id}:release"));
         ids.insert(format!("feature:release_date:{app_id}"));
     }
+    if prompt_item
+        .get("section")
+        .is_some_and(evidence_value_is_present)
+    {
+        ids.insert(format!("app:{app_id}:section"));
+    }
     ids
+}
+
+fn evidence_value_is_present(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
 }
 
 /// Drop forged evidence ids and orphaned claims so ranking scores can still apply.
@@ -140,18 +172,11 @@ pub fn sanitize_rank_result(
         let mut cautions = string_list(item_obj, "cautions", 0, MAX_CAUTIONS, MAX_REASON_CHARS)
             .unwrap_or_default();
 
-        // Soft-attach real prompt evidence when the model wrote claims but used forged ids.
+        // Never launder an unsupported claim by attaching unrelated prompt evidence.
         if (!reasons.is_empty() || !cautions.is_empty()) && evidence.is_empty() {
-            let mut fallback: Vec<String> = candidate.evidence_ids.iter().cloned().collect();
-            fallback.sort();
-            if fallback.is_empty() {
-                reasons.clear();
-                cautions.clear();
-                stripped = true;
-            } else {
-                evidence = fallback.into_iter().take(3).collect();
-                stripped = true;
-            }
+            reasons.clear();
+            cautions.clear();
+            stripped = true;
         }
 
         let fit_score = match unit_field(item_obj, "fit_score", 0) {
@@ -199,15 +224,8 @@ pub fn sanitize_rank_result(
         summary_evidence_ids.clear();
         stripped = true;
     } else if !summary_out.is_empty() && summary_evidence_ids.is_empty() {
-        let mut fallback: Vec<String> = all_evidence.iter().map(|s| (*s).to_owned()).collect();
-        fallback.sort();
-        if fallback.is_empty() {
-            summary_out.clear();
-            stripped = true;
-        } else {
-            summary_evidence_ids = fallback.into_iter().take(4).collect();
-            stripped = true;
-        }
+        summary_out.clear();
+        stripped = true;
     }
     if summary_out.chars().count() > MAX_SUMMARY_CHARS {
         summary_out = summary_out.chars().take(MAX_SUMMARY_CHARS).collect();
@@ -585,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_keeps_reasons_after_dropping_forged_evidence() {
+    fn sanitize_drops_claims_instead_of_attaching_unrelated_evidence() {
         let raw = json!({
             "recommendations": [{
                 "app_id": 1,
@@ -600,25 +618,14 @@ mod tests {
         });
         let (result, stripped) = sanitize_rank_result(&raw, &candidates(), 20).unwrap();
         assert!(stripped);
-        assert_eq!(result.recommendations[0].reasons, vec!["good private coop"]);
-        assert!(
-            result.recommendations[0]
-                .reason_evidence_ids
-                .iter()
-                .all(|id| id == "e1")
-        );
-        assert_eq!(result.summary, "nice picks");
-        assert!(!result.summary_evidence_ids.is_empty());
-        assert!(
-            result
-                .summary_evidence_ids
-                .iter()
-                .all(|id| id == "e1" || id == "e2")
-        );
+        assert!(result.recommendations[0].reasons.is_empty());
+        assert!(result.recommendations[0].reason_evidence_ids.is_empty());
+        assert!(result.summary.is_empty());
+        assert!(result.summary_evidence_ids.is_empty());
     }
 
     #[test]
-    fn expand_candidate_evidence_ids_adds_prompt_aliases() {
+    fn expand_candidate_evidence_ids_only_adds_aliases_for_present_facts() {
         let item = json!({
             "name": "Game",
             "multiplayer": {"dominant_mode": "coop", "online_coop": true},
@@ -628,5 +635,25 @@ mod tests {
         assert!(expanded.contains("feature:online_coop:42"));
         assert!(expanded.contains("app:42:multiplayer"));
         assert!(expanded.contains("42"));
+        assert!(!expanded.contains("feature:self_hosted_server:42"));
+        assert!(!expanded.contains("feature:crossplay:42"));
+        assert!(!expanded.contains("app:42:profile"));
+        assert!(!expanded.contains("review:42:summary"));
+    }
+
+    #[test]
+    fn null_profile_fields_do_not_create_evidence_aliases() {
+        let item = json!({
+            "party": {"recommended_min": null, "recommended_max": null},
+            "multiplayer": {"dominant_mode": null, "self_hosted_server": null},
+            "release_date": null,
+            "section": "popular"
+        });
+        let expanded = expand_candidate_evidence_ids(7, &item, HashSet::new());
+        assert!(!expanded.contains("app:7:party"));
+        assert!(!expanded.contains("app:7:multiplayer"));
+        assert!(!expanded.contains("feature:self_hosted_server:7"));
+        assert!(!expanded.contains("app:7:release"));
+        assert!(expanded.contains("app:7:section"));
     }
 }

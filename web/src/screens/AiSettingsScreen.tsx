@@ -1,10 +1,10 @@
 // Styles: styles/screens/settings.css（.ai-settings / .ai-settings-panel 作用域）
 // + base.css 共享类。
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "../api/client";
 import type { AiSettings } from "../api/types";
-import { apiClient } from "../app/runtime";
+import { apiClient, localCredentialServiceOrigin } from "../app/runtime";
 import {
   buildEasyRoutePlan,
   preferChatModelIds,
@@ -109,6 +109,7 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [localCustom, setLocalCustom] = useState<LocalCustomAiSettings | null>(null);
+  const settingsOwnerRef = useRef<string | null>(null);
 
   const modelOptions = useMemo(() => preferChatModelIds(discoveredModels), [discoveredModels]);
 
@@ -120,14 +121,38 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
   };
 
   useEffect(() => {
-    let cancelled = false;
-    const userId = apiClient.sessionUserId();
-    void Promise.all([
-      apiClient.getAiSettings(),
-      userId ? loadLocalCustomAiSettings(userId) : Promise.resolve(null),
-    ])
-      .then(([next, local]) => {
-        if (!cancelled) {
+    let disposed = false;
+    let generation = 0;
+    let observedUserId: string | null | undefined;
+    const load = () => {
+      const userId = apiClient.isAccountAuthenticated() ? apiClient.sessionUserId() : null;
+      if (userId === observedUserId) return;
+      observedUserId = userId;
+      const currentGeneration = ++generation;
+      settingsOwnerRef.current = null;
+      setSettings(null);
+      setLocalCustom(null);
+      setApiKey("");
+      setDiscoveredModels([]);
+      setRoutes([]);
+      setPlanNotes([]);
+      setErrorMessage(null);
+      if (!userId) return;
+
+      void Promise.all([
+        apiClient.getAiSettings(),
+        loadLocalCustomAiSettings(userId, localCredentialServiceOrigin),
+      ])
+        .then(([next, local]) => {
+          if (
+            disposed ||
+            currentGeneration !== generation ||
+            !apiClient.isAccountAuthenticated() ||
+            apiClient.sessionUserId() !== userId
+          ) {
+            return;
+          }
+          settingsOwnerRef.current = userId;
           setLocalCustom(local);
           applySettings(
             local
@@ -149,19 +174,46 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
             setRoutingPreset(local.routingPreset);
             setRoutes(local.routes ?? []);
           }
-        }
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
+        })
+        .catch((error: unknown) => {
+          if (
+            disposed ||
+            currentGeneration !== generation ||
+            !apiClient.isAccountAuthenticated() ||
+            apiClient.sessionUserId() !== userId
+          ) {
+            return;
+          }
           const message = aiErrorMessage(error, "load");
           setErrorMessage(message);
           toast.show(message);
-        }
-      });
+        });
+    };
+    load();
+    const unsubscribe = apiClient.subscribeAuth(load);
     return () => {
-      cancelled = true;
+      disposed = true;
+      generation += 1;
+      settingsOwnerRef.current = null;
+      unsubscribe();
     };
   }, [toast]);
+
+  const requireSettingsOwner = (): string => {
+    const ownerUserId = settingsOwnerRef.current;
+    if (
+      !ownerUserId ||
+      !apiClient.isAccountAuthenticated() ||
+      apiClient.sessionUserId() !== ownerUserId
+    ) {
+      throw new ApiError({
+        code: "unauthenticated",
+        status: 401,
+        message: "account changed while editing AI settings",
+      });
+    }
+    return ownerUserId;
+  };
 
   const applyEasyPlan = (selected: string) => {
     const plan = buildEasyRoutePlan(selected);
@@ -181,8 +233,9 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
     setErrorMessage(null);
     setBusy(true);
     try {
-      const userId = apiClient.sessionUserId();
-      const effectiveKey = apiKey || localCustom?.apiKey || "";
+      const userId = requireSettingsOwner();
+      const effectiveKey =
+        apiKey || (localCustom?.userId === userId ? localCustom.apiKey : "");
       if (mode === "custom" && (!userId || !effectiveKey)) {
         throw new ApiError({
           code: "invalid_argument",
@@ -204,8 +257,9 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
               provider: "openai_compat",
               baseUrl,
               model: model.trim(),
+              expectedAccountUserId: userId,
             }
-          : { mode },
+          : { mode, expectedAccountUserId: userId },
       );
       if (mode === "custom" && userId) {
         const trimmed = model.trim();
@@ -231,11 +285,15 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
               : null,
           routes: resolvedRoutes,
         };
-        await saveLocalCustomAiSettings(local);
+        await saveLocalCustomAiSettings(local, localCredentialServiceOrigin);
+        requireSettingsOwner();
         setLocalCustom(local);
         if (resolvedRoutes) setRoutes(resolvedRoutes);
       } else {
-        await removeLocalCustomAiSettings();
+        if (userId) {
+          await removeLocalCustomAiSettings(userId, localCredentialServiceOrigin);
+        }
+        requireSettingsOwner();
         setLocalCustom(null);
         setRoutes([]);
         setPlanNotes([]);
@@ -259,13 +317,17 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
     setErrorMessage(null);
     setBusy(true);
     try {
-      const effectiveKey = apiKey || localCustom?.apiKey || "";
+      const userId = requireSettingsOwner();
+      const effectiveKey =
+        apiKey || (localCustom?.userId === userId ? localCustom.apiKey : "");
       await apiClient.testAiSettings({
+        ownerUserId: userId,
         provider: "openai_compat",
         baseUrl,
         model: model.trim() || "probe-model",
         apiKey: effectiveKey,
       });
+      requireSettingsOwner();
       toast.show("连接正常");
     } catch (error: unknown) {
       const message = aiErrorMessage(error, "test");
@@ -277,7 +339,9 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
   };
 
   const discover = async (): Promise<string[]> => {
-    const effectiveKey = apiKey || localCustom?.apiKey || "";
+    const userId = requireSettingsOwner();
+    const effectiveKey =
+      apiKey || (localCustom?.userId === userId ? localCustom.apiKey : "");
     if (!baseUrl.trim() || !effectiveKey) {
       throw new ApiError({
         code: "invalid_argument",
@@ -286,9 +350,11 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
       });
     }
     const { models } = await apiClient.discoverCustomModels({
+      ownerUserId: userId,
       baseUrl,
       apiKey: effectiveKey,
     });
+    requireSettingsOwner();
     const list = preferChatModelIds(models);
     setDiscoveredModels(list.length > 0 ? list : models);
     return list.length > 0 ? list : models;
@@ -349,8 +415,10 @@ export function AiSettingsScreen({ embedded = false }: { embedded?: boolean }) {
 
   const removeKey = async () => {
     try {
-      await removeLocalCustomAiSettings();
-      const next = await apiClient.deleteCustomAiKey();
+      const userId = requireSettingsOwner();
+      const next = await apiClient.deleteCustomAiKey(userId);
+      await removeLocalCustomAiSettings(userId, localCredentialServiceOrigin);
+      requireSettingsOwner();
       setApiKey("");
       setLocalCustom(null);
       setRoutes([]);

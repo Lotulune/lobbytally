@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyPendingPreferencePatch,
   defaultPreferences,
@@ -8,6 +8,7 @@ import {
   PLATFORM_OPTIONS,
   preferencesChanged,
   queuePreferencePatch,
+  setPreferenceOwnerResolver,
   SESSION_OPTIONS,
   toggleMember,
 } from "../src/app/preferences";
@@ -22,6 +23,10 @@ function memoryStorage() {
 }
 
 describe("preference helpers", () => {
+  afterEach(() => {
+    setPreferenceOwnerResolver(null);
+  });
+
   it("uses the normalized macOS platform identifier", () => {
     expect(PLATFORM_OPTIONS.find((option) => option.label === "macOS")?.id).toBe("macos");
   });
@@ -117,5 +122,84 @@ describe("preference helpers", () => {
 
     await expect(flushPendingPreferencePatch(api, storage)).rejects.toThrow("offline");
     expect(hasPendingPreferencePatch(storage)).toBe(true);
+  });
+
+  it("lets the first authenticated account claim an onboarding patch", async () => {
+    const storage = memoryStorage();
+    let currentUserId: string | null = null;
+    setPreferenceOwnerResolver(() => currentUserId);
+    queuePreferencePatch({ party_size: 6 }, storage);
+
+    currentUserId = "u_first";
+    const putPreferences = vi.fn(async (preferences: ReturnType<typeof defaultPreferences>) => ({
+      ...preferences,
+      version: preferences.version + 1,
+    }));
+    const api = {
+      sessionUserId: () => currentUserId,
+      isAccountAuthenticated: () => currentUserId !== null,
+      getPreferences: vi.fn(async () => defaultPreferences()),
+      putPreferences,
+    };
+
+    await flushPendingPreferencePatch(api, storage);
+
+    expect(putPreferences).toHaveBeenCalledWith(
+      expect.objectContaining({ party_size: 6, version: 1 }),
+    );
+    expect(hasPendingPreferencePatch(storage)).toBe(false);
+  });
+
+  it("keeps different accounts' pending patches isolated", async () => {
+    const storage = memoryStorage();
+    let currentUserId: string | null = "u_a";
+    setPreferenceOwnerResolver(() => currentUserId);
+    queuePreferencePatch({ party_size: 6 }, storage);
+
+    currentUserId = "u_b";
+    expect(hasPendingPreferencePatch(storage)).toBe(false);
+    queuePreferencePatch({ party_size: 8 }, storage);
+    const api = {
+      sessionUserId: () => currentUserId,
+      isAccountAuthenticated: () => true,
+      getPreferences: vi.fn(async () => defaultPreferences()),
+      putPreferences: vi.fn(async (preferences: ReturnType<typeof defaultPreferences>) => ({
+        ...preferences,
+        version: 2,
+      })),
+    };
+    await flushPendingPreferencePatch(api, storage);
+    expect(api.putPreferences).toHaveBeenCalledWith(
+      expect.objectContaining({ party_size: 8 }),
+    );
+
+    currentUserId = "u_a";
+    expect(hasPendingPreferencePatch(storage)).toBe(true);
+    expect(applyPendingPreferencePatch(defaultPreferences(), storage).party_size).toBe(6);
+  });
+
+  it("does not delete a newer patch queued while an older PUT is in flight", async () => {
+    const storage = memoryStorage();
+    setPreferenceOwnerResolver(() => "u_a");
+    queuePreferencePatch({ party_size: 6 }, storage);
+    let resolvePut!: (value: ReturnType<typeof defaultPreferences>) => void;
+    const putResult = new Promise<ReturnType<typeof defaultPreferences>>((resolve) => {
+      resolvePut = resolve;
+    });
+    const api = {
+      sessionUserId: () => "u_a",
+      isAccountAuthenticated: () => true,
+      getPreferences: vi.fn(async () => defaultPreferences()),
+      putPreferences: vi.fn(() => putResult),
+    };
+    const flushing = flushPendingPreferencePatch(api, storage);
+    await vi.waitFor(() => expect(api.putPreferences).toHaveBeenCalledTimes(1));
+
+    queuePreferencePatch({ party_size: 8 }, storage);
+    resolvePut({ ...defaultPreferences(), party_size: 6, version: 2 });
+    await flushing;
+
+    expect(hasPendingPreferencePatch(storage)).toBe(true);
+    expect(applyPendingPreferencePatch(defaultPreferences(), storage).party_size).toBe(8);
   });
 });

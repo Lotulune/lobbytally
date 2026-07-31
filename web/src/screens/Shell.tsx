@@ -49,15 +49,48 @@ export function Shell() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
+    let profileGeneration = 0;
+
     const loadProfile = () => {
-      if (!apiClient.isAccountAuthenticated()) {
+      const generation = ++profileGeneration;
+      const expectedUserId = apiClient.sessionUserId();
+      if (!apiClient.isAccountAuthenticated() || expectedUserId === null) {
         setProfile(null);
         return;
       }
-      void apiClient.getMe().then(setProfile).catch(() => setProfile(null));
+      void apiClient
+        .getMe()
+        .then((nextProfile) => {
+          if (
+            disposed ||
+            generation !== profileGeneration ||
+            !apiClient.isAccountAuthenticated() ||
+            apiClient.sessionUserId() !== expectedUserId
+          ) {
+            return;
+          }
+          setProfile(nextProfile);
+        })
+        .catch(() => {
+          if (
+            disposed ||
+            generation !== profileGeneration ||
+            !apiClient.isAccountAuthenticated() ||
+            apiClient.sessionUserId() !== expectedUserId
+          ) {
+            return;
+          }
+          setProfile(null);
+        });
     };
     loadProfile();
-    return apiClient.subscribeAuth(loadProfile);
+    const unsubscribe = apiClient.subscribeAuth(loadProfile);
+    return () => {
+      disposed = true;
+      profileGeneration += 1;
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => subscribeAccountGate(() => setAuthOpen(true)), []);

@@ -105,6 +105,17 @@ describe("checkServiceConnection", () => {
     expect(result2).toMatchObject({ ok: false, kind: "incompatible" });
   });
 
+  it("rejects an API base path the runtime client cannot apply", async () => {
+    const { fetchFn } = makeFetchStub({
+      "GET /.well-known/mpgs": () =>
+        jsonResponse({ ...DISCOVERY, api_base_path: "/api/v1" }),
+    });
+
+    const result = await checkServiceConnection(ORIGIN, { fetchFn });
+
+    expect(result).toMatchObject({ ok: false, kind: "incompatible" });
+  });
+
   it("maps a readiness 503 to not_ready, never to an address error", async () => {
     const { fetchFn } = makeFetchStub(
       healthyRoutes({

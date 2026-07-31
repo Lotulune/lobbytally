@@ -102,6 +102,11 @@ export interface ApiClientOptions {
   now?: () => number;
 }
 
+interface ExpectedPrincipal {
+  userId: string;
+  account: boolean;
+}
+
 function randomId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
@@ -115,6 +120,8 @@ export class ApiClient {
   private readonly now: () => number;
   private session: SessionTokens | null = null;
   private sessionPromise: Promise<SessionTokens | null> | null = null;
+  /** Prevent an in-flight refresh/bootstrap from restoring a session after logout. */
+  private sessionRevision = 0;
   private authListeners = new Set<() => void>();
 
   constructor(options: ApiClientOptions = {}) {
@@ -151,6 +158,7 @@ export class ApiClient {
   }
 
   private saveSession(session: SessionTokens | null): void {
+    this.sessionRevision += 1;
     this.session = session;
     if (session) {
       this.storage.setItem(SESSION_KEY, JSON.stringify(session));
@@ -194,13 +202,14 @@ export class ApiClient {
     if (this.session && this.session.expires_at_ms > this.now() + 30_000) {
       return this.session;
     }
-    this.sessionPromise ??= this.bootstrapSession().finally(() => {
+    const expectedRevision = this.sessionRevision;
+    this.sessionPromise ??= this.bootstrapSession(expectedRevision).finally(() => {
       this.sessionPromise = null;
     });
     return this.sessionPromise;
   }
 
-  private async bootstrapSession(): Promise<SessionTokens | null> {
+  private async bootstrapSession(expectedRevision: number): Promise<SessionTokens | null> {
     const current = this.session;
     if (current && current.refresh_expires_at_ms > this.now() + 30_000) {
       try {
@@ -209,6 +218,7 @@ export class ApiClient {
           body: { refresh_token: current.refresh_token },
           auth: false,
         });
+        if (this.sessionRevision !== expectedRevision) return this.session;
         this.saveSession(refreshed);
         return refreshed;
       } catch (error) {
@@ -217,9 +227,11 @@ export class ApiClient {
         if (!(error instanceof ApiError && error.status === 401)) throw error;
       }
     }
+    if (this.sessionRevision !== expectedRevision) return this.session;
     const fresh = await this.rawJson<SessionTokens>("POST", "/v1/session/anonymous", {
       auth: false,
     });
+    if (this.sessionRevision !== expectedRevision) return this.session;
     this.saveSession({ ...fresh, account: false });
     return fresh;
   }
@@ -233,19 +245,36 @@ export class ApiClient {
       body?: unknown;
       auth?: boolean;
       headers?: Record<string, string>;
+      /** Credential-verification endpoints use 401 as their business verdict. */
+      retryAuthOn401?: boolean;
+      /** Refuse to send or retry after the active identity changes. */
+      expectedPrincipal?: ExpectedPrincipal;
     } = {},
   ): Promise<Response> {
     const headers: Record<string, string> = {
       "x-device-id": this.deviceId(),
       ...args.headers,
     };
+    let requestSession: SessionTokens | null = null;
     if (args.body !== undefined) {
       headers["content-type"] = "application/json";
     }
     if (args.auth) {
-      const session = await this.ensureSession();
-      if (session) {
-        headers.authorization = `Bearer ${session.access_token}`;
+      requestSession = await this.ensureSession();
+      if (
+        args.expectedPrincipal !== undefined &&
+        (!requestSession ||
+          requestSession.user_id !== args.expectedPrincipal.userId ||
+          requestSession.account !== args.expectedPrincipal.account)
+      ) {
+        throw new ApiError({
+          code: "unauthenticated",
+          status: 401,
+          message: "account changed before the request could be sent",
+        });
+      }
+      if (requestSession) {
+        headers.authorization = `Bearer ${requestSession.access_token}`;
       }
     }
     let response: Response;
@@ -281,11 +310,20 @@ export class ApiClient {
         offline: false,
       });
     }
-    if (response.status === 401 && args.auth) {
+    if (response.status === 401 && args.auth && args.retryAuthOn401 !== false) {
+      // A request started by one identity must never be replayed with another
+      // identity's token after a logout, login, registration, or account switch.
+      const current = this.session;
+      if (!requestSession || !current || !this.samePrincipal(requestSession, current)) {
+        return response;
+      }
       // Access token rejected: refresh (keeping the refresh token) and retry once.
-      this.invalidateAccess();
+      // A concurrent request may already have refreshed this same principal.
+      if (current.access_token === requestSession.access_token) {
+        this.invalidateAccess();
+      }
       const session = await this.ensureSession();
-      if (session) {
+      if (session && this.samePrincipal(requestSession, session)) {
         headers.authorization = `Bearer ${session.access_token}`;
         try {
           response = await this.fetchFn(`${this.baseUrl}${path}`, {
@@ -305,6 +343,10 @@ export class ApiClient {
       }
     }
     return response;
+  }
+
+  private samePrincipal(left: SessionTokens, right: SessionTokens): boolean {
+    return left.user_id === right.user_id && left.account === right.account;
   }
 
   private async parseError(response: Response): Promise<ApiError> {
@@ -327,7 +369,13 @@ export class ApiClient {
   private async rawJson<T>(
     method: string,
     path: string,
-    args: { body?: unknown; auth?: boolean; headers?: Record<string, string> } = {},
+    args: {
+      body?: unknown;
+      auth?: boolean;
+      headers?: Record<string, string>;
+      retryAuthOn401?: boolean;
+      expectedPrincipal?: ExpectedPrincipal;
+    } = {},
   ): Promise<T> {
     const response = await this.rawResponse(method, path, args);
     if (!response.ok) {
@@ -340,15 +388,26 @@ export class ApiClient {
     method: string,
     path: string,
     body?: unknown,
+    options: {
+      headers?: Record<string, string>;
+      expectedAccountUserId?: string;
+    } = {},
   ): Promise<Response> {
-    if (!this.isAccountAuthenticated()) {
+    const activeUserId = this.sessionUserId();
+    const expectedUserId = options.expectedAccountUserId ?? activeUserId;
+    if (!this.isAccountAuthenticated() || !activeUserId || activeUserId !== expectedUserId) {
       throw new ApiError({
         code: "unauthenticated",
         status: 401,
         message: "sign in to continue",
       });
     }
-    const response = await this.rawResponse(method, path, { auth: true, body });
+    const response = await this.rawResponse(method, path, {
+      auth: true,
+      body,
+      headers: options.headers,
+      expectedPrincipal: { userId: expectedUserId, account: true },
+    });
     if (!response.ok) throw await this.parseError(response);
     return response;
   }
@@ -359,7 +418,8 @@ export class ApiClient {
     body: Blob,
     contentType?: string,
   ): Promise<Response> {
-    if (!this.isAccountAuthenticated()) {
+    const expectedUserId = this.sessionUserId();
+    if (!this.isAccountAuthenticated() || !expectedUserId) {
       throw new ApiError({
         code: "unauthenticated",
         status: 401,
@@ -367,13 +427,13 @@ export class ApiClient {
       });
     }
     const resolvedType = contentType || contentTypeForBlob(body);
-    const send = async (): Promise<Response> => {
+    const send = async (): Promise<{ response: Response; session: SessionTokens }> => {
       const session = await this.ensureSession();
-      if (!session) {
+      if (!session?.account || session.user_id !== expectedUserId) {
         throw new ApiError({ code: "unauthenticated", status: 401, message: "sign in to continue" });
       }
       try {
-        return await this.fetchFn(`${this.baseUrl}${path}`, {
+        const response = await this.fetchFn(`${this.baseUrl}${path}`, {
           method,
           headers: {
             "x-device-id": this.deviceId(),
@@ -381,7 +441,24 @@ export class ApiClient {
             "content-type": resolvedType,
           },
           body,
+          redirect: "manual",
         });
+        if (
+          response.type === "opaqueredirect" ||
+          response.status === 301 ||
+          response.status === 302 ||
+          response.status === 303 ||
+          response.status === 307 ||
+          response.status === 308
+        ) {
+          throw new ApiError({
+            code: "network",
+            status: response.status,
+            message: "server redirected the request; refusing to follow with credentials",
+            offline: false,
+          });
+        }
+        return { response, session };
       } catch (cause) {
         throw new ApiError({
           code: "network",
@@ -391,10 +468,22 @@ export class ApiClient {
         });
       }
     };
-    let response = await send();
+    let sent = await send();
+    let response = sent.response;
     if (response.status === 401) {
-      this.invalidateAccess();
-      response = await send();
+      const current = this.session;
+      if (
+        !current?.account ||
+        current.user_id !== expectedUserId ||
+        !this.samePrincipal(sent.session, current)
+      ) {
+        throw await this.parseError(response);
+      }
+      if (current.access_token === sent.session.access_token) {
+        this.invalidateAccess();
+      }
+      sent = await send();
+      response = sent.response;
     }
     if (!response.ok) throw await this.parseError(response);
     return response;
@@ -453,7 +542,11 @@ export class ApiClient {
     }
     let response: Response;
     try {
-      response = await this.rawResponse("GET", path, { auth, headers });
+      const expectedPrincipal =
+        auth && this.session
+          ? { userId: this.session.user_id, account: this.session.account }
+          : undefined;
+      response = await this.rawResponse("GET", path, { auth, headers, expectedPrincipal });
     } catch (error) {
       if (error instanceof ApiError && error.offline && cached) {
         return { data: cached.data, fetchedAtMs: cached.fetchedAtMs, fromOfflineCache: true };
@@ -518,7 +611,11 @@ export class ApiClient {
   }
 
   private async uncachedGet<T>(path: string, auth: boolean): Promise<CachedResult<T>> {
-    const data = await this.rawJson<T>("GET", path, { auth });
+    const expectedPrincipal =
+      auth && this.session
+        ? { userId: this.session.user_id, account: this.session.account }
+        : undefined;
+    const data = await this.rawJson<T>("GET", path, { auth, expectedPrincipal });
     return { data, fetchedAtMs: this.now(), fromOfflineCache: false };
   }
 
@@ -544,6 +641,7 @@ export class ApiClient {
     query: string,
     limit = 6,
     customAi?: {
+      ownerUserId: string;
       provider: "openai_compat";
       baseUrl: string;
       model: string;
@@ -562,6 +660,9 @@ export class ApiClient {
       "/v1/recommendations/natural-language",
       {
         auth: true,
+        expectedPrincipal: customAi
+          ? { userId: customAi.ownerUserId, account: true }
+          : undefined,
         body: {
           query,
           limit,
@@ -617,19 +718,16 @@ export class ApiClient {
     idempotencyKey: string;
     clientCreatedAtMs: number;
   }): Promise<FeedbackRecord> {
-    if (!this.isAccountAuthenticated()) {
-      throw new ApiError({ code: "unauthenticated", status: 401, message: "sign in to continue" });
-    }
-    const response = await this.rawResponse("POST", "/v1/feedback", {
-      auth: true,
-      headers: { "idempotency-key": args.idempotencyKey },
-      body: {
+    const response = await this.accountResponse(
+      "POST",
+      "/v1/feedback",
+      {
         app_id: args.appId,
         type: args.type,
         client_created_at_ms: args.clientCreatedAtMs,
       },
-    });
-    if (!response.ok) throw await this.parseError(response);
+      { headers: { "idempotency-key": args.idempotencyKey } },
+    );
     return (await response.json()) as FeedbackRecord;
   }
 
@@ -650,8 +748,13 @@ export class ApiClient {
     password: string;
     deviceLabel?: string;
   }): Promise<SessionTokens> {
+    const expectedPrincipal = this.session
+      ? { userId: this.session.user_id, account: this.session.account }
+      : undefined;
     const session = await this.rawJson<SessionTokens>("POST", "/v1/auth/register", {
       auth: true,
+      retryAuthOn401: false,
+      expectedPrincipal,
       body: {
         username: args.username,
         display_name: args.displayName,
@@ -671,8 +774,13 @@ export class ApiClient {
     deviceLabel?: string;
     mergePreference?: "anonymous" | "account";
   }): Promise<SessionTokens> {
+    const expectedPrincipal = this.session
+      ? { userId: this.session.user_id, account: this.session.account }
+      : undefined;
     const session = await this.rawJson<SessionTokens>("POST", "/v1/auth/login", {
       auth: true,
+      retryAuthOn401: false,
+      expectedPrincipal,
       body: {
         username: args.username,
         password: args.password,
@@ -687,15 +795,36 @@ export class ApiClient {
   }
 
   async logout(): Promise<void> {
-    await this.accountResponse("POST", "/v1/auth/logout");
-    this.saveSession(null);
-    this.clearCachedResponses();
+    await this.localLogoutWithBestEffortRevoke("/v1/auth/logout");
   }
 
   async logoutAll(): Promise<void> {
-    await this.accountResponse("POST", "/v1/auth/logout-all");
+    await this.localLogoutWithBestEffortRevoke("/v1/auth/logout-all");
+  }
+
+  /**
+   * Local sign-out must not depend on connectivity. Capture the current token,
+   * clear it synchronously, then make a non-blocking best-effort revocation.
+   */
+  private async localLogoutWithBestEffortRevoke(path: string): Promise<void> {
+    const session = this.session;
     this.saveSession(null);
     this.clearCachedResponses();
+    if (!session?.account) return;
+    try {
+      const revoke = this.fetchFn(`${this.baseUrl}${path}`, {
+        method: "POST",
+        headers: {
+          "x-device-id": this.deviceId(),
+          authorization: `Bearer ${session.access_token}`,
+        },
+        body: null,
+        redirect: "manual",
+      });
+      void revoke.catch(() => undefined);
+    } catch {
+      // The local credential is already gone. Remote expiry/revocation is best effort.
+    }
   }
 
   async changePassword(oldPassword: string, newPassword: string): Promise<void> {
@@ -746,45 +875,68 @@ export class ApiClient {
     baseUrl?: string;
     model?: string;
     apiKey?: string;
+    expectedAccountUserId?: string;
   }): Promise<AiSettings> {
-    const response = await this.accountResponse("PUT", "/v1/me/ai-settings", {
-      mode: input.mode,
-      provider: input.provider,
-      base_url: input.baseUrl,
-      model: input.model,
-      api_key: input.apiKey,
-    });
+    const response = await this.accountResponse(
+      "PUT",
+      "/v1/me/ai-settings",
+      {
+        mode: input.mode,
+        provider: input.provider,
+        base_url: input.baseUrl,
+        model: input.model,
+        api_key: input.apiKey,
+      },
+      { expectedAccountUserId: input.expectedAccountUserId },
+    );
     return (await response.json()) as AiSettings;
   }
 
   async testAiSettings(input: {
+    ownerUserId: string;
     provider: "openai_compat";
     baseUrl: string;
     model: string;
     apiKey?: string;
   }): Promise<void> {
-    await this.accountResponse("POST", "/v1/me/ai-settings/test", {
-      mode: "custom",
-      provider: input.provider,
-      base_url: input.baseUrl,
-      model: input.model,
-      api_key: input.apiKey,
-    });
+    await this.accountResponse(
+      "POST",
+      "/v1/me/ai-settings/test",
+      {
+        mode: "custom",
+        provider: input.provider,
+        base_url: input.baseUrl,
+        model: input.model,
+        api_key: input.apiKey,
+      },
+      { expectedAccountUserId: input.ownerUserId },
+    );
   }
 
   async discoverCustomModels(input: {
+    ownerUserId: string;
     baseUrl: string;
     apiKey: string;
   }): Promise<{ models: string[] }> {
-    const response = await this.accountResponse("POST", "/v1/me/ai-settings/discover", {
-      base_url: input.baseUrl,
-      api_key: input.apiKey,
-    });
+    const response = await this.accountResponse(
+      "POST",
+      "/v1/me/ai-settings/discover",
+      {
+        base_url: input.baseUrl,
+        api_key: input.apiKey,
+      },
+      { expectedAccountUserId: input.ownerUserId },
+    );
     return (await response.json()) as { models: string[] };
   }
 
-  async deleteCustomAiKey(): Promise<AiSettings> {
-    const response = await this.accountResponse("DELETE", "/v1/me/ai-settings/custom-key");
+  async deleteCustomAiKey(expectedAccountUserId?: string): Promise<AiSettings> {
+    const response = await this.accountResponse(
+      "DELETE",
+      "/v1/me/ai-settings/custom-key",
+      undefined,
+      { expectedAccountUserId },
+    );
     return (await response.json()) as AiSettings;
   }
 

@@ -146,4 +146,69 @@ describe("PlayIntentStore", () => {
     const storeB = new PlayIntentStore(second.client, storage);
     expect(storeB.effectiveVoted(10, false)).toBe(false);
   });
+
+  it("keeps pending votes separate when another account uses the same app", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(
+      "mpgs.session.v1",
+      JSON.stringify(sessionBody({ user_id: "u_a", access_token: "token-a" })),
+    );
+    const { fetchFn: fetchA } = makeFetchStub({
+      "POST /v1/games/10/play-intent": () => {
+        throw new TypeError("offline");
+      },
+    });
+    const storeA = new PlayIntentStore(
+      new ApiClient({ baseUrl: "http://x", fetchFn: fetchA, storage }),
+      storage,
+    );
+    storeA.toggle(10, false);
+    await storeA.flush();
+
+    storage.setItem(
+      "mpgs.session.v1",
+      JSON.stringify(sessionBody({ user_id: "u_b", access_token: "token-b" })),
+    );
+    const { fetchFn: fetchB } = makeFetchStub({
+      "POST /v1/games/10/play-intent": () => {
+        throw new TypeError("offline");
+      },
+    });
+    const storeB = new PlayIntentStore(
+      new ApiClient({ baseUrl: "http://x", fetchFn: fetchB, storage }),
+      storage,
+    );
+    expect(storeB.effectiveVoted(10, false)).toBe(false);
+    expect(storeB.pendingCount()).toBe(0);
+
+    storeB.toggle(10, false);
+    await storeB.flush();
+
+    const persisted = JSON.parse(storage.getItem("mpgs.playintent.v1") ?? "{}") as {
+      entries: Array<{ ownerUserId: string; appId: number; pending: boolean }>;
+    };
+    expect(persisted.entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ ownerUserId: "u_a", appId: 10, pending: true }),
+        expect.objectContaining({ ownerUserId: "u_b", appId: 10, pending: true }),
+      ]),
+    );
+  });
+
+  it("migrates the legacy numeric-key shape to the active account", () => {
+    const storage = new MemoryStorage();
+    seedAccountSession(storage, { user_id: "legacy-owner" });
+    storage.setItem(
+      "mpgs.playintent.v1",
+      JSON.stringify({ entries: { "10": { voted: true, pending: true } } }),
+    );
+    const { fetchFn } = makeFetchStub({});
+    const store = new PlayIntentStore(
+      new ApiClient({ baseUrl: "http://x", fetchFn, storage }),
+      storage,
+    );
+
+    expect(store.effectiveVoted(10, false)).toBe(true);
+    expect(storage.getItem("mpgs.playintent.v1")).toContain('"ownerUserId":"legacy-owner"');
+  });
 });

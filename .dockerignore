@@ -1,5 +1,12 @@
 .git
 .github
+.env
+.env.*
+**/.env
+**/.env.*
+**/mpgs.env
+**/mpgs.env.*
+deploy/runtime
 data
 target
 node_modules

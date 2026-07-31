@@ -928,6 +928,91 @@ fn fixture_pipeline_into_storage() {
 }
 
 #[test]
+fn catalog_refresh_does_not_downgrade_store_identity_or_media() {
+    let (repo, clock) = repo_with_clock(10_000);
+    let raw = RawResponse::validate(
+        200,
+        include_bytes!("../../steam-source/fixtures/store_appdetails_game.json").to_vec(),
+        Some("application/json".into()),
+        1024 * 1024,
+    )
+    .unwrap();
+    let mut parsed = parse_store_details(
+        &StoreDetailsRequest::with_locale(892970, "CN", "schinese").unwrap(),
+        &raw,
+    )
+    .unwrap();
+    parsed.details.name = Some("英灵神殿".into());
+    parsed.details.header_image_url =
+        Some("https://shared.akamai.steamstatic.com/store-rich-cover.jpg".into());
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+
+    clock.advance_ms(1_000);
+    repo.upsert_catalog(&AppCatalogProposal {
+        app_id: 892970,
+        name: "Valheim".into(),
+        app_type: AppTypeProposal::Game,
+        last_modified: Some(1_800_000_000),
+        price_change_number: None,
+        source: "steam_istore_getapplist",
+        stability: SourceStability::OfficialStable,
+        adapter_version: "app-list-test",
+    })
+    .unwrap();
+
+    let app = repo.get_app(892970).unwrap().unwrap();
+    assert_eq!(app.canonical_name, "英灵神殿");
+    assert_eq!(app.release_state, "released");
+    assert_eq!(app.release_date.as_deref(), Some("2021-02-02"));
+    let cover: (String, String) = repo
+        .database()
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT capsule_url, source FROM app_media WHERE app_id = 892970",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert_eq!(
+        cover.0,
+        "https://shared.akamai.steamstatic.com/store-rich-cover.jpg"
+    );
+    assert_ne!(cover.1, "steam_catalog");
+
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO apps (
+                     app_id, app_type, canonical_name, release_state,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (42, 'unknown', 'app-42', 'unknown', 1, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    repo.upsert_app_localization(42, "english", Some("Catalog Name"), None, "test")
+        .unwrap();
+    repo.upsert_catalog(&AppCatalogProposal {
+        app_id: 42,
+        name: "Catalog Name".into(),
+        app_type: AppTypeProposal::Game,
+        last_modified: Some(1_800_000_001),
+        price_change_number: None,
+        source: "steam_istore_getapplist",
+        stability: SourceStability::OfficialStable,
+        adapter_version: "app-list-test",
+    })
+    .unwrap();
+    let promoted = repo.get_app(42).unwrap().unwrap();
+    assert_eq!(promoted.canonical_name, "Catalog Name");
+    assert_eq!(promoted.app_type, "game");
+}
+
+#[test]
 fn backup_restore_and_integrity() {
     let dir = tempfile::tempdir().unwrap();
     let live = dir.path().join("live.db");
@@ -1843,30 +1928,12 @@ fn search_matches_chinese_and_english_localization_names() {
             Ok(())
         })
         .unwrap();
-    repo.upsert_app_localization(
-        548430,
-        "schinese",
-        Some("深岩银河"),
-        None,
-        "test",
-    )
-    .unwrap();
-    repo.upsert_app_localization(
-        548430,
-        "english",
-        Some("Deep Rock Galactic"),
-        None,
-        "test",
-    )
-    .unwrap();
-    repo.upsert_app_localization(
-        1245620,
-        "english",
-        Some("ELDEN RING"),
-        None,
-        "test",
-    )
-    .unwrap();
+    repo.upsert_app_localization(548430, "schinese", Some("深岩银河"), None, "test")
+        .unwrap();
+    repo.upsert_app_localization(548430, "english", Some("Deep Rock Galactic"), None, "test")
+        .unwrap();
+    repo.upsert_app_localization(1245620, "english", Some("ELDEN RING"), None, "test")
+        .unwrap();
 
     let by_en = repo.search_games("Deep Rock", 10).unwrap();
     assert_eq!(by_en.len(), 1);
@@ -1886,9 +1953,97 @@ fn search_matches_chinese_and_english_localization_names() {
     assert_eq!(elden_zh[0].app_id, 1_245_620);
 
     // Unrelated languages should not match until we opt in later.
-    repo.upsert_app_localization(548430, "japanese", Some("ディープロックガラクティック"), None, "test")
-        .unwrap();
+    repo.upsert_app_localization(
+        548430,
+        "japanese",
+        Some("ディープロックガラクティック"),
+        None,
+        "test",
+    )
+    .unwrap();
     assert!(repo.search_games("ディープ", 10).unwrap().is_empty());
+}
+
+#[test]
+fn missing_english_name_retries_after_refresh_cooldown() {
+    let (repo, clock) = repo_with_clock(1_000_000);
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO apps (
+                     app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+                 ) VALUES (548430, 'game', '深岩银河', 'released', 1, 1)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO multiplayer_profiles (
+                     app_id, online_coop, computed_at_ms
+                 ) VALUES (548430, 1, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    repo.record_store_details_not_found(548430, "US", "english")
+        .unwrap();
+
+    let filter = crate::EnrichmentNeedFilter {
+        store: false,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: true,
+    };
+    let recent = repo
+        .list_enrichment_targets_after_filtered_with_media(
+            10,
+            None,
+            "CN",
+            "schinese",
+            filter,
+            crate::MediaBackfillPolicy::DISABLED,
+        )
+        .unwrap();
+    assert!(recent.is_empty());
+    assert!(
+        repo.has_store_detail_refresh(548430, "US", "english")
+            .unwrap()
+    );
+
+    clock.advance_ms(crate::repo::ENGLISH_NAME_RETRY_INTERVAL_MS + 1);
+    assert!(
+        !repo
+            .has_store_detail_refresh(548430, "US", "english")
+            .unwrap()
+    );
+    let retry = repo
+        .list_enrichment_targets_after_filtered_with_media(
+            10,
+            None,
+            "CN",
+            "schinese",
+            filter,
+            crate::MediaBackfillPolicy::DISABLED,
+        )
+        .unwrap();
+    assert_eq!(retry.len(), 1);
+    assert!(retry[0].needs_english_name);
+
+    repo.upsert_app_localization(548430, "english", Some("Deep Rock Galactic"), None, "test")
+        .unwrap();
+    let completed = repo
+        .list_enrichment_targets_after_filtered_with_media(
+            10,
+            None,
+            "CN",
+            "schinese",
+            filter,
+            crate::MediaBackfillPolicy::DISABLED,
+        )
+        .unwrap();
+    assert!(completed.is_empty());
 }
 
 #[test]
@@ -1932,7 +2087,9 @@ fn media_backfill_is_coverage_gated_and_attempt_limited() {
         english_name: false,
     };
     let due = repo
-        .list_enrichment_targets_after_filtered_with_media(10, None, "CN", "schinese", filter, policy)
+        .list_enrichment_targets_after_filtered_with_media(
+            10, None, "CN", "schinese", filter, policy,
+        )
         .unwrap();
     assert_eq!(due.len(), 2);
     assert!(due.iter().all(|t| t.needs_media_backfill));
@@ -1956,26 +2113,55 @@ fn media_backfill_is_coverage_gated_and_attempt_limited() {
     assert!(none.iter().all(|t| !t.needs_media_backfill));
 
     // Attempt limits: mark exhausted.
-    repo.begin_media_backfill_attempt(10).unwrap();
+    assert!(repo.begin_media_backfill_attempt(10).unwrap());
+    assert!(!repo.begin_media_backfill_attempt(10).unwrap());
     repo.finish_media_backfill_attempt(10, crate::MediaBackfillOutcome::Failed, 2)
         .unwrap();
-    repo.begin_media_backfill_attempt(10).unwrap();
+    clock.advance_ms(5 * 60 * 1_000 + 1);
+    assert!(repo.begin_media_backfill_attempt(10).unwrap());
     repo.finish_media_backfill_attempt(10, crate::MediaBackfillOutcome::Failed, 2)
         .unwrap();
     clock.advance_ms(120_000);
     let after_fail = repo
-        .list_enrichment_targets_after_filtered_with_media(10, None, "CN", "schinese", filter, policy)
+        .list_enrichment_targets_after_filtered_with_media(
+            10, None, "CN", "schinese", filter, policy,
+        )
         .unwrap();
-    assert!(!after_fail.iter().any(|t| t.app_id == 10 && t.needs_media_backfill));
-    assert!(after_fail.iter().any(|t| t.app_id == 20 && t.needs_media_backfill));
+    assert!(
+        !after_fail
+            .iter()
+            .any(|t| t.app_id == 10 && t.needs_media_backfill)
+    );
+    assert!(
+        after_fail
+            .iter()
+            .any(|t| t.app_id == 20 && t.needs_media_backfill)
+    );
 
     // Terminal none stops retries.
-    repo.begin_media_backfill_attempt(20).unwrap();
+    assert!(repo.begin_media_backfill_attempt(20).unwrap());
+    assert!(!repo.begin_media_backfill_attempt(20).unwrap());
     repo.finish_media_backfill_attempt(20, crate::MediaBackfillOutcome::NoneAvailable, 2)
         .unwrap();
+    repo.finish_media_backfill_attempt(20, crate::MediaBackfillOutcome::Failed, 2)
+        .unwrap();
+    let backfill_state: (i64, String) = repo
+        .database()
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT attempts, status FROM app_media_backfill_state WHERE app_id = 20",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert_eq!(backfill_state, (1, "none".into()));
     clock.advance_ms(120_000);
     let after_none = repo
-        .list_enrichment_targets_after_filtered_with_media(10, None, "CN", "schinese", filter, policy)
+        .list_enrichment_targets_after_filtered_with_media(
+            10, None, "CN", "schinese", filter, policy,
+        )
         .unwrap();
     assert!(!after_none.iter().any(|t| t.needs_media_backfill));
 }
@@ -1999,10 +2185,7 @@ fn store_media_gallery_ingest_replace_preserve_and_clear() {
         .unwrap();
 
     let assets = repo.game_media_assets(892970).unwrap();
-    assert_eq!(
-        assets.iter().filter(|a| a.kind == "screenshot").count(),
-        2
-    );
+    assert_eq!(assets.iter().filter(|a| a.kind == "screenshot").count(), 2);
     assert_eq!(assets.iter().filter(|a| a.kind == "movie").count(), 2);
     let cover = repo.game_detail(892970).unwrap().unwrap();
     assert!(cover.cover_url.is_some());
@@ -2123,10 +2306,7 @@ fn upgrade_from_v15_keeps_cover_and_empty_gallery() {
             .map_err(Into::into)
         })
         .unwrap();
-    assert_eq!(
-        cover,
-        "https://shared.akamai.steamstatic.com/legacy.jpg"
-    );
+    assert_eq!(cover, "https://shared.akamai.steamstatic.com/legacy.jpg");
     let assets: i64 = db
         .with_conn(|conn| {
             conn.query_row(

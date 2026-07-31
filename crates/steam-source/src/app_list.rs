@@ -101,6 +101,25 @@ pub struct AppListPage {
     pub content_hash: String,
 }
 
+impl AppListPage {
+    /// Validate that applying this page would move the request cursor forward.
+    ///
+    /// The response-level parser cannot know the request cursor, so collectors
+    /// must call this before ingesting or persisting the next checkpoint.
+    pub fn validate_for_request(&self, request: &AppListRequest) -> Result<(), SourceError> {
+        if self.proposals.is_empty() {
+            return Ok(());
+        }
+        if self.page_last_appid <= request.last_appid {
+            return Err(SourceError::invalid_structure(format!(
+                "app list cursor did not advance: requested last_appid {}, received {}",
+                request.last_appid, self.page_last_appid
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Parse a validated GetAppList response into normalized proposals.
 pub fn parse_app_list_page(raw: &RawResponse) -> Result<AppListPage, SourceError> {
     let envelope: AppListEnvelope = raw.parse_json()?;
@@ -148,6 +167,11 @@ pub fn parse_app_list_page(raw: &RawResponse) -> Result<AppListPage, SourceError
             "have_more_results requires last_appid",
         ));
     }
+    if !proposals.is_empty() && page_last_appid != max_appid {
+        return Err(SourceError::invalid_structure(format!(
+            "response last_appid {page_last_appid} does not match page maximum appid {max_appid}"
+        )));
+    }
 
     Ok(AppListPage {
         proposals,
@@ -179,8 +203,8 @@ pub fn collect_pages(
 
     for raw in raw_pages {
         let request = AppListRequest::from_cursor(&cursor, DEFAULT_MAX_RESULTS);
-        let _ = request; // documents that each page would use the current cursor
         let page = parse_app_list_page(raw)?;
+        page.validate_for_request(&request)?;
         all.extend(page.proposals.iter().cloned());
         apply_page_to_cursor(&mut cursor, &page);
     }
@@ -275,5 +299,37 @@ mod tests {
         .unwrap();
         let err = parse_app_list_page(&raw).unwrap_err();
         assert!(matches!(err, SourceError::JsonParse { .. }));
+    }
+
+    #[test]
+    fn rejects_response_cursor_that_does_not_match_page_maximum() {
+        let raw = RawResponse::validate(
+            200,
+            br#"{"response":{"apps":[{"appid":10,"name":"A"},{"appid":20,"name":"B"}],"have_more_results":true,"last_appid":10}}"#.to_vec(),
+            None,
+            1024,
+        )
+        .unwrap();
+        let err = parse_app_list_page(&raw).unwrap_err();
+        assert!(matches!(err, SourceError::InvalidStructure { .. }));
+        assert!(err.to_string().contains("page maximum appid 20"));
+    }
+
+    #[test]
+    fn rejects_page_that_does_not_advance_request_cursor() {
+        let page = parse_app_list_page(&fixture("page1")).unwrap();
+        let request = AppListRequest {
+            last_appid: page.page_last_appid,
+            if_modified_since: 0,
+            max_results: 100,
+            include_games: true,
+            include_dlc: false,
+            include_software: false,
+            include_videos: false,
+            include_hardware: false,
+        };
+        let err = page.validate_for_request(&request).unwrap_err();
+        assert!(matches!(err, SourceError::InvalidStructure { .. }));
+        assert!(err.to_string().contains("did not advance"));
     }
 }

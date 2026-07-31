@@ -12,9 +12,13 @@ import {
 const hlsTestState = vi.hoisted(() => ({
   instances: 0,
   destroyed: 0,
+  sources: [] as string[],
+  importBarrier: null as Promise<void> | null,
 }));
 
-vi.mock("hls.js", () => {
+vi.mock("hls.js", async () => {
+  if (hlsTestState.importBarrier) await hlsTestState.importBarrier;
+
   class MockHls {
     static Events = { ERROR: "error" };
 
@@ -26,7 +30,9 @@ vi.mock("hls.js", () => {
       hlsTestState.instances += 1;
     }
 
-    loadSource() {}
+    loadSource(source: string) {
+      hlsTestState.sources.push(source);
+    }
 
     attachMedia() {}
 
@@ -108,6 +114,8 @@ function mountGallery(props: {
 beforeEach(() => {
   hlsTestState.instances = 0;
   hlsTestState.destroyed = 0;
+  hlsTestState.sources = [];
+  hlsTestState.importBarrier = null;
   vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => {});
 });
@@ -327,6 +335,126 @@ describe("GameMediaGallery", () => {
     expect(host.textContent).toContain("当前环境无法播放预告片");
     expect(host.querySelector('a[href*="store.steampowered.com"]')).toBeTruthy();
     playSpy.mockRestore();
+    unmount();
+  });
+
+  it("recreates the video stage when switching between video items", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    const { host, unmount } = mountGallery({
+      media: {
+        updated_at_ms: 1,
+        screenshots: [],
+        videos: [
+          {
+            id: "first",
+            title: "First Trailer",
+            poster_url: "https://shared.akamai.steamstatic.com/first.jpg",
+            highlight: true,
+            mp4_url: "https://video.akamai.steamstatic.com/first.mp4",
+            hls_h264_url: null,
+            dash_h264_url: null,
+          },
+          {
+            id: "second",
+            title: "Second Trailer",
+            poster_url: "https://shared.akamai.steamstatic.com/second.jpg",
+            highlight: true,
+            mp4_url: "https://video.akamai.steamstatic.com/second.mp4",
+            hls_h264_url: null,
+            dash_h264_url: null,
+          },
+        ],
+      },
+    });
+    const firstThumb = host.querySelector<HTMLButtonElement>(
+      '.gallery-thumb[aria-label="预告片：First Trailer"]',
+    )!;
+    const secondThumb = host.querySelector<HTMLButtonElement>(
+      '.gallery-thumb[aria-label="预告片：Second Trailer"]',
+    )!;
+
+    act(() => firstThumb.click());
+    const firstVideo = host.querySelector<HTMLVideoElement>(".gallery-video")!;
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>(".gallery-play-btn")!.click();
+      await Promise.resolve();
+    });
+    expect(firstVideo.getAttribute("src")).toBe(
+      "https://video.akamai.steamstatic.com/first.mp4",
+    );
+
+    act(() => secondThumb.click());
+    const secondVideo = host.querySelector<HTMLVideoElement>(".gallery-video")!;
+    expect(secondVideo).not.toBe(firstVideo);
+    expect(secondVideo.getAttribute("src")).toBeNull();
+    expect(host.querySelector(".gallery-play-btn")).toBeTruthy();
+    unmount();
+  });
+
+  it("does not attach a stale HLS source after switching video items", async () => {
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockReturnValue("");
+    let releaseImport = () => {};
+    hlsTestState.importBarrier = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    const { host, unmount } = mountGallery({
+      media: {
+        updated_at_ms: 1,
+        screenshots: [],
+        videos: [
+          {
+            id: "first-hls",
+            title: "First HLS",
+            poster_url: "https://shared.akamai.steamstatic.com/first-hls.jpg",
+            highlight: true,
+            mp4_url: null,
+            hls_h264_url: "https://video.akamai.steamstatic.com/first.m3u8",
+            dash_h264_url: null,
+          },
+          {
+            id: "second-hls",
+            title: "Second HLS",
+            poster_url: "https://shared.akamai.steamstatic.com/second-hls.jpg",
+            highlight: true,
+            mp4_url: null,
+            hls_h264_url: "https://video.akamai.steamstatic.com/second.m3u8",
+            dash_h264_url: null,
+          },
+        ],
+      },
+    });
+    const firstThumb = host.querySelector<HTMLButtonElement>(
+      '.gallery-thumb[aria-label="预告片：First HLS"]',
+    )!;
+    const secondThumb = host.querySelector<HTMLButtonElement>(
+      '.gallery-thumb[aria-label="预告片：Second HLS"]',
+    )!;
+
+    act(() => firstThumb.click());
+    act(() => {
+      host.querySelector<HTMLButtonElement>(".gallery-play-btn")!.click();
+    });
+    act(() => secondThumb.click());
+    releaseImport();
+    await act(async () => {
+      await vi.dynamicImportSettled();
+      await Promise.resolve();
+    });
+
+    expect(hlsTestState.instances).toBe(0);
+    expect(hlsTestState.sources).toEqual([]);
+    expect(host.querySelector(".gallery-play-btn")).toBeTruthy();
+
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>(".gallery-play-btn")!.click();
+      await vi.dynamicImportSettled();
+      await Promise.resolve();
+    });
+    expect(hlsTestState.instances).toBe(1);
+    expect(hlsTestState.sources).toEqual([
+      "https://video.akamai.steamstatic.com/second.m3u8",
+    ]);
     unmount();
   });
 

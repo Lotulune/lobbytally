@@ -127,6 +127,16 @@ async function loadHlsConstructor(): Promise<HlsConstructor | null> {
   }
 }
 
+function videoSourceIdentity(item: GalleryVideoItem): string {
+  return JSON.stringify([
+    item.id,
+    item.posterUrl,
+    item.mp4Url,
+    item.hlsUrl,
+    item.dashUrl,
+  ]);
+}
+
 function VideoStage({
   item,
   steamUrl,
@@ -139,6 +149,9 @@ function VideoStage({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<HlsLike | null>(null);
   const playbackGenerationRef = useRef(0);
+  const sourceIdentity = videoSourceIdentity(item);
+  const sourceIdentityRef = useRef(sourceIdentity);
+  sourceIdentityRef.current = sourceIdentity;
   const [playing, setPlaying] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -192,7 +205,9 @@ function VideoStage({
 
     destroyPlayer();
     const isCurrent = () =>
-      playbackGenerationRef.current === generation && videoRef.current === el;
+      playbackGenerationRef.current === generation &&
+      sourceIdentityRef.current === sourceIdentity &&
+      videoRef.current === el;
 
     if (item.mp4Url) {
       el.src = item.mp4Url;
@@ -258,7 +273,7 @@ function VideoStage({
     if (!isCurrent()) return;
     setError("当前环境无法播放预告片");
     setPlaying(false);
-  }, [destroyPlayer, item.hlsUrl, item.mp4Url, loading]);
+  }, [destroyPlayer, item.hlsUrl, item.mp4Url, loading, sourceIdentity]);
 
   return (
     <div className="gallery-stage-video">
@@ -748,7 +763,12 @@ export function GameMediaGallery({
             </span>
           </button>
         ) : videoCurrent ? (
-          <VideoStage item={videoCurrent} steamUrl={steamUrl} active />
+          <VideoStage
+            key={videoSourceIdentity(videoCurrent)}
+            item={videoCurrent}
+            steamUrl={steamUrl}
+            active
+          />
         ) : null}
       </div>
 

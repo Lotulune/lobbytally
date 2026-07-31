@@ -32,18 +32,33 @@ sudo bash ./linux/install.sh .
 # 编辑 /etc/mpgs/mpgs.env：MPGS_DATABASE_PATH、MPGS_ADMIN_TOKEN
 sudo -u mpgs mpgs-dbtool migrate /var/lib/mpgs/mpgs.db
 sudo systemctl start mpgs-server
-curl -sS http://127.0.0.1:8080/health/ready
+curl -sS http://127.0.0.1:17880/health/ready
 ```
 
 ### 2.3 Windows（WinSW）
 
 1. 使用 `package_server.ps1` 生成布局。
 2. 将 WinSW 可执行文件放到 `windows\winsw.exe`。
-3. 管理员 PowerShell：`.\windows\install-service.ps1 -PackageRoot .`
-4. 在服务 XML 或主机环境中配置 `MPGS_ADMIN_TOKEN` 与数据库路径。
-5. 验证：`Invoke-RestMethod http://127.0.0.1:8080/v1/meta`
+3. 管理员 PowerShell 中安全输入管理 Token 并安装：
 
-卸载：`.\windows\uninstall-service.ps1 -PackageRoot .`
+```powershell
+$adminToken = Read-Host 'MPGS admin token' -AsSecureString
+.\windows\install-service.ps1 -PackageRoot . -AdminToken $adminToken -Start
+```
+
+安装器把只读程序复制到 `%ProgramFiles%\MPGS`，把数据库/日志放到
+`%ProgramData%\MPGS`，收紧 ACL，并以 `LocalService` 运行。未传 `-Start`
+时只安装 Manual 服务且不启动；不得直接从下载目录或用户可写目录运行服务。
+其他 Steam/AI 环境变量应由管理员加入受保护的已安装服务 XML，随后重启服务。
+
+验证：`Invoke-RestMethod http://127.0.0.1:8080/v1/meta`
+
+卸载：
+
+```powershell
+& "$env:ProgramFiles\MPGS\windows\uninstall-service.ps1" `
+  -PackageRoot "$env:ProgramFiles\MPGS"
+```
 
 ### 2.4 反向代理
 
@@ -103,6 +118,10 @@ mpgs-dbtool m7-data-audit <db> --allow-upcoming-shortfall='官方目录当日新
 ### 3.5 Docker / Compose
 
 `deploy/docker-compose.yml` 包含 `mpgs-server`、可选静态 Web 网关 `mpgs-web` 和周期执行租约任务的 `mpgs-worker`。SQLite 与头像通过同一宿主机目录挂载到 `/var/lib/mpgs`，不得改成网络共享卷。
+一次性的 `mpgs-init` 会在 server/worker 启动前创建并校正该目录的容器
+UID/GID；worker 还通过 `.worker-health` 暴露最近一次运行状态，连续失败会退出并由
+Compose 重启。`docker compose ps` 出现 `unhealthy` 时应检查 worker 日志，而不能只看
+API readiness。
 
 复制环境模板后，在 `deploy/.env` 选择部署模式：
 
@@ -114,10 +133,11 @@ MPGS_DEPLOY_MODE=backend
 MPGS_DEPLOY_MODE=full
 ```
 
-生产默认保留 `full` 以兼容现有站点。只面向桌面客户端的新安装建议使用 `backend`。切换模式后执行 `deploy/update.sh`，脚本只拉取并启动该模式所需服务，`--remove-orphans` 会移除上一模式多出的容器。
+生产默认保留 `full` 以兼容现有站点。只面向桌面客户端的新安装建议使用 `backend`。切换模式后执行 `deploy/update.sh`；脚本会停止全部旧入口，只拉取并启动该模式所需服务，并在切到 `backend` 时显式移除旧 Web 容器。
 
 ```bash
 cp deploy/mpgs.env.example deploy/mpgs.env
+mkdir -p deploy/runtime
 chmod 600 deploy/mpgs.env
 docker compose -f deploy/docker-compose.yml up -d --build
 docker compose -f deploy/docker-compose.yml exec mpgs-server \
@@ -138,7 +158,11 @@ curl http://127.0.0.1:18082/.well-known/mpgs
 
 迁移已有数据库时，先使用 `mpgs-dbtool backup <source> <backup>` 生成一致性副本，再把副本放到 `deploy/runtime/mpgs.db`。worker 默认每 60 秒领取一次任务；没有 `MPGS_STEAM_WEB_API_KEY` 时官方 AppList 同步保持禁用，但候选发现、商店详情、评价和 CCU 富化仍会执行。连续 7 天采集完成前，`m7-data-audit` 返回失败属于预期状态。
 
-正式 VPS 不应在宿主机编译 Rust。`.github/workflows/container-images.yml` 在 `main` 更新后把 release 镜像发布为 `ghcr.io/lotulune/mpgs-server:main` 和 `ghcr.io/lotulune/mpgs-web:main`，并保留 `sha-<commit>` 标签用于回滚。VPS 初始化：
+正式 VPS 不应在宿主机编译 Rust。CI 的 Web、Rust quality 与 Linux package
+门禁全部通过后，`.github/workflows/container-images.yml` 才会发布成对的
+`mpgs-server:sha-<commit>` / `mpgs-web:sha-<commit>`。两个不可变镜像均存在后，
+工作流最后才移动 `mpgs-server:release-main` 指针；VPS 从该指针读取同一个 commit，
+不会混用两个发布版本。VPS 初始化：
 
 ```bash
 cp deploy/.env.example deploy/.env
@@ -148,7 +172,23 @@ docker login ghcr.io
 ./deploy/update.sh
 ```
 
-`deploy/update.sh` 在源码目录是 Git checkout 时只允许 fast-forward 拉取；压缩包部署则跳过源码更新、直接拉镜像。它读取管理员维护的 `deploy/.env`，按 `MPGS_DEPLOY_MODE` 使用 `docker compose pull` 与 `up --no-build`，随后运行数据库完整性和对应入口的 HTTP 健康检查。运行时密钥只保存在 `deploy/mpgs.env`，不得放入 `deploy/.env`、GitHub workflow 或镜像标签。
+`deploy/update.sh` 默认读取 `MPGS_RELEASE_POINTER_IMAGE`；它拒绝脏工作树，且只有
+当指针 SHA 与远端部署分支 tip 一致时才继续。脚本先从目标提交提取临时 Compose
+配置并拉取两个对应的 `sha-*` 镜像；镜像、数据库与健康检查全部成功后才把源码
+fast-forward 到同一 SHA。更新器从临时副本运行，因此源码切换不会替换执行中的
+脚本；旧、新 Compose 快照共用显式项目名但分开执行，失败时源码仍停留在旧提交，
+旧镜像也只由旧 Compose 配置恢复。切换前脚本停止 Web/worker/server 写入，使用
+**当前旧镜像**中的 `mpgs-dbtool`
+生成并验证 `deploy/runtime/backups/pre-update-*.db`。新版本必须同时通过数据库
+完整性、readiness、`/v1/meta.build_git_sha` 和 worker 健康检查；任一失败时，脚本会
+保留失败数据库副本、恢复升级前备份，并把旧容器的精确本地 image ID 临时标记为
+标准回滚镜像引用后自动重启，避免依赖已经移动的旧 tag。
+
+紧急固定某个已发布版本时，可在 `deploy/.env` 临时设置完整的 40 位
+`MPGS_RELEASE_SHA`；成功恢复并确认后应删除该 pin，重新跟随发布指针。运行时密钥只
+保存在 `deploy/mpgs.env`，不得放入 `deploy/.env`、GitHub workflow 或镜像标签。
+`.dockerignore` 明确排除了两个部署 env 与 `deploy/runtime`，但这些文件仍应保持
+`0600` 且绝不能手工加入构建上下文。
 
 内置 AI 使用 OpenAI-compatible Provider 时配置 `MPGS_AI_PROVIDER=openai_compat`、`MPGS_AI_BASE_URL`、`MPGS_AI_API_KEY`、`MPGS_AI_MODEL` 和 `MPGS_AI_TIMEOUT_SECS`。Embedding 默认使用本地 `hash`，只有确认上游提供兼容 Embedding 接口时才切换为 `openai_compat`。AI 失败会回退到确定性推荐；更换模型后需重启 `mpgs-server`，并应先用 `/v1/meta` 和一条自然语言推荐请求验证 `ai_available`、`ai_status` 与延迟。
 
@@ -162,7 +202,9 @@ sudo systemctl start mpgs-update.service
 systemctl status mpgs-update.timer --no-pager
 ```
 
-定时器只拉取 GHCR 镜像清单；镜像未变化时 Compose 不重建容器。失败记录在 `journalctl -u mpgs-update.service`，下一周期会自动重试。
+定时器只在成对发布指针前移后部署；指针未变化时 Compose 不重建容器。失败与自动
+回滚记录在 `journalctl -u mpgs-update.service`，升级前备份和失败数据库副本不会
+自动删除，应纳入磁盘容量与保留策略。
 
 ### 3.6 密钥轮换
 

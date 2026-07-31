@@ -1,40 +1,24 @@
 name: Container images
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/container-images.yml"
-      - ".dockerignore"
-      - "Dockerfile"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "apps/**"
-      - "crates/**"
-      - "deploy/**"
-      - "migrations/**"
-      - "package.json"
-      - "pnpm-lock.yaml"
-      - "pnpm-workspace.yaml"
-      - "web/**"
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_sha:
+        description: "Commit SHA that passed the caller's quality gates"
+        required: true
+        type: string
 
 permissions:
   contents: read
   packages: write
 
-concurrency:
-  group: container-images-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  publish:
-    name: Publish ${{ matrix.image }}
+  build:
+    name: Build immutable ${{ matrix.image }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - image: mpgs-server
@@ -42,30 +26,70 @@ jobs:
           - image: mpgs-web
             target: web
     steps:
-      - name: Check out repository
+      - name: Check out the validated commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - name: Validate release SHA
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          case "$RELEASE_SHA" in
+            "" | *[!0-9a-fA-F]*) exit 2 ;;
+          esac
+          test "${#RELEASE_SHA}" -eq 40
 
       - name: Log in to GitHub Container Registry
         env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_TOKEN: ${{ github.token }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
-      - name: Build and push release image
+      - name: Set up Docker Buildx
+        run: docker buildx create --use --name mpgs-builder
+
+      - name: Build and push immutable image
         env:
           IMAGE_NAME: ${{ matrix.image }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
           TARGET: ${{ matrix.target }}
         run: |
           owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           image="ghcr.io/$owner/$IMAGE_NAME"
-          docker buildx create --use --name mpgs-builder
           docker buildx build \
             --target "$TARGET" \
             --build-arg MPGS_BUILD_PROFILE=release \
-            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --build-arg "MPGS_BUILD_GIT_SHA=$RELEASE_SHA" \
+            --label "org.opencontainers.image.revision=$RELEASE_SHA" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --cache-from "type=gha,scope=$TARGET" \
             --cache-to "type=gha,mode=max,scope=$TARGET" \
-            --tag "$image:main" \
-            --tag "$image:sha-$GITHUB_SHA" \
+            --tag "$image:sha-$RELEASE_SHA" \
             --push \
             .
+
+  promote:
+    name: Promote paired release pointer
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Verify pair and move release pointer
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          server="ghcr.io/$owner/mpgs-server"
+          web="ghcr.io/$owner/mpgs-web"
+          docker buildx imagetools inspect "$server:sha-$RELEASE_SHA" >/dev/null
+          docker buildx imagetools inspect "$web:sha-$RELEASE_SHA" >/dev/null
+          # The pointer is moved only after both immutable images exist. The
+          # updater reads its revision label, then selects both sha-* images.
+          docker buildx imagetools create \
+            --tag "$server:release-main" \
+            "$server:sha-$RELEASE_SHA"

@@ -10,6 +10,8 @@ const QUEUE_KEY = "mpgs.feedback.v1";
 
 export interface PendingFeedback {
   localId: string;
+  /** Account that created this write; null quarantines an unowned legacy record. */
+  ownerUserId: string | null;
   appId: number;
   type: FeedbackType;
   idempotencyKey: string;
@@ -28,7 +30,7 @@ export interface PendingFeedback {
 export type FeedbackListener = (entries: PendingFeedback[]) => void;
 
 interface QueueStorageShape {
-  entries: PendingFeedback[];
+  entries: Array<Omit<PendingFeedback, "ownerUserId"> & { ownerUserId?: string | null }>;
 }
 
 function isRetryable(error: unknown): boolean {
@@ -65,7 +67,22 @@ export class FeedbackQueue {
       if (!raw) return;
       const parsed = JSON.parse(raw) as QueueStorageShape;
       if (Array.isArray(parsed.entries)) {
-        this.entries = parsed.entries;
+        const legacyOwner = this.currentOwnerUserId();
+        let migrated = false;
+        this.entries = parsed.entries.map((entry) => {
+          if (entry.ownerUserId !== undefined) {
+            return {
+              ...entry,
+              ownerUserId:
+                typeof entry.ownerUserId === "string" ? entry.ownerUserId : null,
+            };
+          }
+          migrated = true;
+          // A legacy queue loaded while its account session is still present can
+          // be safely adopted. Logged-out legacy records remain quarantined.
+          return { ...entry, ownerUserId: legacyOwner };
+        });
+        if (migrated) this.persist();
       }
     } catch {
       this.entries = [];
@@ -102,10 +119,20 @@ export class FeedbackQueue {
     return this.entries.map((e) => ({ ...e }));
   }
 
+  private currentOwnerUserId(): string | null {
+    return this.client.isAccountAuthenticated() ? this.client.sessionUserId() : null;
+  }
+
+  private belongsToCurrentOwner(entry: PendingFeedback): boolean {
+    const owner = this.currentOwnerUserId();
+    return owner !== null && entry.ownerUserId === owner;
+  }
+
   /** Latest effective (not cancelled/undone) feedback per app, for optimistic UI. */
   activeByApp(): Map<number, PendingFeedback> {
     const map = new Map<number, PendingFeedback>();
     for (const entry of this.entries) {
+      if (!this.belongsToCurrentOwner(entry)) continue;
       if (entry.cancelled || entry.undone) continue;
       map.set(entry.appId, entry);
     }
@@ -114,8 +141,13 @@ export class FeedbackQueue {
 
   /** Record feedback locally and try to sync immediately. Returns the local entry. */
   submit(appId: number, type: FeedbackType): PendingFeedback {
+    const ownerUserId = this.currentOwnerUserId();
+    if (!ownerUserId) {
+      throw new ApiError({ code: "unauthenticated", status: 401, message: "sign in to continue" });
+    }
     const entry: PendingFeedback = {
       localId: newIdempotencyKey(),
+      ownerUserId,
       appId,
       type,
       idempotencyKey: newIdempotencyKey(),
@@ -135,7 +167,7 @@ export class FeedbackQueue {
   /** Undo by local id. Unsynced entries are cancelled locally; synced ones call the API. */
   async undo(localId: string): Promise<void> {
     const entry = this.entries.find((e) => e.localId === localId);
-    if (!entry || entry.cancelled || entry.undone) return;
+    if (!entry || !this.belongsToCurrentOwner(entry) || entry.cancelled || entry.undone) return;
     if (entry.feedbackId === null) {
       entry.cancelled = true;
       this.persist();
@@ -163,9 +195,10 @@ export class FeedbackQueue {
   pendingCount(): number {
     return this.entries.filter(
       (e) =>
-        (!e.cancelled && e.feedbackId === null) ||
-        (e.cancelled && e.feedbackId === null && e.submissionAttempted === true) ||
-        e.syncError === "undo_pending",
+        this.belongsToCurrentOwner(e) &&
+        ((!e.cancelled && e.feedbackId === null) ||
+          (e.cancelled && e.feedbackId === null && e.submissionAttempted === true) ||
+          e.syncError === "undo_pending"),
     ).length;
   }
 
@@ -180,6 +213,7 @@ export class FeedbackQueue {
 
   private async runFlush(): Promise<void> {
     for (const entry of this.entries) {
+      if (!this.belongsToCurrentOwner(entry)) continue;
       if (entry.cancelled && entry.feedbackId === null && !entry.submissionAttempted) continue;
       if (entry.feedbackId === null) {
         try {
@@ -194,8 +228,13 @@ export class FeedbackQueue {
           entry.feedbackId = record.feedback_id;
           if (entry.cancelled) entry.undone = true;
           entry.syncError = entry.undone ? "undo_pending" : null;
-          if (!entry.cancelled) this.notifyRankingChanged();
+          if (!entry.cancelled && this.belongsToCurrentOwner(entry)) this.notifyRankingChanged();
         } catch (error) {
+          if (!this.belongsToCurrentOwner(entry)) {
+            // The request belongs to the account that started it. Preserve the
+            // record for that account if the active identity changed meanwhile.
+            continue;
+          }
           if (isRetryable(error)) {
             entry.syncError = error instanceof ApiError ? error.code : "unknown";
             break; // retry later without hammering the same unavailable service
@@ -205,12 +244,18 @@ export class FeedbackQueue {
           entry.cancelled = true;
         }
       }
-      if (entry.feedbackId !== null && entry.undone && entry.syncError === "undo_pending") {
+      if (
+        this.belongsToCurrentOwner(entry) &&
+        entry.feedbackId !== null &&
+        entry.undone &&
+        entry.syncError === "undo_pending"
+      ) {
         try {
           await this.client.undoFeedback(entry.feedbackId);
           entry.syncError = null;
-          this.notifyRankingChanged();
+          if (this.belongsToCurrentOwner(entry)) this.notifyRankingChanged();
         } catch (error) {
+          if (!this.belongsToCurrentOwner(entry)) continue;
           if (isRetryable(error)) {
             entry.syncError = "undo_pending";
             break;

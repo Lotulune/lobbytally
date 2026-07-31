@@ -3,18 +3,24 @@ import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const runtime = vi.hoisted(() => ({
+  ensureSession: vi.fn(async () => null),
+  isAccountAuthenticated: vi.fn(() => false),
+  sessionUserId: vi.fn(() => "anon-user"),
   naturalLanguageRecommendations: vi.fn(),
   subscribeRankingChanged: vi.fn(() => () => undefined),
 }));
 
 vi.mock("../src/app/runtime", () => ({
   apiClient: {
-    sessionUserId: () => null,
+    ensureSession: runtime.ensureSession,
+    isAccountAuthenticated: runtime.isAccountAuthenticated,
+    sessionUserId: runtime.sessionUserId,
     naturalLanguageRecommendations: runtime.naturalLanguageRecommendations,
   },
   feedbackQueue: {
     subscribeRankingChanged: runtime.subscribeRankingChanged,
   },
+  localCredentialServiceOrigin: "https://service.example",
 }));
 
 import { NaturalLanguageScreen } from "../src/screens/NaturalLanguageScreen";
@@ -24,6 +30,9 @@ import { NaturalLanguageScreen } from "../src/screens/NaturalLanguageScreen";
 describe("NaturalLanguageScreen", () => {
   afterEach(() => {
     runtime.naturalLanguageRecommendations.mockReset();
+    runtime.ensureSession.mockClear();
+    runtime.isAccountAuthenticated.mockClear();
+    runtime.sessionUserId.mockClear();
     runtime.subscribeRankingChanged.mockClear();
   });
 
@@ -67,6 +76,7 @@ describe("NaturalLanguageScreen", () => {
     expect(host.textContent).toContain("最长 60 分钟（硬性）");
     expect(host.textContent).not.toContain("party_size");
     expect(host.textContent).not.toContain("session_minutes");
+    expect(runtime.naturalLanguageRecommendations).toHaveBeenCalledTimes(1);
 
     act(() => root.unmount());
   });

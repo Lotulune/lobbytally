@@ -1,0 +1,113 @@
+name: Pre-production images
+
+on:
+  push:
+    branches:
+      - codex/preprod-validation-20260731
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: preprod-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust-quality:
+    name: Rust test and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust 1.97.0
+        run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
+
+      - name: Check formatting
+        run: cargo +1.97.0 fmt --all -- --check
+
+      - name: Run tests
+        run: cargo +1.97.0 test --workspace --locked
+
+      - name: Run Clippy
+        run: cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
+
+  web-quality:
+    name: Web test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.9 --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        run: pnpm --filter lobbytally-web test
+
+      - name: Build web client
+        run: pnpm --filter lobbytally-web build
+
+  build:
+    name: Build pre-production ${{ matrix.image }}
+    needs:
+      - rust-quality
+      - web-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - image: mpgs-server
+            target: server
+          - image: mpgs-web
+            target: web
+    steps:
+      - name: Check out validated commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Log in to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Set up Docker Buildx
+        run: docker buildx create --use --name "mpgs-preprod-${{ github.run_id }}-${{ matrix.target }}"
+
+      - name: Build and push immutable pre-production image
+        env:
+          IMAGE_NAME: ${{ matrix.image }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/$owner/$IMAGE_NAME"
+          docker buildx build \
+            --target "$TARGET" \
+            --build-arg MPGS_BUILD_PROFILE=release \
+            --build-arg "MPGS_BUILD_GIT_SHA=$GITHUB_SHA" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --cache-from "type=gha,scope=$TARGET" \
+            --cache-to "type=gha,mode=max,scope=$TARGET" \
+            --tag "$image:preprod-$GITHUB_SHA" \
+            --push \
+            .

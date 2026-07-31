@@ -65,22 +65,25 @@ impl ClientStore {
             .map_err(|error| error.to_string())
     }
 
-    fn take_legacy_session(&self) -> Result<Option<String>, String> {
-        let mut connection = self.lock()?;
-        let transaction = connection.transaction().map_err(|error| error.to_string())?;
-        let value = transaction
+    fn read_legacy_session(&self) -> Result<Option<String>, String> {
+        self.lock()?
             .query_row(
                 "SELECT value FROM client_kv WHERE key = ?1",
                 [SESSION_KEY],
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|error| error.to_string())?;
-        transaction
-            .execute("DELETE FROM client_kv WHERE key = ?1", [SESSION_KEY])
-            .map_err(|error| error.to_string())?;
-        transaction.commit().map_err(|error| error.to_string())?;
-        Ok(value)
+            .map_err(|error| error.to_string())
+    }
+
+    fn acknowledge_legacy_session(&self, expected_value: &str) -> Result<bool, String> {
+        self.lock()?
+            .execute(
+                "DELETE FROM client_kv WHERE key = ?1 AND value = ?2",
+                params![SESSION_KEY, expected_value],
+            )
+            .map(|deleted| deleted == 1)
+            .map_err(|error| error.to_string())
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
@@ -139,8 +142,27 @@ fn client_store_load(store: State<'_, ClientStore>) -> Result<HashMap<String, St
 }
 
 #[tauri::command]
-fn client_store_take_legacy_session(store: State<'_, ClientStore>) -> Result<Option<String>, String> {
-    store.take_legacy_session()
+fn client_store_read_legacy_session(
+    store: State<'_, ClientStore>,
+) -> Result<Option<String>, String> {
+    store.read_legacy_session()
+}
+
+/// Compatibility alias for desktop bundles that still invoke the old command.
+/// It intentionally no longer deletes before the secure-store write succeeds.
+#[tauri::command]
+fn client_store_take_legacy_session(
+    store: State<'_, ClientStore>,
+) -> Result<Option<String>, String> {
+    store.read_legacy_session()
+}
+
+#[tauri::command]
+fn client_store_acknowledge_legacy_session(
+    expected_value: String,
+    store: State<'_, ClientStore>,
+) -> Result<bool, String> {
+    store.acknowledge_legacy_session(&expected_value)
 }
 
 #[tauri::command]
@@ -224,7 +246,9 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             client_store_load,
+            client_store_read_legacy_session,
             client_store_take_legacy_session,
+            client_store_acknowledge_legacy_session,
             client_store_set,
             client_store_remove,
             auth_session_load,
@@ -262,7 +286,11 @@ mod tests {
             assert!(store.set(SESSION_KEY, "rejected").is_err());
             store.set("mpgs.cache.feed", "snapshot").unwrap();
             assert_eq!(
-                store.load().unwrap().get("mpgs.cache.feed").map(String::as_str),
+                store
+                    .load()
+                    .unwrap()
+                    .get("mpgs.cache.feed")
+                    .map(String::as_str),
                 Some("snapshot")
             );
         }
@@ -281,5 +309,38 @@ mod tests {
         }
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_session_is_only_deleted_after_matching_acknowledgement() {
+        let store = ClientStore::open_at(Path::new(":memory:")).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO client_kv (key, value, updated_at_ms) VALUES (?1, ?2, 0)",
+                params![SESSION_KEY, "legacy-session"],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.read_legacy_session().unwrap().as_deref(),
+            Some("legacy-session")
+        );
+        assert_eq!(
+            store.read_legacy_session().unwrap().as_deref(),
+            Some("legacy-session")
+        );
+        assert!(!store
+            .acknowledge_legacy_session("different-session")
+            .unwrap());
+        assert_eq!(
+            store.read_legacy_session().unwrap().as_deref(),
+            Some("legacy-session")
+        );
+
+        assert!(store.acknowledge_legacy_session("legacy-session").unwrap());
+        assert_eq!(store.read_legacy_session().unwrap(), None);
+        assert!(!store.acknowledge_legacy_session("legacy-session").unwrap());
     }
 }

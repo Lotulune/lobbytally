@@ -17,10 +17,12 @@ RUN pnpm --dir web build
 FROM rust:1.97-bookworm AS rust-build
 WORKDIR /src
 ARG MPGS_BUILD_PROFILE=release
+ARG MPGS_BUILD_GIT_SHA=unknown
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     set -eu; \
+    export MPGS_BUILD_GIT_SHA; \
     if [ "$MPGS_BUILD_PROFILE" = "release" ]; then \
       cargo build --release --locked -p mpgs-server -p mpgs-dbtool; \
       profile_dir=release; \

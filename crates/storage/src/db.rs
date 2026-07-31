@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::clock::{Clock, SystemClock};
 use crate::error::{StorageError, StorageResult};
@@ -145,6 +145,8 @@ impl Database {
                     "database connection pragmas are not ready",
                 ));
             }
+            validate_key_schema(conn)?;
+            validate_foreign_keys(conn)?;
             Ok(())
         })?;
         Ok(())
@@ -197,4 +199,194 @@ pub fn apply_pragmas(conn: &Connection) -> StorageResult<()> {
     }
     conn.pragma_update(None, "synchronous", "FULL")?;
     Ok(())
+}
+
+const KEY_SCHEMA_PROBES: &[(&str, &str)] = &[
+    (
+        "schema_migrations",
+        "SELECT version, name, applied_at_ms FROM schema_migrations LIMIT 0",
+    ),
+    (
+        "apps",
+        "SELECT app_id, app_type, canonical_name FROM apps LIMIT 0",
+    ),
+    (
+        "anonymous_users",
+        "SELECT user_id, access_token_hash, refresh_token_hash,
+                access_expires_at_ms, refresh_expires_at_ms
+         FROM anonymous_users LIMIT 0",
+    ),
+    (
+        "user_accounts",
+        "SELECT user_id, username_normalized, password_hash, password_scheme,
+                status, avatar_public_id
+         FROM user_accounts LIMIT 0",
+    ),
+    (
+        "account_sessions",
+        "SELECT session_id, user_id, access_token_hash, refresh_token_hash,
+                expires_at_ms, refresh_expires_at_ms, revoked_at_ms,
+                replaced_by_session_id
+         FROM account_sessions LIMIT 0",
+    ),
+    (
+        "feedback_events",
+        "SELECT feedback_id, user_id, idempotency_key, undone_by,
+                request_fingerprint
+         FROM feedback_events LIMIT 0",
+    ),
+    (
+        "jobs",
+        "SELECT job_id, attempts, max_attempts, status, lease_owner,
+                lease_expires_at_ms, completion_idempotency_key
+         FROM jobs LIMIT 0",
+    ),
+    (
+        "play_intent_state",
+        "SELECT singleton, revision FROM play_intent_state LIMIT 0",
+    ),
+    (
+        "user_ai_credentials",
+        "SELECT user_id, mode, encrypted_api_key, key_version
+         FROM user_ai_credentials LIMIT 0",
+    ),
+];
+
+const REQUIRED_PRIMARY_KEYS: &[(&str, &str)] = &[
+    ("schema_migrations", "version"),
+    ("apps", "app_id"),
+    ("anonymous_users", "user_id"),
+    ("user_accounts", "user_id"),
+    ("account_sessions", "session_id"),
+    ("feedback_events", "feedback_id"),
+    ("jobs", "job_id"),
+    ("play_intent_state", "singleton"),
+    ("user_ai_credentials", "user_id"),
+];
+
+const REQUIRED_UNIQUE_KEYS: &[(&str, &[&str])] = &[
+    ("schema_migrations", &["name"]),
+    ("anonymous_users", &["access_token_hash"]),
+    ("anonymous_users", &["refresh_token_hash"]),
+    ("user_accounts", &["username_normalized"]),
+    ("user_accounts", &["avatar_public_id"]),
+    ("account_sessions", &["access_token_hash"]),
+    ("account_sessions", &["refresh_token_hash"]),
+    ("feedback_events", &["user_id", "idempotency_key"]),
+    ("jobs", &["idempotency_key"]),
+];
+
+fn validate_key_schema(conn: &Connection) -> StorageResult<()> {
+    for (name, probe) in KEY_SCHEMA_PROBES {
+        conn.prepare(probe).map_err(|error| {
+            StorageError::migration(format!("required {name} schema is unavailable: {error}"))
+        })?;
+    }
+    for (table, column) in REQUIRED_PRIMARY_KEYS {
+        let ordinal: Option<i64> = conn
+            .query_row(
+                "SELECT pk FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if ordinal.is_none_or(|value| value <= 0) {
+            return Err(StorageError::migration(format!(
+                "required primary key {table}({column}) is missing"
+            )));
+        }
+    }
+    for (table, columns) in REQUIRED_UNIQUE_KEYS {
+        if !has_unique_key(conn, table, columns)? {
+            return Err(StorageError::migration(format!(
+                "required unique key {table}({}) is missing",
+                columns.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn has_unique_key(conn: &Connection, table: &str, expected: &[&str]) -> StorageResult<bool> {
+    let index_names = {
+        let mut statement =
+            conn.prepare("SELECT name FROM pragma_index_list(?1) WHERE \"unique\" = 1")?;
+        let rows = statement.query_map(params![table], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for index_name in index_names {
+        let mut statement =
+            conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno ASC")?;
+        let rows =
+            statement.query_map(params![index_name], |row| row.get::<_, Option<String>>(0))?;
+        let columns = rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        if columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validate_foreign_keys(conn: &Connection) -> StorageResult<()> {
+    let mut statement = conn.prepare("PRAGMA foreign_key_check")?;
+    let mut rows = statement.query([])?;
+    if let Some(row) = rows.next()? {
+        let table: String = row.get(0)?;
+        let row_id: Option<i64> = row.get(1)?;
+        let parent: String = row.get(2)?;
+        let foreign_key: i64 = row.get(3)?;
+        return Err(StorageError::migration(format!(
+            "foreign key violation in {table} row {row_id:?}: parent={parent}, constraint={foreign_key}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_rejects_missing_key_schema() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            conn.execute_batch("DROP TABLE account_sessions")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            db.readiness_check(),
+            Err(StorageError::Migration { .. })
+        ));
+    }
+
+    #[test]
+    fn readiness_rejects_foreign_key_violations() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            conn.pragma_update(None, "foreign_keys", "OFF")?;
+            conn.execute(
+                "INSERT INTO play_intent_votes (app_id, user_id, created_at_ms)
+                 VALUES (999, 'missing-user', 1)",
+                [],
+            )?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            db.readiness_check(),
+            Err(StorageError::Migration { .. })
+        ));
+    }
 }

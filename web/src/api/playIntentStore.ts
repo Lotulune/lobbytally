@@ -12,25 +12,35 @@ import type { StorageLike } from "./types";
 const STORE_KEY = "mpgs.playintent.v1";
 
 interface VoteEntry {
+  appId: number;
   voted: boolean;
   /** True until the desired state is acknowledged by the server. */
   pending: boolean;
-  /** Identity that acknowledged a settled override. */
-  userId?: string | null;
+  /** Account that owns this override; null quarantines an unowned legacy record. */
+  ownerUserId: string | null;
 }
 
 export type PlayIntentListener = () => void;
 
 interface StoreShape {
-  entries: Record<string, VoteEntry>;
+  v?: number;
+  entries: Record<string, LegacyVoteEntry> | VoteEntry[];
+}
+
+interface LegacyVoteEntry {
+  voted: boolean;
+  pending?: boolean;
+  userId?: string | null;
+  ownerUserId?: string | null;
+  appId?: number;
 }
 
 export class PlayIntentStore {
   private readonly client: ApiClient;
   private readonly storage: StorageLike;
-  private entries = new Map<number, VoteEntry>();
+  private entries = new Map<string, VoteEntry>();
   private listeners = new Set<PlayIntentListener>();
-  private syncPromises = new Map<number, Promise<void>>();
+  private syncPromises = new Map<string, Promise<void>>();
 
   constructor(client: ApiClient, storage: StorageLike = getServiceStorage()) {
     this.client = client;
@@ -43,15 +53,40 @@ export class PlayIntentStore {
       const raw = this.storage.getItem(STORE_KEY);
       if (!raw) return;
       const parsed = JSON.parse(raw) as StoreShape;
-      for (const [appId, entry] of Object.entries(parsed.entries ?? {})) {
-        if (typeof entry?.voted === "boolean") {
-          this.entries.set(Number(appId), {
-            voted: entry.voted,
-            pending: entry.pending ?? false,
-            userId: entry.userId,
-          });
+      const legacyOwner = this.currentOwnerUserId();
+      const stored = parsed.entries ?? {};
+      const rows: Array<[string, LegacyVoteEntry]> = Array.isArray(stored)
+        ? stored.map((entry, index) => [String(index), entry])
+        : Object.entries(stored);
+      let migrated = !Array.isArray(stored) || parsed.v !== 2;
+      for (const [storageKey, entry] of rows) {
+        if (typeof entry?.voted !== "boolean") continue;
+        const appId =
+          typeof entry.appId === "number" && Number.isFinite(entry.appId)
+            ? entry.appId
+            : Number(storageKey);
+        if (!Number.isFinite(appId)) continue;
+        let ownerUserId: string | null;
+        if (typeof entry.ownerUserId === "string") {
+          ownerUserId = entry.ownerUserId;
+        } else if (entry.ownerUserId === null) {
+          ownerUserId = null;
+        } else if (typeof entry.userId === "string") {
+          ownerUserId = entry.userId;
+          migrated = true;
+        } else {
+          ownerUserId = legacyOwner;
+          migrated = true;
         }
+        const normalized: VoteEntry = {
+          appId,
+          voted: entry.voted,
+          pending: entry.pending ?? false,
+          ownerUserId,
+        };
+        this.entries.set(this.entryKey(appId, ownerUserId), normalized);
       }
+      if (migrated) this.persist(false);
     } catch {
       this.entries.clear();
     }
@@ -59,9 +94,10 @@ export class PlayIntentStore {
 
   private persist(notify = true): void {
     try {
-      const entries: Record<string, VoteEntry> = {};
-      for (const [appId, entry] of this.entries) entries[String(appId)] = entry;
-      this.storage.setItem(STORE_KEY, JSON.stringify({ entries }));
+      this.storage.setItem(
+        STORE_KEY,
+        JSON.stringify({ v: 2, entries: Array.from(this.entries.values()) }),
+      );
     } catch {
       // best effort
     }
@@ -88,55 +124,66 @@ export class PlayIntentStore {
   }
 
   isPending(appId: number): boolean {
-    return this.entries.get(appId)?.pending ?? false;
+    return this.currentEntry(appId)?.pending ?? false;
   }
 
   pendingCount(): number {
     let count = 0;
-    for (const entry of this.entries.values()) if (entry.pending) count += 1;
+    const owner = this.currentOwnerUserId();
+    for (const entry of this.entries.values()) {
+      if (owner !== null && entry.ownerUserId === owner && entry.pending) count += 1;
+    }
     return count;
   }
 
   /** Flip the vote optimistically and sync. `serverVoted` is the latest known flag. */
   toggle(appId: number, serverVoted: boolean): void {
-    const current = this.entries.get(appId)?.voted ?? serverVoted;
-    this.entries.set(appId, { voted: !current, pending: true });
+    const ownerUserId = this.currentOwnerUserId();
+    if (!ownerUserId) return;
+    const key = this.entryKey(appId, ownerUserId);
+    const current = this.entries.get(key)?.voted ?? serverVoted;
+    this.entries.set(key, { appId, voted: !current, pending: true, ownerUserId });
     this.persist();
-    void this.sync(appId);
+    void this.sync(key);
   }
 
-  private sync(appId: number): Promise<void> {
-    const existing = this.syncPromises.get(appId);
+  private sync(key: string): Promise<void> {
+    const existing = this.syncPromises.get(key);
     if (existing) return existing;
-    const promise = this.runSync(appId).finally(() => {
-      this.syncPromises.delete(appId);
+    const promise = this.runSync(key).finally(() => {
+      this.syncPromises.delete(key);
     });
-    this.syncPromises.set(appId, promise);
+    this.syncPromises.set(key, promise);
     return promise;
   }
 
-  private async runSync(appId: number): Promise<void> {
+  private async runSync(key: string): Promise<void> {
     while (true) {
-      const entry = this.entries.get(appId);
+      const entry = this.entries.get(key);
       if (!entry?.pending) return;
+      if (!this.belongsToCurrentOwner(entry)) return;
       const desired = entry.voted;
       try {
-        const result = await this.client.setPlayIntent(appId, desired);
-        const current = this.entries.get(appId);
+        const result = await this.client.setPlayIntent(entry.appId, desired);
+        const current = this.entries.get(key);
         if (!current) return;
         if (current.voted !== desired) continue;
         // Keep a short-lived override until a server payload reflects the ack.
-        this.entries.set(appId, {
+        this.entries.set(key, {
+          appId: current.appId,
           voted: result.voted,
           pending: false,
-          userId: this.client.sessionUserId(),
+          ownerUserId: current.ownerUserId,
         });
         this.persist();
         return;
       } catch (error) {
-        const current = this.entries.get(appId);
+        const current = this.entries.get(key);
         if (!current) return;
         if (current.voted !== desired) continue;
+        // A logout/account switch freezes this owner's write for a future
+        // matching session instead of attributing or deleting it under another.
+        if (!this.belongsToCurrentOwner(current)) return;
         if (
           error instanceof ApiError &&
           (error.offline || error.status === 408 || error.status === 429 || error.status >= 500)
@@ -144,7 +191,7 @@ export class PlayIntentStore {
           return; // stay pending; flush() retries
         }
         // Permanent failure: drop the optimistic override so the UI reverts.
-        this.entries.delete(appId);
+        this.entries.delete(key);
         this.persist();
         return;
       }
@@ -152,11 +199,13 @@ export class PlayIntentStore {
   }
 
   private reconciledEntry(appId: number, serverVoted: boolean): VoteEntry | undefined {
-    const entry = this.entries.get(appId);
+    const owner = this.currentOwnerUserId();
+    if (!owner) return undefined;
+    const key = this.entryKey(appId, owner);
+    const entry = this.entries.get(key);
     if (!entry || entry.pending) return entry;
-    const wrongIdentity = entry.userId === undefined || entry.userId !== this.client.sessionUserId();
-    if (wrongIdentity || entry.voted === serverVoted) {
-      this.entries.delete(appId);
+    if (entry.voted === serverVoted) {
+      this.entries.delete(key);
       // Reconciliation happens while rendering; persist quietly to avoid a
       // listener-driven state update during another component's render.
       this.persist(false);
@@ -167,9 +216,29 @@ export class PlayIntentStore {
 
   /** Retry every unsynced vote. Safe to call on reconnect. */
   async flush(): Promise<void> {
-    const pending = [...this.entries.entries()].filter(([, e]) => e.pending).map(([id]) => id);
-    for (const appId of pending) {
-      await this.sync(appId);
+    const pending = [...this.entries.entries()]
+      .filter(([, entry]) => entry.pending && this.belongsToCurrentOwner(entry))
+      .map(([key]) => key);
+    for (const key of pending) {
+      await this.sync(key);
     }
+  }
+
+  private currentOwnerUserId(): string | null {
+    return this.client.isAccountAuthenticated() ? this.client.sessionUserId() : null;
+  }
+
+  private belongsToCurrentOwner(entry: VoteEntry): boolean {
+    const owner = this.currentOwnerUserId();
+    return owner !== null && entry.ownerUserId === owner;
+  }
+
+  private currentEntry(appId: number): VoteEntry | undefined {
+    const owner = this.currentOwnerUserId();
+    return owner ? this.entries.get(this.entryKey(appId, owner)) : undefined;
+  }
+
+  private entryKey(appId: number, ownerUserId: string | null): string {
+    return JSON.stringify([ownerUserId, appId]);
   }
 }

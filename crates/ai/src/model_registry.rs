@@ -17,6 +17,9 @@ struct RegistrySnapshot {
     models: HashMap<String, ModelCapabilities>,
     fetched_at: Instant,
     ttl: Duration,
+    /// Only a complete `/models` discovery result may turn absence into proof
+    /// that a model is unavailable. Canary/protocol observations are partial.
+    authoritative: bool,
 }
 
 impl RegistrySnapshot {
@@ -46,6 +49,7 @@ impl ModelRegistry {
             models: map,
             fetched_at: Instant::now(),
             ttl,
+            authoritative: true,
         };
         *self.inner.write().expect("model registry lock") = Some(snapshot);
     }
@@ -94,7 +98,13 @@ impl ModelRegistry {
         let guard = self.inner.read().expect("model registry lock");
         match guard.as_ref() {
             None => true,
-            Some(snap) => snap.models.get(model).is_some_and(|caps| caps.available),
+            // An expired discovery snapshot is no longer authoritative. Let a
+            // configured model retry so a stale list cannot disable it forever.
+            Some(snap) if !snap.is_fresh() => true,
+            Some(snap) => match snap.models.get(model) {
+                Some(caps) => caps.available,
+                None => !snap.authoritative,
+            },
         }
     }
 
@@ -115,6 +125,7 @@ impl ModelRegistry {
                 models: map,
                 fetched_at: Instant::now(),
                 ttl: DEFAULT_REGISTRY_TTL,
+                authoritative: false,
             });
         }
     }
@@ -125,6 +136,7 @@ impl ModelRegistry {
             models: HashMap::new(),
             fetched_at: Instant::now(),
             ttl: DEFAULT_REGISTRY_TTL,
+            authoritative: false,
         });
         let caps = snap
             .models
@@ -299,5 +311,14 @@ mod tests {
         assert!(caps.responses);
         assert!(caps.available);
         assert!(!caps.chat_completions);
+    }
+
+    #[test]
+    fn protocol_success_does_not_close_registry_to_unobserved_fallbacks() {
+        let registry = ModelRegistry::new();
+        registry.record_protocol_success("primary", ApiProtocol::Responses);
+
+        assert!(registry.is_model_allowed("primary"));
+        assert!(registry.is_model_allowed("fallback"));
     }
 }

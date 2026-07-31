@@ -117,7 +117,10 @@ export function OnboardingScreen({ onDone }: { onDone: () => void }) {
       return;
     }
     try {
-      await flushPendingPreferencePatch(apiClient);
+      const saved = await flushPendingPreferencePatch(apiClient);
+      if (!saved) {
+        toast.show("偏好已保存在本机，登录后会自动同步。");
+      }
       fireAction("confirm", doneBtnRef.current);
     } catch (error) {
       const offline = error instanceof ApiError && error.offline;

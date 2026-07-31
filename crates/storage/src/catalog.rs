@@ -43,6 +43,114 @@ pub fn upsert_app(
     Ok(())
 }
 
+/// Merge a low-fidelity catalog row without downgrading store-enriched fields.
+///
+/// App-list and store-search rows do not carry an authoritative release state,
+/// release date, or locale. Once store details have materialized a localization,
+/// that localized display name must also remain authoritative.
+pub fn upsert_catalog_app(
+    conn: &Connection,
+    app_id: u32,
+    app_type: &str,
+    canonical_name: &str,
+    source_modified_at_ms: Option<i64>,
+    now_ms: i64,
+) -> StorageResult<()> {
+    conn.execute(
+        "INSERT INTO apps (
+            app_id, app_type, canonical_name, release_state,
+            source_modified_at_ms, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, 'unknown', ?4, ?5, ?5)
+         ON CONFLICT(app_id) DO UPDATE SET
+            app_type = CASE
+                WHEN apps.app_type = 'unknown'
+                     AND NOT (
+                         apps.source_modified_at_ms IS NOT NULL
+                         AND (
+                             excluded.source_modified_at_ms IS NULL
+                             OR excluded.source_modified_at_ms < apps.source_modified_at_ms
+                         )
+                     )
+                    THEN excluded.app_type
+                ELSE apps.app_type
+            END,
+            canonical_name = CASE
+                WHEN apps.source_modified_at_ms IS NOT NULL
+                     AND (
+                         excluded.source_modified_at_ms IS NULL
+                         OR excluded.source_modified_at_ms < apps.source_modified_at_ms
+                     )
+                    THEN apps.canonical_name
+                WHEN trim(apps.canonical_name) = ''
+                     OR apps.canonical_name = 'app-' || CAST(apps.app_id AS TEXT)
+                    THEN excluded.canonical_name
+                WHEN EXISTS (
+                    SELECT 1 FROM app_localizations localization
+                    WHERE localization.app_id = apps.app_id
+                      AND localization.name IS NOT NULL
+                      AND trim(localization.name) != ''
+                )
+                    THEN apps.canonical_name
+                ELSE excluded.canonical_name
+            END,
+            source_modified_at_ms = CASE
+                WHEN excluded.source_modified_at_ms IS NULL
+                    THEN apps.source_modified_at_ms
+                WHEN apps.source_modified_at_ms IS NULL
+                     OR excluded.source_modified_at_ms >= apps.source_modified_at_ms
+                    THEN excluded.source_modified_at_ms
+                ELSE apps.source_modified_at_ms
+            END,
+            updated_at_ms = excluded.updated_at_ms
+         WHERE (
+                apps.app_type = 'unknown'
+                AND excluded.app_type != 'unknown'
+                AND NOT (
+                    apps.source_modified_at_ms IS NOT NULL
+                    AND (
+                        excluded.source_modified_at_ms IS NULL
+                        OR excluded.source_modified_at_ms < apps.source_modified_at_ms
+                    )
+                )
+            )
+            OR (
+                apps.canonical_name IS NOT excluded.canonical_name
+                AND NOT (
+                    apps.source_modified_at_ms IS NOT NULL
+                    AND (
+                        excluded.source_modified_at_ms IS NULL
+                        OR excluded.source_modified_at_ms < apps.source_modified_at_ms
+                    )
+                )
+                AND (
+                    trim(apps.canonical_name) = ''
+                    OR apps.canonical_name = 'app-' || CAST(apps.app_id AS TEXT)
+                    OR NOT EXISTS (
+                        SELECT 1 FROM app_localizations localization
+                        WHERE localization.app_id = apps.app_id
+                          AND localization.name IS NOT NULL
+                          AND trim(localization.name) != ''
+                    )
+                )
+            )
+            OR (
+                excluded.source_modified_at_ms IS NOT NULL
+                AND (
+                    apps.source_modified_at_ms IS NULL
+                    OR excluded.source_modified_at_ms > apps.source_modified_at_ms
+                )
+            )",
+        params![
+            app_id,
+            app_type,
+            canonical_name,
+            source_modified_at_ms,
+            now_ms
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn get_app(conn: &Connection, app_id: u32) -> StorageResult<Option<AppRecord>> {
     conn.query_row(
         "SELECT app_id, app_type, canonical_name, release_state, release_date,

@@ -1383,6 +1383,8 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let ai_account = account_for_repo(&repo, "ai_provider_user");
+        let authorization = format!("Bearer {}", ai_account.access_token);
 
         let fake = Arc::new(FakeProvider {
             response: serde_json::json!({
@@ -1421,6 +1423,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/recommendations/natural-language")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, authorization.clone())
                     .body(Body::from(
                         r#"{"query":"3 people casual coop replayable","limit":3}"#,
                     ))
@@ -1463,6 +1466,7 @@ mod tests {
                 .method("POST")
                 .uri("/v1/recommendations/natural-language")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, authorization)
                 .body(Body::from(
                     r#"{"query":"3 people casual coop replayable","limit":3}"#,
                 ))
@@ -1934,7 +1938,12 @@ mod tests {
         )
         .unwrap();
         assert!(empty_json["cover_url"].is_string() || empty_json["cover_url"].is_null());
-        assert!(empty_json["media"]["screenshots"].as_array().unwrap().is_empty());
+        assert!(
+            empty_json["media"]["screenshots"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(empty_json["media"]["videos"].as_array().unwrap().is_empty());
         assert!(empty_json["media"]["updated_at_ms"].is_null());
 
@@ -1979,7 +1988,12 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(before_json["media"]["screenshots"].as_array().unwrap().is_empty());
+        assert!(
+            before_json["media"]["screenshots"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
 
         // Insert gallery assets directly and verify full JSON + ETag change.
         let now_ms = repo.data_updated_at_ms().unwrap() + 10_000;
@@ -2033,8 +2047,18 @@ mod tests {
         let videos = rich_json["media"]["videos"].as_array().unwrap();
         assert_eq!(shots.len(), 2);
         assert_eq!(shots[0]["id"], "0");
-        assert!(shots[0]["thumbnail_url"].as_str().unwrap().starts_with("https://"));
-        assert!(shots[0]["full_url"].as_str().unwrap().starts_with("https://"));
+        assert!(
+            shots[0]["thumbnail_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://")
+        );
+        assert!(
+            shots[0]["full_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://")
+        );
         assert_eq!(videos.len(), 2);
         assert_eq!(videos[0]["id"], "257363622");
         assert_eq!(videos[0]["highlight"], true);

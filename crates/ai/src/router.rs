@@ -674,6 +674,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inferred_primary_success_does_not_block_unobserved_fallback() {
+        let provider = Arc::new(FakeProvider {
+            response: json!({"ok": true}),
+            ..FakeProvider::default()
+        });
+        let registry = Arc::new(ModelRegistry::new());
+        let router = TaskRouter::new(
+            provider.clone(),
+            default_task_routes(),
+            registry,
+            RouterPolicy::default(),
+        );
+
+        // Models discovery failed or was unavailable: the first successful
+        // protocol observation must remain a partial, open registry snapshot.
+        let first = router
+            .structured_completion(base_request(AiTaskType::RankExplain))
+            .await
+            .unwrap();
+        assert_eq!(first.response.model, "grok-4.5");
+
+        provider
+            .fail_models
+            .lock()
+            .expect("lock")
+            .insert("grok-4.5".into(), AiError::RateLimited);
+        let second = router
+            .structured_completion(base_request(AiTaskType::RankExplain))
+            .await
+            .unwrap();
+        assert_eq!(second.response.model, "grok-4.20-0309-non-reasoning");
+        assert!(second.used_fallback);
+    }
+
+    #[tokio::test]
     async fn router_does_not_pretend_success_when_all_models_fail() {
         let provider = FakeProvider {
             fail_with: Some(AiError::Timeout),

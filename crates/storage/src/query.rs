@@ -368,6 +368,17 @@ pub fn section_matches(
             .wilson_lower
             .is_some_and(|value| value >= popular_quality_floor)
         && friend_score >= config.popular_min_friend_fit;
+    let multiplayer = &signals.multiplayer;
+    let depends_on_public_population =
+        multiplayer.matchmaking_core >= 0.5 || multiplayer.public_world_dependency >= 0.5;
+    let has_public_independent_path = row.private_session == Some(true)
+        || row.self_hosted_server == Some(true)
+        || multiplayer.private_session >= 0.5
+        || multiplayer.self_host_or_dedicated >= 0.5
+        || multiplayer.low_public_population_dependency >= 0.5;
+    let classic_activity_sufficient = !depends_on_public_population
+        || has_public_independent_path
+        || activity >= config.classic_public_min_ccu;
     match section {
         FeedSection::Upcoming => {
             // Store-search candidates often only materialize a safe min party size
@@ -389,12 +400,21 @@ pub fn section_matches(
         FeedSection::RecentRelease => {
             row.release_state == "released"
                 && date.is_some_and(|value| value >= cutoff_date && value <= today)
+                && friend_score >= config.recent_min_friend_fit
         }
         FeedSection::PopularLegacy => is_popular_legacy,
         FeedSection::ClassicLegacy => {
             row.release_state == "released"
                 && date.is_some_and(|value| value < cutoff_date)
                 && !is_popular_legacy
+                && row
+                    .total_reviews
+                    .is_some_and(|value| value >= config.classic_min_reviews)
+                && row
+                    .wilson_lower
+                    .is_some_and(|value| value >= config.classic_min_wilson)
+                && friend_score >= config.classic_min_friend_fit
+                && classic_activity_sufficient
         }
     }
 }
@@ -810,4 +830,232 @@ pub fn data_updated_at_ms(conn: &Connection) -> StorageResult<i64> {
         |row| row.get(0),
     )?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GameCandidateRow, section_matches};
+    use mpgs_domain::{
+        FeedSection, MultiplayerSignals, RankingSignals, RecommendationConfig, friend_fit,
+    };
+
+    const CUTOFF: &str = "2026-01-01";
+    const TODAY: &str = "2026-07-28";
+
+    fn candidate(release_date: &str) -> GameCandidateRow {
+        GameCandidateRow {
+            app_id: 1,
+            name: "test-game".into(),
+            app_type: "game".into(),
+            release_state: "released".into(),
+            release_date: Some(release_date.into()),
+            release_date_raw: None,
+            release_date_precision: None,
+            cover_url: None,
+            cover_updated_at_ms: None,
+            short_description: None,
+            dominant_mode: Some("coop".into()),
+            private_session: Some(true),
+            online_coop: Some(true),
+            self_hosted_server: Some(true),
+            recommended_min: Some(1),
+            recommended_max: Some(4),
+            profile_confidence: Some(0.9),
+            total_reviews: Some(3_000),
+            total_positive: Some(2_800),
+            latest_ccu: None,
+            wilson_lower: Some(0.82),
+            typical_ccu_7d: None,
+            platforms: vec!["windows".into()],
+            languages: vec!["schinese".into()],
+            typical_session_minutes_min: None,
+            typical_session_minutes_max: None,
+            is_free: Some(false),
+            final_price_minor: None,
+            price_currency: None,
+            has_demo: false,
+        }
+    }
+
+    fn strong_friend_signals() -> RankingSignals {
+        RankingSignals {
+            multiplayer: MultiplayerSignals {
+                private_session: 1.0,
+                self_host_or_dedicated: 1.0,
+                online_coop: 1.0,
+                group_size_fit: 1.0,
+                low_public_population_dependency: 1.0,
+                drop_in_out: 0.8,
+                cross_platform_fit: 0.5,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn isolated_classic_config() -> RecommendationConfig {
+        RecommendationConfig {
+            // Keep this fixture out of PopularLegacy so ClassicLegacy gates are isolated.
+            popular_min_ccu: 10_000,
+            ..RecommendationConfig::default()
+        }
+    }
+
+    #[test]
+    fn recent_release_enforces_configured_friend_fit_threshold() {
+        let row = candidate("2026-07-01");
+        let signals = strong_friend_signals();
+        let score = friend_fit(&signals.multiplayer);
+        let mut config = RecommendationConfig {
+            recent_min_friend_fit: score,
+            ..RecommendationConfig::default()
+        };
+
+        assert!(section_matches(
+            FeedSection::RecentRelease,
+            &row,
+            &signals,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+
+        config.recent_min_friend_fit = (score + 0.001).min(1.0);
+        assert!(!section_matches(
+            FeedSection::RecentRelease,
+            &row,
+            &signals,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn classic_legacy_enforces_review_wilson_and_friend_fit_thresholds() {
+        let mut row = candidate("2020-01-01");
+        let signals = strong_friend_signals();
+        let mut config = isolated_classic_config();
+        assert!(section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &signals,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+
+        config.classic_min_reviews = 3_001;
+        assert!(!section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &signals,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+        config.classic_min_reviews = 3_000;
+
+        config.classic_min_wilson = 0.83;
+        assert!(!section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &signals,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+        config.classic_min_wilson = 0.82;
+
+        config.classic_min_friend_fit = 1.0;
+        assert!(!section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &signals,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+        config.classic_min_friend_fit = RecommendationConfig::default().classic_min_friend_fit;
+
+        row.total_reviews = None;
+        assert!(!section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &signals,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+        row.total_reviews = Some(3_000);
+        row.wilson_lower = None;
+        assert!(!section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &signals,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+    }
+
+    #[test]
+    fn classic_public_activity_gate_preserves_unknown_and_private_path_semantics() {
+        let mut row = candidate("2020-01-01");
+        row.private_session = Some(false);
+        row.online_coop = Some(false);
+        row.self_hosted_server = Some(false);
+        let mut config = isolated_classic_config();
+        config.classic_min_friend_fit = 0.0;
+        config.classic_public_min_ccu = 1_000;
+
+        let unknown_dependency = RankingSignals::default();
+        assert!(section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &unknown_dependency,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+
+        let public_dependency = RankingSignals {
+            multiplayer: MultiplayerSignals {
+                matchmaking_core: 0.6,
+                public_world_dependency: 0.6,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        row.latest_ccu = Some(999);
+        assert!(!section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &public_dependency,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+
+        row.latest_ccu = Some(1_000);
+        assert!(section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &public_dependency,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+
+        row.latest_ccu = None;
+        row.private_session = Some(true);
+        assert!(section_matches(
+            FeedSection::ClassicLegacy,
+            &row,
+            &public_dependency,
+            CUTOFF,
+            TODAY,
+            &config,
+        ));
+    }
 }

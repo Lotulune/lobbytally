@@ -9,18 +9,17 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use image::{DynamicImage, ImageFormat, imageops::FilterType};
+use image::{DynamicImage, ImageFormat, ImageReader, Limits, imageops::FilterType};
 use mpgs_ai::{
     AiError, AiGateway, AiPolicy, AiProvider, AiRankResult, AiStatus, AiTaskType, AppVoteCount,
-    COMPARE_COLUMNS, COMPARE_PROMPT_VERSION, CandidateEvidence, DEFAULT_ROUTE_VERSION,
-    EmbeddingInput, EmbeddingProvider, GroupAdviceRequest as AiGroupAdviceRequest,
-    OpenAiCompatProvider, RANK_PROMPT_VERSION, RuleIntentBaseline, SUMMARY_PROMPT_VERSION,
-    StructuredRequest, TaskRouter, compare_schema, compare_system_prompt,
-    deterministic_group_advice, group_advice_schema, group_advice_system_prompt,
-    intent_parse_schema, intent_parse_system_prompt, merge_intent_with_rules,
-    parse_compare_explanation, parse_group_advice, parse_structured_intent, rank_analysis_schema,
-    rank_analysis_system_prompt, rule_game_summary, validate_rank_result,
-    wrap_untrusted_data_block,
+    COMPARE_PROMPT_VERSION, CandidateEvidence, DEFAULT_ROUTE_VERSION, EmbeddingInput,
+    EmbeddingProvider, GroupAdviceRequest as AiGroupAdviceRequest, OpenAiCompatProvider,
+    RANK_PROMPT_VERSION, RuleIntentBaseline, SUMMARY_PROMPT_VERSION, StructuredRequest, TaskRouter,
+    compare_schema, compare_system_prompt, deterministic_group_advice, group_advice_schema,
+    group_advice_system_prompt, intent_parse_schema, intent_parse_system_prompt,
+    merge_intent_with_rules, parse_compare_explanation, parse_group_advice,
+    parse_structured_intent, rank_analysis_schema, rank_analysis_system_prompt, rule_game_summary,
+    validate_rank_result, wrap_untrusted_data_block,
 };
 use mpgs_domain::{FeedSection, FeedbackType, RecommendationConfig, UserPreferences};
 use mpgs_recommender::{
@@ -35,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use utoipa::{OpenApi, ToSchema};
 
-use crate::ai_limits::AccountAiLimiter;
+use crate::ai_limits::{AccountAiLimiter, AccountAiPermit};
 use crate::cors::CorsConfig;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 
@@ -68,6 +67,9 @@ pub struct AppState {
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const LOGIN_ATTEMPTS_PER_ACCOUNT: u32 = 10;
 const MAX_LOGIN_IDENTITIES: usize = 100_000;
+const AI_CALL_WINDOW: Duration = Duration::from_secs(60);
+const AI_CALLS_PER_ACCOUNT: u32 = 10;
+const MAX_AI_CALL_IDENTITIES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy)]
 struct LoginAttemptCounter {
@@ -121,6 +123,56 @@ impl LoginAttemptLimiter {
 fn login_attempt_limiter() -> &'static LoginAttemptLimiter {
     static LIMITER: OnceLock<LoginAttemptLimiter> = OnceLock::new();
     LIMITER.get_or_init(LoginAttemptLimiter::default)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AiCallCounter {
+    started: Instant,
+    attempts: u32,
+}
+
+#[derive(Default)]
+struct AiCallLimiter {
+    counters: Mutex<HashMap<String, AiCallCounter>>,
+}
+
+impl AiCallLimiter {
+    fn allow(&self, user_id: &str) -> bool {
+        let now = Instant::now();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        user_id.hash(&mut hasher);
+        let key = format!("{:016x}", hasher.finish());
+        let mut counters = self
+            .counters
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if counters.len() >= MAX_AI_CALL_IDENTITIES {
+            counters.retain(|_, counter| now.duration_since(counter.started) < AI_CALL_WINDOW);
+        }
+        if counters.len() >= MAX_AI_CALL_IDENTITIES {
+            return false;
+        }
+        let counter = counters.entry(key).or_insert(AiCallCounter {
+            started: now,
+            attempts: 0,
+        });
+        if now.duration_since(counter.started) >= AI_CALL_WINDOW {
+            *counter = AiCallCounter {
+                started: now,
+                attempts: 0,
+            };
+        }
+        if counter.attempts >= AI_CALLS_PER_ACCOUNT {
+            return false;
+        }
+        counter.attempts = counter.attempts.saturating_add(1);
+        true
+    }
+}
+
+fn ai_call_limiter() -> &'static AiCallLimiter {
+    static LIMITER: OnceLock<AiCallLimiter> = OnceLock::new();
+    LIMITER.get_or_init(AiCallLimiter::default)
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -636,7 +688,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/logout-all", post(logout_all_accounts))
         .route("/v1/auth/password", put(change_account_password))
         .route("/v1/me", get(get_me).patch(patch_me).delete(delete_me))
-        .route("/v1/me/avatar", put(put_avatar).delete(delete_avatar))
+        .route(
+            "/v1/me/avatar",
+            put(put_avatar)
+                .delete(delete_avatar)
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
         .route(
             "/v1/me/ai-settings",
             get(get_ai_settings).put(put_ai_settings),
@@ -686,9 +743,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/v1/jobs/lease", post(lease_jobs))
         .route("/internal/v1/jobs/{job_id}/complete", post(complete_job))
         .route("/internal/v1/jobs/{job_id}/fail", post(fail_job))
-        // Avatar uploads are capped and decoded separately; every smaller JSON
-        // endpoint still validates its own bounded DTO.
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        // JSON endpoints are deliberately small. The avatar route overrides this
+        // limit locally because encoded image uploads may be as large as 2 MiB.
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn_with_state(
             rate_limiter,
             crate::rate_limit::middleware,
@@ -1356,7 +1413,19 @@ async fn put_avatar(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let raw = body.to_vec();
+    let decode_permit = match avatar_decode_limiter().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "avatar processing is busy; retry later",
+                None,
+            );
+        }
+    };
     let encoded = match tokio::task::spawn_blocking(move || {
+        let _decode_permit = decode_permit;
         process_avatar_image(&raw, content_type.as_deref())
     })
     .await
@@ -1661,34 +1730,60 @@ fn resolve_avatar_image_format(
     })
 }
 
+fn avatar_decode_limiter() -> Arc<tokio::sync::Semaphore> {
+    const MAX_CONCURRENT_AVATAR_DECODES: usize = 2;
+    static LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    Arc::clone(
+        LIMITER
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_AVATAR_DECODES))),
+    )
+}
+
+fn validate_avatar_dimensions(width: u32, height: u32) -> Result<(), String> {
+    const MAX_AVATAR_PIXELS: u64 = 16_000_000;
+    const MAX_AVATAR_DIMENSION: u32 = 16_000;
+    if width == 0 || height == 0 {
+        return Err("avatar image has no pixels".to_owned());
+    }
+    if width > MAX_AVATAR_DIMENSION
+        || height > MAX_AVATAR_DIMENSION
+        || u64::from(width)
+            .checked_mul(u64::from(height))
+            .is_none_or(|pixels| pixels > MAX_AVATAR_PIXELS)
+    {
+        return Err("avatar dimensions are too large".to_owned());
+    }
+    Ok(())
+}
+
+fn decode_avatar_image(raw: &[u8], format: ImageFormat) -> Result<DynamicImage, String> {
+    let dimensions = ImageReader::with_format(Cursor::new(raw), format)
+        .into_dimensions()
+        .map_err(|_| "avatar data does not match its declared image type".to_owned())?;
+    validate_avatar_dimensions(dimensions.0, dimensions.1)?;
+
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(16_000);
+    limits.max_image_height = Some(16_000);
+    limits.max_alloc = Some(96 * 1024 * 1024);
+    let mut reader = ImageReader::with_format(Cursor::new(raw), format);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|_| "avatar data could not be decoded within safe limits".to_owned())
+}
+
 fn process_avatar_image(raw: &[u8], content_type: Option<&str>) -> Result<Vec<u8>, String> {
     const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
-    const MAX_AVATAR_PIXELS: u64 = 16_000_000;
     if raw.is_empty() || raw.len() > MAX_AVATAR_BYTES {
         return Err("avatar must be a non-empty JPEG, PNG, or WebP smaller than 2 MiB".to_owned());
     }
-    let format = resolve_avatar_image_format(raw, content_type)?;
-    let image = match image::load_from_memory_with_format(raw, format) {
-        Ok(image) => image,
-        Err(_) => {
-            // Declared type can disagree with bytes (renamed extensions). Fall back
-            // to magic-byte sniffing once before rejecting.
-            let sniffed = sniff_avatar_image_format(raw)
-                .ok_or_else(|| "avatar data does not match its declared image type".to_owned())?;
-            if sniffed == format {
-                return Err("avatar data does not match its declared image type".to_owned());
-            }
-            image::load_from_memory_with_format(raw, sniffed)
-                .map_err(|_| "avatar data does not match its declared image type".to_owned())?
-        }
-    };
-    if u64::from(image.width()) * u64::from(image.height()) > MAX_AVATAR_PIXELS {
-        return Err("avatar dimensions are too large".to_owned());
-    }
+    let declared_format = resolve_avatar_image_format(raw, content_type)?;
+    // A renamed file is harmless, but decoding must use the magic-byte format so
+    // dimension preflight and decoder limits apply to the actual codec.
+    let format = sniff_avatar_image_format(raw).unwrap_or(declared_format);
+    let image = decode_avatar_image(raw, format)?;
     let side = image.width().min(image.height());
-    if side == 0 {
-        return Err("avatar image has no pixels".to_owned());
-    }
     let left = (image.width() - side) / 2;
     let top = (image.height() - side) / 2;
     let resized: DynamicImage =
@@ -2546,6 +2641,33 @@ impl FeedSortOrder {
     }
 }
 
+fn feed_result_context(
+    preference_context: &str,
+    sort: FeedSort,
+    order: FeedSortOrder,
+    demo_only: bool,
+) -> String {
+    format!(
+        "{:016x}",
+        hash64(&format!(
+            "{preference_context}|sort={}|order={}|demo_only={demo_only}",
+            sort.as_str(),
+            order.as_str()
+        ))
+    )
+}
+
+fn feedback_personal_adjustment(feedback: Option<&str>, matchmaking_core: f64) -> f64 {
+    match feedback {
+        Some("like") => 0.20,
+        // "Played" means the discovery feed should make room for something new.
+        Some("played") => -0.10,
+        Some("too_competitive") if matchmaking_core >= 0.5 => -0.30,
+        Some("too_competitive" | "hosting_friction") => -0.15,
+        _ => 0.0,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FeedPresentation {
     release_date: Option<String>,
@@ -2680,6 +2802,8 @@ async fn get_feed(
         &active_config.version,
         &active_config.config,
     );
+    let demo_only = query.demo_only.unwrap_or(false);
+    let result_context = feed_result_context(&preference_context, feed_sort, feed_order, demo_only);
     let snapshot_ms = match storage_result(repo, |repo| repo.data_updated_at_ms()).await {
         Ok(value) => value,
         Err(error) => return map_storage_error(error, None),
@@ -2709,7 +2833,7 @@ async fn get_feed(
             query.cursor.as_deref(),
             section,
             snapshot_ms,
-            &preference_context,
+            &result_context,
             play_intent.epoch.revision,
         ) {
             Ok(value) => value,
@@ -2732,9 +2856,10 @@ async fn get_feed(
         }
     };
     let cache_identity = user_id.as_deref().unwrap_or("public");
-    // v4: feed items include cover fallbacks + review/ccu presentation fields + sort.
+    // v5: cursor and validators include every query dimension that can change
+    // membership or ordering.
     let etag = weak_etag(&format!(
-        "feed:v4:{}:{snapshot_ms}:{preference_context}:{offset}:{limit}:{}:pi{}:user{cache_identity}:sort{}:order{}",
+        "feed:v5:{}:{snapshot_ms}:{result_context}:{offset}:{limit}:{}:pi{}:user{cache_identity}:sort{}:order{}:demo{demo_only}",
         section.as_str(),
         active_config.version,
         play_intent.epoch.revision,
@@ -2775,7 +2900,7 @@ async fn get_feed(
     let inputs: Vec<RankingInput> = candidates
         .into_iter()
         .filter_map(|row| {
-            if query.demo_only == Some(true) && !row.has_demo {
+            if demo_only && !row.has_demo {
                 return None;
             }
             let signals = row.to_ranking_signals();
@@ -2783,13 +2908,8 @@ async fn get_feed(
             if matches!(feedback, Some("not_interested" | "party_size_mismatch")) {
                 return None;
             }
-            let personal_adjustment = match feedback {
-                Some("like") => 0.20,
-                Some("played") => 0.05,
-                Some("too_competitive") if signals.multiplayer.matchmaking_core >= 0.5 => -0.30,
-                Some("too_competitive" | "hosting_friction") => -0.15,
-                _ => 0.0,
-            };
+            let personal_adjustment =
+                feedback_personal_adjustment(feedback, signals.multiplayer.matchmaking_core);
             let availability = row.availability();
             let matches_section = mpgs_storage::query::section_matches(
                 section,
@@ -2905,7 +3025,7 @@ async fn get_feed(
         Some(encode_cursor(
             section,
             snapshot_ms,
-            &preference_context,
+            &result_context,
             play_intent.epoch.revision,
             next_offset,
         ))
@@ -3035,15 +3155,14 @@ async fn natural_language_recommendations(
         r#async: async_mode,
         intent_delta,
     } = body;
-    let query = raw_query.trim().to_owned();
-    if query.len() < 3 || query.len() > 500 {
+    let Some(query) = normalized_ai_query(&raw_query) else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
             "query must contain between 3 and 500 characters",
             None,
         );
-    }
+    };
     let output_limit = limit.unwrap_or(6);
     if !(3..=10).contains(&output_limit) {
         return error_response(
@@ -3070,20 +3189,19 @@ async fn natural_language_recommendations(
         Some(_) => None, // custom credentials are applied after feed for rank only
         None => Some(account_ai_gateway(&state, account_user_id.as_deref()).await),
     };
-    let early_router = resolved_ai_early.as_ref().and_then(|resolved| {
-        if resolved.gateway.provider_name() == state.ai.provider_name()
-            && state.task_router.is_available()
-        {
-            Some(state.task_router.as_ref())
-        } else {
-            None
-        }
-    });
-    if let Some(router) = early_router {
-        let gateway = &resolved_ai_early.as_ref().unwrap().gateway;
-        if let Some(merged) = try_ai_intent_parse(router, gateway, &query, &interpreted).await {
-            apply_structured_intent(&mut interpreted, &merged);
-        }
+    if let Some(resolved) = resolved_ai_early.as_ref()
+        && let Some(router) = resolved_task_router(resolved, &state)
+        && let Some(merged) = try_ai_intent_parse(
+            router,
+            &resolved.gateway,
+            state.repo.as_ref(),
+            resolved.admission.as_ref(),
+            &query,
+            &interpreted,
+        )
+        .await
+    {
+        apply_structured_intent(&mut interpreted, &merged);
     }
 
     let feed_query = FeedQuery {
@@ -3199,19 +3317,37 @@ async fn natural_language_recommendations(
                     None,
                 );
             };
-            let mode = match state.repo.as_ref() {
+            let settings = match state.repo.as_ref() {
                 Some(repo) => {
                     let user_id = account_user_id.to_owned();
-                    match storage_result(repo, move |repo| repo.account_ai_settings(&user_id)).await
-                    {
-                        Ok(settings) => settings.mode,
-                        Err(_) => AiMode::Off,
-                    }
+                    storage_result(repo, move |repo| repo.account_ai_settings(&user_id))
+                        .await
+                        .ok()
                 }
-                None => AiMode::Off,
+                None => None,
             };
-            if mode == AiMode::Custom {
-                match transient_custom_ai_resolved(custom).await {
+            if settings
+                .as_ref()
+                .is_some_and(|row| row.mode == AiMode::Custom)
+            {
+                let Some(saved_base_url) =
+                    settings.as_ref().and_then(|row| row.base_url.as_deref())
+                else {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_argument",
+                        "saved custom AI endpoint is missing",
+                        None,
+                    );
+                };
+                match transient_custom_ai_resolved(
+                    custom,
+                    saved_base_url,
+                    account_user_id,
+                    state.account_ai_limits.clone(),
+                )
+                .await
+                {
                     Ok(resolved) => resolved,
                     Err(response) => return response,
                 }
@@ -3229,22 +3365,7 @@ async fn natural_language_recommendations(
         .unwrap_or_else(|| "anonymous".to_owned());
     let ai_started = std::time::Instant::now();
     // Prefer device-local multi-model custom router; otherwise built-in TaskRouter.
-    let custom_router = resolved_ai.task_router.clone();
-    let task_router = custom_router
-        .as_ref()
-        .map(|r| r.as_ref())
-        .or_else(|| {
-            resolved_ai
-                .builtin_quota
-                .as_ref()
-                .map(|_| state.task_router.as_ref())
-        })
-        .or_else(|| {
-            (!resolved_ai.gateway.provider_name().is_empty()
-                && resolved_ai.gateway.provider_name() == state.ai.provider_name()
-                && state.task_router.is_available())
-            .then_some(state.task_router.as_ref())
-        });
+    let task_router = resolved_task_router(&resolved_ai, &state);
 
     let enhance = if skip_rank_ai {
         if resolved_ai.gateway.is_available() || task_router.is_some_and(|r| r.is_available()) {
@@ -3260,14 +3381,13 @@ async fn natural_language_recommendations(
             &cache_scope,
             &query,
             &mut items,
-            resolved_ai.builtin_quota.as_ref(),
+            resolved_ai.admission.as_ref(),
         )
         .await
     };
     items.truncate(output_limit as usize);
-    let active_router = task_router.unwrap_or(state.task_router.as_ref());
-    let rank_route = active_router.route_for(AiTaskType::RankExplain);
-    let intent_route = active_router.route_for(AiTaskType::IntentParse);
+    let rank_route = task_router.and_then(|router| router.route_for(AiTaskType::RankExplain));
+    let intent_route = task_router.and_then(|router| router.route_for(AiTaskType::IntentParse));
     Json(json!({
         "query": query,
         "interpreted": interpreted,
@@ -3279,7 +3399,7 @@ async fn natural_language_recommendations(
         "ai_route_version": enhance.route_version,
         "ai_used_model_fallback": enhance.used_model_fallback,
         "ai_attempted_models": enhance.attempted_models,
-        "ai_multi_model": active_router.multi_model_active(),
+        "ai_multi_model": task_router.is_some_and(TaskRouter::multi_model_active),
         "ai_routes": {
             "rank_explain": rank_route.map(|r| json!({
                 "primary": r.primary_model,
@@ -3338,60 +3458,118 @@ fn reorder_items_by_hybrid(items: &mut [serde_json::Value], hits: &[mpgs_storage
 }
 
 /// Resolve an account's AI mode without ever returning the custom key to the
-/// caller. Anonymous natural-language requests use the deployment's built-in
-/// mode but cannot select a custom provider.
+/// caller. Anonymous requests deliberately receive a disabled gateway: every
+/// paid provider call must have an accountable, admitted account identity.
+#[derive(Clone)]
 struct ResolvedAiGateway {
     gateway: AiGateway,
     /// When set (device-local multi-model custom API), prefer this over `state.task_router`.
     task_router: Option<Arc<TaskRouter>>,
-    builtin_quota: Option<BuiltinAiQuota>,
+    use_builtin_router: bool,
+    admission: Option<AiCallAdmission>,
 }
 
 #[derive(Clone)]
-struct BuiltinAiQuota {
+struct AiCallAdmission {
     user_id: String,
     limiter: AccountAiLimiter,
+    charge_daily_quota: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AiAdmissionError {
+    BudgetExhausted,
+    TemporarilyUnavailable,
+}
+
+fn disabled_resolved_ai() -> ResolvedAiGateway {
+    ResolvedAiGateway {
+        gateway: AiGateway::disabled(),
+        task_router: None,
+        use_builtin_router: false,
+        admission: None,
+    }
+}
+
+fn resolved_task_router<'a>(
+    resolved: &'a ResolvedAiGateway,
+    state: &'a AppState,
+) -> Option<&'a TaskRouter> {
+    resolved
+        .task_router
+        .as_deref()
+        .or_else(|| {
+            resolved
+                .use_builtin_router
+                .then_some(state.task_router.as_ref())
+        })
+        .filter(|router| router.is_available())
+}
+
+fn ai_admission_failure_reason(error: AiAdmissionError) -> String {
+    match error {
+        AiAdmissionError::BudgetExhausted => AiError::BudgetExhausted.fallback_reason().to_owned(),
+        AiAdmissionError::TemporarilyUnavailable => {
+            "AI account quota is temporarily unavailable; deterministic results are shown"
+                .to_owned()
+        }
+    }
+}
+
+async fn acquire_ai_call(
+    repo: Option<&Repository>,
+    admission: &AiCallAdmission,
+) -> Result<AccountAiPermit, AiAdmissionError> {
+    let permit = admission
+        .limiter
+        .try_acquire(&admission.user_id)
+        .ok_or(AiAdmissionError::BudgetExhausted)?;
+    if !ai_call_limiter().allow(&admission.user_id) {
+        return Err(AiAdmissionError::BudgetExhausted);
+    }
+    if admission.charge_daily_quota {
+        let repo = repo.ok_or(AiAdmissionError::TemporarilyUnavailable)?;
+        let user_id = admission.user_id.clone();
+        let day_utc = chrono_like_now_ms() / 86_400_000;
+        let daily_limit = admission.limiter.daily_budget();
+        match storage_result(repo, move |repo| {
+            repo.consume_account_ai_quota(&user_id, day_utc, daily_limit)
+        })
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(AiAdmissionError::BudgetExhausted),
+            Err(_) => return Err(AiAdmissionError::TemporarilyUnavailable),
+        }
+    }
+    Ok(permit)
 }
 
 async fn account_ai_gateway(state: &AppState, user_id: Option<&str>) -> ResolvedAiGateway {
     let Some(user_id) = user_id else {
-        return ResolvedAiGateway {
-            gateway: state.ai.clone(),
-            task_router: None,
-            builtin_quota: None,
-        };
+        return disabled_resolved_ai();
     };
     let Some(repo) = state.repo.as_ref() else {
-        return ResolvedAiGateway {
-            gateway: AiGateway::disabled(),
-            task_router: None,
-            builtin_quota: None,
-        };
+        return disabled_resolved_ai();
     };
     let lookup_user_id = user_id.to_owned();
     let settings =
         match storage_result(repo, move |repo| repo.account_ai_settings(&lookup_user_id)).await {
             Ok(settings) => settings,
             Err(_) => {
-                return ResolvedAiGateway {
-                    gateway: AiGateway::disabled(),
-                    task_router: None,
-                    builtin_quota: None,
-                };
+                return disabled_resolved_ai();
             }
         };
     match settings.mode {
-        AiMode::Off => ResolvedAiGateway {
-            gateway: AiGateway::disabled(),
-            task_router: None,
-            builtin_quota: None,
-        },
+        AiMode::Off => disabled_resolved_ai(),
         AiMode::Builtin => ResolvedAiGateway {
             gateway: state.ai.clone(),
             task_router: None,
-            builtin_quota: Some(BuiltinAiQuota {
+            use_builtin_router: true,
+            admission: Some(AiCallAdmission {
                 user_id: user_id.to_owned(),
                 limiter: state.account_ai_limits.clone(),
+                charge_daily_quota: true,
             }),
         },
         AiMode::Custom => ResolvedAiGateway {
@@ -3399,13 +3577,25 @@ async fn account_ai_gateway(state: &AppState, user_id: Option<&str>) -> Resolved
             // with the recommendation request.
             gateway: AiGateway::disabled(),
             task_router: None,
-            builtin_quota: None,
+            use_builtin_router: false,
+            admission: None,
         },
     }
 }
 
+fn custom_ai_hosts_match(
+    requested: &mpgs_ai::CustomBaseUrlResolution,
+    saved: &mpgs_ai::CustomBaseUrlResolution,
+) -> bool {
+    requested.host.eq_ignore_ascii_case(&saved.host)
+        && requested.address.port() == saved.address.port()
+}
+
 async fn transient_custom_ai_resolved(
     custom: TransientCustomAiRequest,
+    saved_base_url: &str,
+    user_id: &str,
+    limiter: AccountAiLimiter,
 ) -> Result<ResolvedAiGateway, Response> {
     if custom.provider != "openai_compat" {
         return Err(error_response(
@@ -3423,16 +3613,34 @@ async fn transient_custom_ai_resolved(
             None,
         ));
     }
-    let resolution = mpgs_ai::resolve_custom_base_url(&custom.base_url)
-        .await
-        .map_err(|_| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                "custom AI endpoint is not allowed",
-                None,
-            )
-        })?;
+    let (resolution, saved_resolution) = tokio::join!(
+        mpgs_ai::resolve_custom_base_url(&custom.base_url),
+        mpgs_ai::resolve_custom_base_url(saved_base_url)
+    );
+    let resolution = resolution.map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "custom AI endpoint is not allowed",
+            None,
+        )
+    })?;
+    let saved_resolution = saved_resolution.map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "saved custom AI endpoint is no longer valid",
+            None,
+        )
+    })?;
+    if !custom_ai_hosts_match(&resolution, &saved_resolution) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "custom AI endpoint does not match saved account settings",
+            None,
+        ));
+    }
     let timeout = Duration::from_secs(20);
     let provider = OpenAiCompatProvider::new_with_custom_resolution(
         resolution.base_url.clone(),
@@ -3467,8 +3675,9 @@ async fn transient_custom_ai_resolved(
             Arc::new(mpgs_ai::ModelRegistry::new()),
             mpgs_ai::RouterPolicy::default(),
         );
-        // Best-effort discovery so missing models are skipped (device key, not logged).
-        let _ = router.refresh_model_registry().await;
+        // Keep the registry unknown/optimistic here. Explicit discovery has its
+        // own authenticated endpoint; recommendation requests must not add an
+        // unadmitted `/models` call or block first paint before AI admission.
         Some(Arc::new(router))
     } else {
         None
@@ -3477,7 +3686,12 @@ async fn transient_custom_ai_resolved(
     Ok(ResolvedAiGateway {
         gateway,
         task_router,
-        builtin_quota: None,
+        use_builtin_router: false,
+        admission: Some(AiCallAdmission {
+            user_id: user_id.to_owned(),
+            limiter,
+            charge_daily_quota: false,
+        }),
     })
 }
 
@@ -3628,11 +3842,13 @@ async fn enhance_natural_language_with_ai(
     cache_scope: &str,
     query: &str,
     items: &mut Vec<serde_json::Value>,
-    builtin_quota: Option<&BuiltinAiQuota>,
+    admission: Option<&AiCallAdmission>,
 ) -> AiEnhanceOutcome {
     const AI_MAX_RECOMMENDATIONS: usize = 8;
+    let online_available =
+        gateway.is_available() || task_router.is_some_and(TaskRouter::is_available);
     if items.is_empty() {
-        if gateway.is_available() {
+        if online_available {
             return AiEnhanceOutcome {
                 status: AiStatus::Used,
                 ..AiEnhanceOutcome::default()
@@ -3640,7 +3856,7 @@ async fn enhance_natural_language_with_ai(
         }
         return AiEnhanceOutcome::disabled(mpgs_ai::AiError::Disabled.fallback_reason());
     }
-    if !gateway.is_available() {
+    if !online_available {
         // Keep reason text compatible with M4 acceptance wording while exposing disabled status.
         return AiEnhanceOutcome::fallback(mpgs_ai::AiError::Disabled.fallback_reason());
     }
@@ -3700,7 +3916,7 @@ async fn enhance_natural_language_with_ai(
         return AiEnhanceOutcome::fallback("no valid candidates for AI analysis");
     }
 
-    let provider_identity = gateway.provider_cache_identity();
+    let provider_identity = ai_route_cache_identity(gateway, task_router, AiTaskType::RankExplain);
     let route_version = task_router
         .map(|router| router.route_version(AiTaskType::RankExplain).to_owned())
         .unwrap_or_else(|| DEFAULT_ROUTE_VERSION.to_owned());
@@ -3771,46 +3987,17 @@ async fn enhance_natural_language_with_ai(
         protocol: None,
     };
 
-    // Cache hits above return before this point. Only a real built-in model
-    // request consumes the account's durable daily quota and a short-lived
-    // per-account concurrency permit.
-    let _permit = if let Some(quota) = builtin_quota {
-        match quota.limiter.try_acquire(&quota.user_id) {
-            Some(permit) => Some(permit),
-            None => {
-                return AiEnhanceOutcome::fallback(
-                    mpgs_ai::AiError::BudgetExhausted.fallback_reason(),
-                );
-            }
-        }
-    } else {
-        None
+    // Cache hits above return before this point. Every real provider call,
+    // including a device-local custom provider, needs the same account-scoped
+    // concurrency and minute admission. Built-in calls additionally charge the
+    // durable daily budget.
+    let Some(admission) = admission else {
+        return AiEnhanceOutcome::fallback(AiError::Disabled.fallback_reason());
     };
-    if let Some(quota) = builtin_quota {
-        let Some(repo) = repo else {
-            return AiEnhanceOutcome::fallback(mpgs_ai::AiError::Disabled.fallback_reason());
-        };
-        let user_id = quota.user_id.clone();
-        let day_utc = chrono_like_now_ms() / 86_400_000;
-        let daily_limit = quota.limiter.daily_budget();
-        match storage_result(repo, move |repo| {
-            repo.consume_account_ai_quota(&user_id, day_utc, daily_limit)
-        })
-        .await
-        {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return AiEnhanceOutcome::fallback(
-                    mpgs_ai::AiError::BudgetExhausted.fallback_reason(),
-                );
-            }
-            Err(_) => {
-                return AiEnhanceOutcome::fallback(
-                    "AI account quota is temporarily unavailable; deterministic recommendations are shown",
-                );
-            }
-        }
-    }
+    let _permit = match acquire_ai_call(repo, admission).await {
+        Ok(permit) => permit,
+        Err(error) => return AiEnhanceOutcome::fallback(ai_admission_failure_reason(error)),
+    };
 
     let (response, used_model_fallback, attempted_models) =
         match run_rank_completion(gateway, task_router, request).await {
@@ -4021,6 +4208,38 @@ fn apply_validated_ai_rank(items: &mut Vec<serde_json::Value>, validated: &mpgs_
     *items = reordered;
 }
 
+fn ai_route_cache_identity(
+    gateway: &AiGateway,
+    task_router: Option<&TaskRouter>,
+    task: AiTaskType,
+) -> String {
+    let route = task_router
+        .and_then(|router| router.route_for(task))
+        .map(|route| {
+            json!({
+                "task": task.as_str(),
+                "primary_model": route.primary_model,
+                "fallback_models": route.fallback_models,
+                "protocol_preference": route
+                    .protocol_preference
+                    .iter()
+                    .map(|protocol| protocol.as_str())
+                    .collect::<Vec<_>>(),
+                "timeout_ms": route.timeout.as_millis(),
+                "max_output_tokens": route.max_output_tokens,
+                "enabled": route.enabled,
+                "route_version": route.route_version,
+            })
+        })
+        .unwrap_or_else(|| json!({ "task": task.as_str(), "route": "direct" }));
+    let identity = json!({
+        "provider": gateway.provider_cache_identity(),
+        "route": route,
+    });
+    let bytes = serde_json::to_vec(&identity).unwrap_or_default();
+    format!("ai-route:{}", hex_sha256(&bytes))
+}
+
 fn nl_ai_cache_key(
     query: &str,
     compact: &[serde_json::Value],
@@ -4121,6 +4340,13 @@ fn default_true() -> bool {
     true
 }
 
+fn normalized_ai_query(raw: &str) -> Option<String> {
+    let query = raw.trim();
+    (3..=500)
+        .contains(&query.chars().count())
+        .then(|| query.to_owned())
+}
+
 #[derive(Debug, Deserialize)]
 struct AiCompareRequest {
     app_ids: Vec<u32>,
@@ -4131,15 +4357,14 @@ async fn ai_search(
     headers: HeaderMap,
     Json(body): Json<AiSearchRequest>,
 ) -> Response {
-    let query = body.query.trim().to_owned();
-    if query.len() < 3 || query.len() > 500 {
+    let Some(query) = normalized_ai_query(&body.query) else {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
             "query must contain between 3 and 500 characters",
             None,
         );
-    }
+    };
     let output_limit = body.limit.unwrap_or(6);
     if !(3..=10).contains(&output_limit) {
         return error_response(
@@ -4199,7 +4424,16 @@ async fn ai_search(
         .and_then(|v| v.as_str())
         .unwrap_or("fallback")
         .to_owned();
-    if let Some(repo) = state.repo.as_ref() {
+    let Some(repo) = state.repo.as_ref() else {
+        return storage_disabled();
+    };
+    let account_user_id = optional_account_user_id(repo, &headers).await;
+    let resolved_ai = account_ai_gateway(&state, account_user_id.as_deref()).await;
+    let cache_scope = account_user_id
+        .as_deref()
+        .map(|user_id| format!("account:{user_id}"))
+        .unwrap_or_else(|| "anonymous".to_owned());
+    {
         let now_ms = chrono_like_now_ms();
         let request_json = json!({ "query": query, "limit": output_limit }).to_string();
         let base_result_json = payload.to_string();
@@ -4226,7 +4460,11 @@ async fn ai_search(
             created_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(6 * 60 * 60 * 1000),
         };
-        let _ = storage_result(repo, move |repo| repo.insert_progressive_analysis(&insert)).await;
+        if let Err(error) =
+            storage_result(repo, move |repo| repo.insert_progressive_analysis(&insert)).await
+        {
+            return map_storage_error(error, None);
+        }
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("analysis_id".into(), json!(analysis_id));
             if body.r#async && status_for_row == "pending" {
@@ -4239,18 +4477,20 @@ async fn ai_search(
             let analysis_id_bg = analysis_id.clone();
             let query_bg = query.clone();
             let items_bg = payload.get("items").cloned().unwrap_or_else(|| json!([]));
+            let resolved_ai_bg = resolved_ai.clone();
+            let cache_scope_bg = cache_scope.clone();
             tokio::spawn(async move {
                 enhance_progressive_analysis_in_background(
                     state_bg,
                     analysis_id_bg,
                     query_bg,
                     items_bg,
+                    resolved_ai_bg,
+                    cache_scope_bg,
                 )
                 .await;
             });
         }
-    } else if let Some(obj) = payload.as_object_mut() {
-        obj.insert("analysis_id".into(), json!(analysis_id));
     }
 
     Json(payload).into_response()
@@ -4261,33 +4501,33 @@ async fn enhance_progressive_analysis_in_background(
     analysis_id: String,
     query: String,
     items_value: serde_json::Value,
+    resolved_ai: ResolvedAiGateway,
+    cache_scope: String,
 ) {
     let Some(repo) = state.repo.as_ref() else {
         return;
     };
     let mut items = items_value.as_array().cloned().unwrap_or_default();
-    let router = state
-        .task_router
-        .is_available()
-        .then_some(state.task_router.as_ref());
+    let router = resolved_task_router(&resolved_ai, &state);
     let enhance = enhance_natural_language_with_ai(
-        &state.ai,
+        &resolved_ai.gateway,
         router,
         Some(repo),
-        "progressive",
+        &cache_scope,
         &query,
         &mut items,
-        None,
+        resolved_ai.admission.as_ref(),
     )
     .await;
     let now_ms = chrono_like_now_ms();
+    let provider_name = resolved_ai.gateway.provider_name().to_owned();
     let result = json!({
         "items": items,
         "ai_status": enhance.status.as_str(),
         "fallback_reason": enhance.fallback_reason,
         "ai_summary": enhance.summary,
         "ai_summary_evidence_ids": enhance.summary_evidence_ids,
-        "ai_provider": state.ai.provider_name(),
+        "ai_provider": provider_name,
         "ai_model": enhance.model,
         "ai_protocol": enhance.protocol,
         "ai_route_version": enhance.route_version,
@@ -4299,16 +4539,11 @@ async fn enhance_progressive_analysis_in_background(
     let update = mpgs_storage::CompleteProgressiveAnalysis {
         analysis_id: analysis_id.clone(),
         status,
-        provider: Some(state.ai.provider_name().to_owned()),
+        provider: Some(provider_name),
         model: enhance.model.clone(),
         protocol: enhance.protocol.clone(),
         route_version: enhance.route_version.or_else(|| {
-            Some(
-                state
-                    .task_router
-                    .route_version(AiTaskType::RankExplain)
-                    .to_owned(),
-            )
+            router.map(|router| router.route_version(AiTaskType::RankExplain).to_owned())
         }),
         result_json: Some(result_json),
         error_category: enhance
@@ -4392,6 +4627,7 @@ async fn get_ai_analysis(
 
 async fn ai_compare(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<AiCompareRequest>,
 ) -> Response {
     let app_ids = body.app_ids;
@@ -4426,6 +4662,8 @@ async fn ai_compare(
 
     // Fact matrix is server-generated; the model may only explain later (AI-009).
     let mut matrix = Vec::new();
+    let mut allowed_evidence = HashSet::new();
+    let mut allowed_columns = HashSet::new();
     for app_id in app_ids {
         let app = match storage_result(repo, move |repo| repo.get_app(app_id)).await {
             Ok(Some(app)) => app,
@@ -4450,6 +4688,38 @@ async fn ai_compare(
             .await
             .ok()
             .flatten();
+        let mut row_evidence = serde_json::Map::new();
+        if profile.as_ref().is_some_and(|profile| {
+            profile.recommended_min_players.is_some() || profile.recommended_max_players.is_some()
+        }) {
+            let evidence_id = format!("app:{app_id}:party_size");
+            allowed_evidence.insert(evidence_id.clone());
+            allowed_columns.insert("party_size".to_owned());
+            row_evidence.insert("party_size".to_owned(), json!(evidence_id));
+        }
+        if profile.as_ref().is_some_and(|profile| {
+            profile.dominant_mode.is_some()
+                || profile.online_coop.is_some()
+                || profile.crossplay.is_some()
+                || profile.drop_in_out.is_some()
+        }) {
+            let evidence_id = format!("app:{app_id}:multiplayer_mode");
+            allowed_evidence.insert(evidence_id.clone());
+            allowed_columns.insert("multiplayer_mode".to_owned());
+            row_evidence.insert("multiplayer_mode".to_owned(), json!(evidence_id));
+        }
+        if profile.as_ref().is_some_and(|profile| {
+            profile.private_session.is_some() || profile.self_hosted_server.is_some()
+        }) {
+            let evidence_id = format!("app:{app_id}:service_dependency");
+            allowed_evidence.insert(evidence_id.clone());
+            allowed_columns.insert("service_dependency".to_owned());
+            row_evidence.insert("service_dependency".to_owned(), json!(evidence_id));
+        }
+        let updated_evidence_id = format!("app:{app_id}:data_updated_at");
+        allowed_evidence.insert(updated_evidence_id.clone());
+        allowed_columns.insert("data_updated_at".to_owned());
+        row_evidence.insert("data_updated_at".to_owned(), json!(updated_evidence_id));
         matrix.push(json!({
             "app_id": app.app_id,
             "name": app.canonical_name,
@@ -4469,29 +4739,26 @@ async fn ai_compare(
                 "drop_in_out": p.drop_in_out,
             })),
             "data_updated_at_ms": app.updated_at_ms,
+            "evidence_ids": row_evidence,
         }));
     }
 
-    let mut allowed_evidence = HashSet::new();
-    for row in &matrix {
-        if let Some(id) = row.get("app_id").and_then(|v| v.as_u64()) {
-            allowed_evidence.insert(format!("app:{id}:identity"));
-            allowed_evidence.insert(format!("app:{id}:profile"));
-            allowed_evidence.insert(format!("app:{id}"));
-            allowed_evidence.insert(id.to_string());
-            for col in COMPARE_COLUMNS {
-                allowed_evidence.insert(format!("app:{id}:{col}"));
-            }
-        }
-    }
+    let mut allowed_columns_list: Vec<_> = allowed_columns.iter().cloned().collect();
+    allowed_columns_list.sort();
     let allowed_ids: Vec<u32> = matrix
         .iter()
         .filter_map(|row| row.get("app_id").and_then(|v| v.as_u64()).map(|v| v as u32))
         .collect();
 
-    let (explanation, ai_status, fallback_reason, model) = if state.task_router.is_available()
-        || state.ai.is_available()
-    {
+    let account_user_id = optional_account_user_id(repo, &headers).await;
+    let resolved_ai = account_ai_gateway(&state, account_user_id.as_deref()).await;
+    let task_router = resolved_task_router(&resolved_ai, &state);
+    let provider_available =
+        resolved_ai.gateway.is_available() || task_router.is_some_and(TaskRouter::is_available);
+    let admission = provider_available
+        .then_some(())
+        .and(resolved_ai.admission.as_ref());
+    let (explanation, ai_status, fallback_reason, model) = if let Some(admission) = admission {
         let data_prompt = format!(
             "{}\n\n{}",
             wrap_untrusted_data_block(
@@ -4501,7 +4768,7 @@ async fn ai_compare(
             ),
             wrap_untrusted_data_block(
                 "allowed_columns",
-                r#"["party_size","platforms","price","multiplayer_mode","service_dependency","content_pacing","review_quality","data_updated_at"]"#,
+                &serde_json::to_string(&allowed_columns_list).unwrap_or_else(|_| "[]".into()),
                 500
             )
         );
@@ -4516,32 +4783,60 @@ async fn ai_compare(
             model: None,
             protocol: None,
         };
-        let completion = if state.task_router.is_available() {
-            state
-                .task_router
-                .structured_completion(request)
-                .await
-                .map(|r| r.response)
-        } else {
-            state.ai.structured_completion(request).await
-        };
-        match completion {
-            Ok(response) => {
-                match parse_compare_explanation(&response.content, &allowed_ids, &allowed_evidence)
-                {
-                    Ok(expl) => (Some(expl), AiStatus::Used, None, Some(response.model)),
+        match acquire_ai_call(Some(repo), admission).await {
+            Ok(_permit) => {
+                let completion = if let Some(router) = task_router {
+                    router
+                        .structured_completion(request)
+                        .await
+                        .map(|r| r.response)
+                } else {
+                    resolved_ai.gateway.structured_completion(request).await
+                };
+                match completion {
+                    Ok(response) => {
+                        match parse_compare_explanation(
+                            &response.content,
+                            &allowed_ids,
+                            &allowed_evidence,
+                        )
+                        .and_then(|explanation| {
+                            for difference in &explanation.differences {
+                                if !allowed_columns.contains(&difference.column)
+                                    || difference
+                                        .evidence_ids
+                                        .iter()
+                                        .any(|id| !id.ends_with(&format!(":{}", difference.column)))
+                                {
+                                    return Err(AiError::InvalidOutput(
+                                        "compare evidence does not match the supplied fact column"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                            Ok(explanation)
+                        }) {
+                            Ok(expl) => (Some(expl), AiStatus::Used, None, Some(response.model)),
+                            Err(error) => (
+                                None,
+                                AiStatus::Fallback,
+                                Some(safe_ai_failure_reason(&error)),
+                                Some(response.model),
+                            ),
+                        }
+                    }
                     Err(error) => (
                         None,
                         AiStatus::Fallback,
                         Some(safe_ai_failure_reason(&error)),
-                        Some(response.model),
+                        None,
                     ),
                 }
             }
             Err(error) => (
                 None,
                 AiStatus::Fallback,
-                Some(safe_ai_failure_reason(&error)),
+                Some(ai_admission_failure_reason(error)),
                 None,
             ),
         }
@@ -4561,16 +4856,7 @@ async fn ai_compare(
         "fallback_reason": fallback_reason,
         "model": model,
         "prompt_version": COMPARE_PROMPT_VERSION,
-        "columns": [
-            "party_size",
-            "platforms",
-            "price",
-            "multiplayer_mode",
-            "service_dependency",
-            "content_pacing",
-            "review_quality",
-            "data_updated_at"
-        ]
+        "columns": allowed_columns_list
     }))
     .into_response()
 }
@@ -4697,8 +4983,16 @@ struct GroupAdviceHttpRequest {
     vote_counts: Vec<AppVoteCount>,
 }
 
+fn valid_group_labels(values: &[String]) -> bool {
+    values.len() <= 16
+        && values
+            .iter()
+            .all(|value| !value.trim().is_empty() && value.chars().count() <= 80)
+}
+
 async fn ai_group_advice(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<GroupAdviceHttpRequest>,
 ) -> Response {
     if !(2..=12).contains(&body.candidate_app_ids.len()) {
@@ -4720,6 +5014,42 @@ async fn ai_group_advice(
             );
         }
     }
+    if body
+        .party_size
+        .is_some_and(|party_size| !(1..=64).contains(&party_size))
+        || !valid_group_labels(&body.platforms)
+        || !valid_group_labels(&body.modes_preferred)
+        || !valid_group_labels(&body.modes_excluded)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "group preferences exceed supported bounds",
+            None,
+        );
+    }
+    if body.vote_counts.len() > body.candidate_app_ids.len() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "vote_counts must contain at most one row per candidate",
+            None,
+        );
+    }
+    let candidate_ids: HashSet<u32> = body.candidate_app_ids.iter().copied().collect();
+    let mut vote_ids = HashSet::new();
+    if body
+        .vote_counts
+        .iter()
+        .any(|row| !candidate_ids.contains(&row.app_id) || !vote_ids.insert(row.app_id))
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "vote_counts must be unique and refer to candidate AppIDs",
+            None,
+        );
+    }
     let request = AiGroupAdviceRequest {
         party_size: body.party_size,
         platforms: body.platforms,
@@ -4729,66 +5059,110 @@ async fn ai_group_advice(
         vote_counts: body.vote_counts.clone(),
     };
     let mut allowed_evidence = HashSet::new();
-    for app_id in &request.candidate_app_ids {
-        allowed_evidence.insert(format!("vote:aggregate:{app_id}"));
-        allowed_evidence.insert(format!("app:{app_id}:profile"));
-    }
+    let candidate_facts: Vec<_> = request
+        .candidate_app_ids
+        .iter()
+        .map(|app_id| {
+            let evidence_id = format!("candidate:{app_id}");
+            allowed_evidence.insert(evidence_id.clone());
+            json!({ "app_id": app_id, "evidence_id": evidence_id })
+        })
+        .collect();
+    let vote_facts: Vec<_> = request
+        .vote_counts
+        .iter()
+        .map(|row| {
+            let evidence_id = format!("vote:aggregate:{}", row.app_id);
+            allowed_evidence.insert(evidence_id.clone());
+            json!({
+                "app_id": row.app_id,
+                "votes": row.votes,
+                "evidence_id": evidence_id,
+            })
+        })
+        .collect();
     let det = deterministic_group_advice(&request.candidate_app_ids, &request.vote_counts);
-    let (advice, ai_status, fallback_reason) =
-        if state.task_router.is_available() || state.ai.is_available() {
-            let data_prompt = wrap_untrusted_data_block(
-                "group_aggregate_json",
-                &serde_json::to_string(&request).unwrap_or_else(|_| "{}".into()),
-                6_000,
-            );
-            let structured = StructuredRequest {
-                task: AiTaskType::GroupAdvice,
-                system_prompt: group_advice_system_prompt().to_owned(),
-                data_prompt,
-                json_schema_name: "group_advice".into(),
-                json_schema: group_advice_schema(),
-                max_output_tokens: 1_200,
-                temperature: 0.2,
-                model: None,
-                protocol: None,
-            };
-            let completion = if state.task_router.is_available() {
-                state
-                    .task_router
-                    .structured_completion(structured)
-                    .await
-                    .map(|r| r.response)
-            } else {
-                state.ai.structured_completion(structured).await
-            };
-            match completion {
-                Ok(response) => {
-                    match parse_group_advice(
-                        &response.content,
-                        &request.candidate_app_ids,
-                        &allowed_evidence,
-                    ) {
-                        Ok(parsed) => (Some(parsed), AiStatus::Used, None),
-                        Err(error) => (
-                            det,
-                            AiStatus::Fallback,
-                            Some(safe_ai_failure_reason(&error)),
-                        ),
+    let account_user_id = match state.repo.as_ref() {
+        Some(repo) => optional_account_user_id(repo, &headers).await,
+        None => None,
+    };
+    let resolved_ai = account_ai_gateway(&state, account_user_id.as_deref()).await;
+    let task_router = resolved_task_router(&resolved_ai, &state);
+    let provider_available =
+        resolved_ai.gateway.is_available() || task_router.is_some_and(TaskRouter::is_available);
+    let admission = provider_available
+        .then_some(())
+        .and(resolved_ai.admission.as_ref());
+    let (advice, ai_status, fallback_reason) = if let Some(admission) = admission {
+        let group_facts = json!({
+            "party_size": request.party_size,
+            "platforms": request.platforms,
+            "modes_preferred": request.modes_preferred,
+            "modes_excluded": request.modes_excluded,
+            "candidates": candidate_facts,
+            "vote_counts": vote_facts,
+        });
+        let data_prompt = wrap_untrusted_data_block(
+            "group_aggregate_json",
+            &serde_json::to_string(&group_facts).unwrap_or_else(|_| "{}".into()),
+            6_000,
+        );
+        let structured = StructuredRequest {
+            task: AiTaskType::GroupAdvice,
+            system_prompt: group_advice_system_prompt().to_owned(),
+            data_prompt,
+            json_schema_name: "group_advice".into(),
+            json_schema: group_advice_schema(),
+            max_output_tokens: 1_200,
+            temperature: 0.2,
+            model: None,
+            protocol: None,
+        };
+        match acquire_ai_call(state.repo.as_ref(), admission).await {
+            Ok(_permit) => {
+                let completion = if let Some(router) = task_router {
+                    router
+                        .structured_completion(structured)
+                        .await
+                        .map(|r| r.response)
+                } else {
+                    resolved_ai.gateway.structured_completion(structured).await
+                };
+                match completion {
+                    Ok(response) => {
+                        match parse_group_advice(
+                            &response.content,
+                            &request.candidate_app_ids,
+                            &allowed_evidence,
+                        ) {
+                            Ok(parsed) => (Some(parsed), AiStatus::Used, None),
+                            Err(error) => (
+                                det,
+                                AiStatus::Fallback,
+                                Some(safe_ai_failure_reason(&error)),
+                            ),
+                        }
                     }
+                    Err(error) => (
+                        det,
+                        AiStatus::Fallback,
+                        Some(safe_ai_failure_reason(&error)),
+                    ),
                 }
-                Err(error) => (
-                    det,
-                    AiStatus::Fallback,
-                    Some(safe_ai_failure_reason(&error)),
-                ),
             }
-        } else {
-            (
+            Err(error) => (
                 det,
                 AiStatus::Fallback,
-                Some(AiError::Disabled.fallback_reason().to_owned()),
-            )
-        };
+                Some(ai_admission_failure_reason(error)),
+            ),
+        }
+    } else {
+        (
+            det,
+            AiStatus::Fallback,
+            Some(AiError::Disabled.fallback_reason().to_owned()),
+        )
+    };
 
     Json(json!({
         "advice": advice,
@@ -5088,6 +5462,8 @@ fn push_hard(list: &mut Vec<String>, field: &str) {
 async fn try_ai_intent_parse(
     router: &TaskRouter,
     gateway: &AiGateway,
+    repo: Option<&Repository>,
+    admission: Option<&AiCallAdmission>,
     query: &str,
     rules: &NaturalLanguageInterpretation,
 ) -> Option<mpgs_ai::StructuredIntent> {
@@ -5114,6 +5490,8 @@ async fn try_ai_intent_parse(
         model: None,
         protocol: None,
     };
+    let admission = admission?;
+    let _permit = acquire_ai_call(repo, admission).await.ok()?;
     let response = if router.is_available() {
         router.structured_completion(request).await.ok()?.response
     } else {
@@ -5480,11 +5858,11 @@ async fn get_game(
         Ok(value) => value,
         Err(error) => return map_storage_error(error, None),
     };
-    let media_assets =
-        match storage_result(repo, move |repo| repo.game_media_assets(app_id)).await {
-            Ok(value) => value,
-            Err(error) => return map_storage_error(error, None),
-        };
+    let media_assets = match storage_result(repo, move |repo| repo.game_media_assets(app_id)).await
+    {
+        Ok(value) => value,
+        Err(error) => return map_storage_error(error, None),
+    };
     match storage_result(repo, move |repo| repo.game_detail(app_id)).await {
         Ok(Some(game)) => {
             let media = game_media_json(&media_assets);
@@ -6546,7 +6924,42 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Request;
     use std::collections::HashSet;
+    use tower::ServiceExt;
+
+    fn api_test_state(ai: AiGateway) -> AppState {
+        AppState {
+            repo: None,
+            admin_token: None,
+            rate_limits: RateLimitConfig {
+                enabled: false,
+                ..RateLimitConfig::default()
+            },
+            cors: CorsConfig::default(),
+            account_ai_limits: AccountAiLimiter::default(),
+            ai,
+            task_router: Arc::new(TaskRouter::from_provider(Arc::new(
+                mpgs_ai::DisabledProvider,
+            ))),
+            embedding: Arc::new(mpgs_ai::HashEmbeddingProvider { dimensions: 64 }),
+        }
+    }
+
+    fn test_router_with_rank_models(primary: &str, fallbacks: &[&str]) -> TaskRouter {
+        let mut routes = mpgs_ai::default_task_routes();
+        let route = routes
+            .get_mut(&AiTaskType::RankExplain)
+            .expect("default rank route");
+        route.primary_model = primary.to_owned();
+        route.fallback_models = fallbacks.iter().map(|model| (*model).to_owned()).collect();
+        TaskRouter::new(
+            Arc::new(mpgs_ai::FakeProvider::default()),
+            routes,
+            Arc::new(mpgs_ai::ModelRegistry::new()),
+            mpgs_ai::RouterPolicy::default(),
+        )
+    }
 
     #[test]
     fn avatar_processing_crops_to_square_webp_and_rejects_mismatched_media() {
@@ -6578,6 +6991,175 @@ mod tests {
     }
 
     #[test]
+    fn avatar_dimensions_are_rejected_before_decode_allocation() {
+        assert!(validate_avatar_dimensions(4_000, 4_000).is_ok());
+        assert!(validate_avatar_dimensions(4_001, 4_000).is_err());
+        assert!(validate_avatar_dimensions(16_001, 1).is_err());
+        assert!(validate_avatar_dimensions(0, 128).is_err());
+    }
+
+    #[test]
+    fn ai_query_limits_count_unicode_characters_not_utf8_bytes() {
+        assert_eq!(
+            normalized_ai_query("  三人合作  ").as_deref(),
+            Some("三人合作")
+        );
+        assert!(normalized_ai_query("游戏").is_none());
+        assert!(normalized_ai_query(&"游".repeat(500)).is_some());
+        assert!(normalized_ai_query(&"游".repeat(501)).is_none());
+    }
+
+    #[test]
+    fn feed_result_context_binds_sort_order_and_demo_filter() {
+        let base = feed_result_context("prefs", FeedSort::Recommended, FeedSortOrder::Desc, false);
+        assert_ne!(
+            base,
+            feed_result_context("prefs", FeedSort::Ccu, FeedSortOrder::Desc, false)
+        );
+        assert_ne!(
+            base,
+            feed_result_context("prefs", FeedSort::Recommended, FeedSortOrder::Asc, false)
+        );
+        assert_ne!(
+            base,
+            feed_result_context("prefs", FeedSort::Recommended, FeedSortOrder::Desc, true)
+        );
+    }
+
+    #[test]
+    fn played_feedback_demotes_discovery_results() {
+        assert!(feedback_personal_adjustment(Some("played"), 0.0) < 0.0);
+        assert!(feedback_personal_adjustment(Some("like"), 0.0) > 0.0);
+    }
+
+    #[test]
+    fn custom_ai_request_must_match_saved_host_and_port() {
+        let saved = mpgs_ai::CustomBaseUrlResolution {
+            base_url: "https://ai.example.test/v1".to_owned(),
+            host: "ai.example.test".to_owned(),
+            address: "203.0.113.10:443".parse().unwrap(),
+        };
+        let same_host_new_address = mpgs_ai::CustomBaseUrlResolution {
+            base_url: "https://AI.EXAMPLE.TEST/other".to_owned(),
+            host: "AI.EXAMPLE.TEST".to_owned(),
+            address: "203.0.113.11:443".parse().unwrap(),
+        };
+        let other_host = mpgs_ai::CustomBaseUrlResolution {
+            base_url: "https://other.example.test/v1".to_owned(),
+            host: "other.example.test".to_owned(),
+            address: "203.0.113.10:443".parse().unwrap(),
+        };
+        let other_port = mpgs_ai::CustomBaseUrlResolution {
+            address: "203.0.113.10:8443".parse().unwrap(),
+            ..saved.clone()
+        };
+        assert!(custom_ai_hosts_match(&same_host_new_address, &saved));
+        assert!(!custom_ai_hosts_match(&other_host, &saved));
+        assert!(!custom_ai_hosts_match(&other_port, &saved));
+    }
+
+    #[test]
+    fn ai_cache_identity_changes_with_the_model_chain() {
+        let gateway = AiGateway::new(
+            Arc::new(mpgs_ai::FakeProvider::default()),
+            AiPolicy::default(),
+        );
+        let first = test_router_with_rank_models("model-a", &["fallback-a"]);
+        let second = test_router_with_rank_models("model-b", &["fallback-a"]);
+        let third = test_router_with_rank_models("model-a", &["fallback-b"]);
+        let first_identity =
+            ai_route_cache_identity(&gateway, Some(&first), AiTaskType::RankExplain);
+        assert_ne!(
+            first_identity,
+            ai_route_cache_identity(&gateway, Some(&second), AiTaskType::RankExplain)
+        );
+        assert_ne!(
+            first_identity,
+            ai_route_cache_identity(&gateway, Some(&third), AiTaskType::RankExplain)
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_requests_never_resolve_the_builtin_ai_provider() {
+        let gateway = AiGateway::new(
+            Arc::new(mpgs_ai::FakeProvider::default()),
+            AiPolicy::default(),
+        );
+        assert!(gateway.is_available());
+        let state = api_test_state(gateway);
+        let resolved = account_ai_gateway(&state, None).await;
+        assert!(!resolved.gateway.is_available());
+        assert!(resolved.admission.is_none());
+        assert!(resolved_task_router(&resolved, &state).is_none());
+    }
+
+    #[tokio::test]
+    async fn each_builtin_upstream_call_consumes_one_daily_quota_unit() {
+        let database = mpgs_storage::Database::open_in_memory().unwrap();
+        let repo = Repository::new(database);
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        let session = repo
+            .register_account(
+                &RegisterAccount {
+                    username: "api_quota_test".to_owned(),
+                    display_name: "API quota test".to_owned(),
+                    password: "long-enough-test-password".to_owned(),
+                    device_label: "test".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+        let admission = AiCallAdmission {
+            user_id: session.user_id.clone(),
+            limiter: AccountAiLimiter::default(),
+            charge_daily_quota: true,
+        };
+        let first = acquire_ai_call(Some(&repo), &admission).await.unwrap();
+        drop(first);
+        let second = acquire_ai_call(Some(&repo), &admission).await.unwrap();
+        drop(second);
+        let day_utc = chrono_like_now_ms() / 86_400_000;
+        assert_eq!(
+            repo.account_ai_daily_usage(&session.user_id, day_utc)
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn json_body_limit_is_smaller_than_the_avatar_upload_limit() {
+        let app = build_router(api_test_state(AiGateway::disabled()));
+        let oversized_json = format!(r#"{{"query":"{}"}}"#, "x".repeat(70 * 1024));
+        let json_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ai/search")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(oversized_json))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let avatar_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/me/avatar")
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(vec![0_u8; 70 * 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(avatar_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
     fn ai_degradation_keeps_safe_scores_and_sanitizes_unverified_evidence() {
         let candidates = vec![CandidateEvidence {
             app_id: 42,
@@ -6598,14 +7180,10 @@ mod tests {
         let (result, notice) =
             validate_rank_result_with_safe_degradation(&raw, &candidates, 1).unwrap();
         assert_eq!(result.recommendations[0].fit_score, 0.8);
-        // Soft-attach real allowed evidence so reasons can land after sanitization.
-        assert_eq!(result.recommendations[0].reasons, vec!["unsupported claim"]);
-        assert_eq!(
-            result.recommendations[0].reason_evidence_ids,
-            vec!["allowed"]
-        );
-        assert_eq!(result.summary, "unsupported summary");
-        assert_eq!(result.summary_evidence_ids, vec!["allowed"]);
+        assert!(result.recommendations[0].reasons.is_empty());
+        assert!(result.recommendations[0].reason_evidence_ids.is_empty());
+        assert!(result.summary.is_empty());
+        assert!(result.summary_evidence_ids.is_empty());
         assert!(notice.is_some());
 
         let unknown = json!({

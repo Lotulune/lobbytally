@@ -14,6 +14,10 @@ use crate::error::{StorageError, StorageResult};
 use crate::users::{ACCESS_TOKEN_TTL_MS, REFRESH_TOKEN_TTL_MS, token_hash};
 
 const PASSWORD_SCHEME: &str = "argon2id-v19";
+// A syntactically valid Argon2id PHC string with an intentionally impossible
+// all-zero digest. Unknown users verify against this value so their login path
+// performs the same expensive password work as a known active account.
+const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c3RhdGljLWR1bW15LXNhbHQ$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const SESSION_PREFIX: &str = "as_";
 const ACCESS_PREFIX: &str = "mpgs_acct_at_";
 const REFRESH_PREFIX: &str = "mpgs_acct_rt_";
@@ -299,11 +303,20 @@ pub fn login_account(
                 ))
             },
         )
-        .optional()?
-        // The caller deliberately maps this generic error to the same 401 for
-        // unknown usernames, wrong passwords, frozen, and deleted accounts.
-        .ok_or_else(|| StorageError::not_found("account credentials"))?;
-    if account.3 != "active" || !verify_password(&account.1, &account.2, &input.password)? {
+        .optional()?;
+    let (verification_hash, verification_scheme) = account
+        .as_ref()
+        .filter(|account| account.2 == PASSWORD_SCHEME)
+        .map(|account| (account.1.as_str(), account.2.as_str()))
+        .unwrap_or((DUMMY_PASSWORD_HASH, PASSWORD_SCHEME));
+    let password_matches =
+        verify_password(verification_hash, verification_scheme, &input.password)?;
+    // The caller deliberately maps this generic error to the same 401 for
+    // unknown usernames, wrong passwords, frozen, and deleted accounts.
+    let Some(account) = account else {
+        return Err(StorageError::not_found("account credentials"));
+    };
+    if account.3 != "active" || !password_matches {
         return Err(StorageError::not_found("account credentials"));
     }
 
@@ -1037,20 +1050,23 @@ fn merge_anonymous_subject(
     preference_choice: Option<PreferenceChoice>,
 ) -> StorageResult<()> {
     merge_preferences(conn, source_user_id, account_user_id, preference_choice)?;
-    // Feedback keeps its original idempotency semantics. Existing account
-    // events win duplicate keys; source rows are removed in the same transaction.
+    // Feedback ids are global within one table. Removing destination-key
+    // conflicts first lets us move the remaining rows in place, preserving
+    // every feedback_id/undone_by relationship and its idempotent undo result.
     conn.execute(
-        "INSERT OR IGNORE INTO feedback_events (
-            user_id, app_id, feedback_type, recommendation_run_id, idempotency_key,
-            client_created_at_ms, created_at_ms, undone_by, request_fingerprint
-         ) SELECT ?1, app_id, feedback_type, recommendation_run_id, idempotency_key,
-                  client_created_at_ms, created_at_ms, undone_by, request_fingerprint
-           FROM feedback_events WHERE user_id = ?2",
+        "DELETE FROM feedback_events
+         WHERE user_id = ?2
+           AND EXISTS (
+               SELECT 1
+               FROM feedback_events AS destination
+               WHERE destination.user_id = ?1
+                 AND destination.idempotency_key = feedback_events.idempotency_key
+           )",
         params![account_user_id, source_user_id],
     )?;
     conn.execute(
-        "DELETE FROM feedback_events WHERE user_id = ?1",
-        params![source_user_id],
+        "UPDATE feedback_events SET user_id = ?1 WHERE user_id = ?2",
+        params![account_user_id, source_user_id],
     )?;
     // The primary key on (app_id, user_id) is the account-level de-duplication
     // rule. Any source duplicate is discarded without adding public count.
@@ -1311,6 +1327,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use mpgs_domain::FeedbackType;
 
     fn setup() -> (Database, String) {
         let db = Database::open_in_memory().unwrap();
@@ -1364,6 +1381,82 @@ mod tests {
             db.with_conn(|conn| resolve_account_user_id(conn, &refreshed.access_token, 31))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn dummy_login_hash_is_valid_and_never_authenticates() {
+        assert!(
+            !verify_password(DUMMY_PASSWORD_HASH, PASSWORD_SCHEME, "unknown-password").unwrap()
+        );
+    }
+
+    #[test]
+    fn account_merge_preserves_idempotent_feedback_undo_relationships() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            let account = register_account(
+                conn,
+                &RegisterAccount {
+                    username: "merge_target".into(),
+                    display_name: "Merge Target".into(),
+                    password: "target-password-long".into(),
+                    device_label: "target".into(),
+                },
+                None,
+                1,
+            )?;
+            let source = crate::users::create_anonymous_session(conn, 2)?;
+            conn.execute(
+                "INSERT INTO apps (
+                     app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+                 ) VALUES (42, 'game', 'Merge Test', 'released', 1, 1)",
+                [],
+            )?;
+            let fingerprint =
+                crate::feedback::request_fingerprint(42, FeedbackType::Like, None, None)?;
+            let original = crate::feedback::create_feedback(
+                conn,
+                &source.user_id,
+                42,
+                FeedbackType::Like,
+                None,
+                "source-like",
+                None,
+                &fingerprint,
+                3,
+            )?;
+            let undo =
+                crate::feedback::undo_feedback(conn, &source.user_id, original.feedback_id, 4)?;
+
+            let logged_in = login_account(
+                conn,
+                &LoginAccount {
+                    username: "merge_target".into(),
+                    password: "target-password-long".into(),
+                    device_label: "merged".into(),
+                    preference_choice: None,
+                },
+                Some(&source.user_id),
+                5,
+            )?;
+            assert_eq!(logged_in.user_id, account.user_id);
+
+            let (moved_id, moved_undo): (i64, Option<i64>) = conn.query_row(
+                "SELECT feedback_id, undone_by
+                 FROM feedback_events
+                 WHERE user_id = ?1 AND idempotency_key = 'source-like'",
+                params![account.user_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(moved_id, original.feedback_id);
+            assert_eq!(moved_undo, Some(undo.feedback_id));
+            let replay = crate::feedback::undo_feedback(conn, &account.user_id, moved_id, 6)?;
+            assert_eq!(replay.feedback_id, undo.feedback_id);
+            assert_eq!(replay.user_id, account.user_id);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

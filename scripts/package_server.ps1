@@ -198,6 +198,18 @@ try {
         if ([string]$serviceXml.service.executable -ne '%BASE%\..\bin\mpgs-server.exe') {
             throw 'WinSW executable path must resolve from windows/ to bin/mpgs-server.exe'
         }
+        if ([string]$serviceXml.service.serviceaccount.username -ne 'NT AUTHORITY\LocalService') {
+            throw 'WinSW service template must use the low-privilege LocalService account'
+        }
+        if ([string]$serviceXml.service.startmode -ne 'Manual') {
+            throw 'WinSW service template must remain Manual until the installer receives an admin token'
+        }
+        $adminTokenEnv = @(
+            $serviceXml.service.env | Where-Object { $_.name -eq 'MPGS_ADMIN_TOKEN' }
+        ) | Select-Object -First 1
+        if ($null -eq $adminTokenEnv -or -not [string]::IsNullOrEmpty([string]$adminTokenEnv.value)) {
+            throw 'WinSW service template must not contain an MPGS_ADMIN_TOKEN'
+        }
     }
 
     $docsOut = Join-Path $pkgRoot 'docs'

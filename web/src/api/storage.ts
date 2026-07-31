@@ -96,6 +96,16 @@ class SqliteBackedStorage implements StorageLike {
     await invoke("auth_session_save", { value: encodeSessionMap(sessions) });
   }
 
+  async verifySessionMapPersisted(): Promise<void> {
+    const sessions = this.collectSessions();
+    const expected =
+      Object.keys(sessions).length === 0 ? null : encodeSessionMap(sessions);
+    const actual = await invoke<string | null>("auth_session_load");
+    if (actual !== expected) {
+      throw new Error("secure session verification failed");
+    }
+  }
+
   private enqueue(write: () => Promise<unknown>): void {
     this.writeChain = this.writeChain
       .then(write)
@@ -168,7 +178,7 @@ export async function initializeClientStorage(): Promise<void> {
   const [persisted, secureSession, sqliteLegacySession] = await Promise.all([
     invoke<Record<string, string>>("client_store_load"),
     invoke<string | null>("auth_session_load"),
-    invoke<string | null>("client_store_take_legacy_session"),
+    invoke<string | null>("client_store_read_legacy_session"),
   ]);
   const sessions = decodeSessionMap(secureSession);
   // One-time: legacy unscoped session that lived in SQLite client_kv.
@@ -200,6 +210,15 @@ export async function initializeClientStorage(): Promise<void> {
     if (value !== null) store.setItem(key, value);
   }
   await store.flush();
+  await store.verifySessionMapPersisted();
+  if (sqliteLegacySession !== null) {
+    // Delete the legacy SQLite copy only after the keyring write has been
+    // read back byte-for-byte. The value predicate makes retries idempotent
+    // and prevents acknowledging a row that changed during migration.
+    await invoke<boolean>("client_store_acknowledge_legacy_session", {
+      expectedValue: sqliteLegacySession,
+    });
+  }
   for (let index = legacy.length - 1; index >= 0; index -= 1) {
     const key = legacy.key(index);
     if (key?.startsWith(MPGS_KEY_PREFIX)) legacy.removeItem(key);
