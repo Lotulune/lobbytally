@@ -102,6 +102,16 @@ fn enrich_inter_request_ms() -> u64 {
         .filter(|value| (1_000..=60_000).contains(value))
         .unwrap_or(ENRICH_INTER_REQUEST_MS)
 }
+
+/// How many GetAppList pages each leased `sync_catalog` job consumes.
+/// Raise temporarily during catalog catch-up; keep at 1 for steady state.
+fn catalog_worker_pages() -> u32 {
+    env::var("MPGS_CATALOG_WORKER_PAGES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| (1..=APP_LIST_PAGES_MAX).contains(value))
+        .unwrap_or(APP_LIST_PAGES_DEFAULT)
+}
 const M7_MIN_CANDIDATES: i64 = 2_000;
 const M7_MIN_TRUSTED_FRIEND_PROFILES: i64 = 300;
 const M7_MIN_SECTION_CANDIDATES: i64 = 20;
@@ -1010,15 +1020,18 @@ fn run_steam_worker_once(
 }
 
 fn run_catalog_worker_task(repo: &Repository, api_key: &str) -> Result<(), WorkerTaskError> {
+    let max_pages = catalog_worker_pages();
     let run_id = repo
         .start_source_run(
             APP_LIST_SOURCE_NAME,
             "catalog_sync",
             APP_LIST_ADAPTER_VERSION,
-            Some("worker=true;max_pages=1;page_size=1000;key=present"),
+            Some(&format!(
+                "worker=true;max_pages={max_pages};page_size={APP_LIST_PAGE_SIZE_DEFAULT};key=present"
+            )),
         )
         .map_err(worker_storage_error)?;
-    match collect_steam_catalog(repo, api_key, 1, APP_LIST_PAGE_SIZE_DEFAULT) {
+    match collect_steam_catalog(repo, api_key, max_pages, APP_LIST_PAGE_SIZE_DEFAULT) {
         Ok(stats) => repo
             .finish_source_run(
                 run_id,
@@ -2607,6 +2620,13 @@ mod tests {
             include_videos: false,
             include_hardware: false,
         }
+    }
+
+    #[test]
+    fn catalog_worker_pages_defaults_to_one_page() {
+        // Safety: steady-state workers must not hammer GetAppList without an
+        // explicit burst override via MPGS_CATALOG_WORKER_PAGES.
+        assert_eq!(catalog_worker_pages(), APP_LIST_PAGES_DEFAULT);
     }
 
     #[test]
