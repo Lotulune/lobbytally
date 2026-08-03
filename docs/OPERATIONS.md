@@ -100,6 +100,8 @@ mpgs-dbtool run-steam-worker-once <db> 1 100
 mpgs-dbtool import-golden-profiles <db>
 mpgs-dbtool m3-audit <db>
 mpgs-dbtool m7-data-audit <db>
+mpgs-dbtool recommendation-audit <db> --as-of 2026-08-02 --top 20 --strict
+mpgs-dbtool recommendation-golden-evaluate <labels.json> --json
 mpgs-dbtool sync-retrieval <db>
 mpgs-dbtool extract-offline-features <db>
 mpgs-dbtool embed-documents <db>
@@ -114,6 +116,10 @@ mpgs-dbtool m7-data-audit <db> --allow-upcoming-shortfall='官方目录当日新
 ```
 
 该例外只豁免 `upcoming` 分区，不能绕过其他数据门禁；建议将命令输出连同原因保存到发布记录。
+
+`recommendation-audit` 以 SQLite `read_only/query_only` 模式重放四分区推荐。`--as-of` 必填，`--user-id` 可选，`--top` 仅控制报告摘要；确定性质量门禁始终使用 Top20。发布门禁应加 `--strict`，这样裁剪率、指数区分度/分桶、跨证据向量同分、可行模式占比、MMR 倒置理由或证据 ID 解析失败时进程返回非零。`not_applicable` 不算失败，也不能当作通过。该命令不迁移或修改数据库，也不评估缺少人工标签/归因结果时的 NDCG 与校准质量。
+
+`recommendation-golden-evaluate` 不读取数据库，只读取 `recommendation_golden_labels_v1` JSON。文件必须至少有 200 条唯一 persona/game/section 判断以及至少 5 个 persona、5 个游戏；所有特征和 CCU/评论基线必须显式归一到 `0..1`，人工相关性为 `0..3`。工具输出分区 pairwise logistic 候选权重、persona/game 双五折指标和 `freeze_eligible`，但不写 `algorithm_configs`。`freeze_eligible=false` 不会单独造成非零退出，CI 必须解析 `--json` 结果；完整 Schema 与门槛见 [推荐算法规格](RECOMMENDATION.md#131-黄金测试集)。
 
 ### 3.5 Docker / Compose
 
@@ -220,7 +226,7 @@ Steam/AI Key 只放在服务端环境；客户端包与日志不得包含。
 1. 备份数据库与当前 `PROVENANCE.json`。
 2. 停止服务（systemd `stop` / WinSW `stop`）。
 3. 替换二进制与文档；保留数据目录与 env。
-4. `mpgs-dbtool migrate <db>`（或启动时自动 migrate）。
+4. `mpgs-dbtool migrate <db>`（或启动时自动 migrate）。当前最新为 `0019_preference_confidence`：已有偏好行兼容为置信度 `1.0`，新建偏好默认 `0.0`。新客户端应显式回传该字段；兼容期服务端会让省略字段的旧客户端 PUT 保留数据库当前置信度，该路径已有 HTTP 集成测试。
 5. 启动并检查 `/health/ready` 与 `/v1/meta` 的 `schema_version`。
 6. 冒烟：四分区、搜索、详情、偏好、反馈、NL fallback。
 

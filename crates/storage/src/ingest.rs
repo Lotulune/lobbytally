@@ -428,6 +428,31 @@ pub fn ingest_store_details(
             now_ms,
         )?;
     }
+    // Preserve the store taxonomy as structured evidence.  The store adapter
+    // already parses these fields, but historically they were discarded at
+    // the storage boundary, leaving retrieval and diversity ranking without
+    // genre, developer, or publisher context.
+    if !details.categories.is_empty()
+        || !details.genres.is_empty()
+        || !details.developers.is_empty()
+        || !details.publishers.is_empty()
+    {
+        insert_feature_evidence(
+            conn,
+            details.app_id,
+            "catalog_taxonomy",
+            &serde_json::json!({
+                "categories": details.categories,
+                "genres": details.genres,
+                "developers": details.developers,
+                "publishers": details.publishers,
+            }),
+            "steam_store",
+            details.source,
+            0.9,
+            now_ms,
+        )?;
+    }
     materialize_store_category_profile(
         conn,
         details.app_id,
@@ -1062,120 +1087,69 @@ fn dominant_mode_label(mode: DominantModeLabel) -> &'static str {
     }
 }
 
-struct DailyAgg {
-    min_ccu: Option<i64>,
-    max_ccu: Option<i64>,
-    mean_ccu: Option<f64>,
-    sample_count: i64,
-    missing_rate: f64,
-}
-
 fn upsert_player_daily(
     conn: &Connection,
     app_id: u32,
-    player_count: Option<u32>,
+    _player_count: Option<u32>,
     now_ms: i64,
 ) -> StorageResult<()> {
     let day = day_utc_from_ms(now_ms);
-    let existing: Option<DailyAgg> = conn
-        .query_row(
-            "SELECT min_ccu, max_ccu, mean_ccu, sample_count, missing_rate
-             FROM player_daily WHERE app_id = ?1 AND day_utc = ?2",
-            params![app_id, day],
-            |row| {
-                Ok(DailyAgg {
-                    min_ccu: row.get(0)?,
-                    max_ccu: row.get(1)?,
-                    mean_ccu: row.get(2)?,
-                    sample_count: row.get(3)?,
-                    missing_rate: row.get(4)?,
-                })
-            },
-        )
-        .optional_compat()?;
-
-    match (existing, player_count) {
-        (None, Some(count)) => {
-            let c = i64::from(count);
-            conn.execute(
-                "INSERT INTO player_daily (
-                    app_id, day_utc, min_ccu, max_ccu, mean_ccu, median_approx_ccu,
-                    sample_count, missing_rate, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?3, ?3, ?3, 1, 0, ?4)",
-                params![app_id, day, c, now_ms],
-            )?;
-        }
-        (None, None) => {
-            conn.execute(
-                "INSERT INTO player_daily (
-                    app_id, day_utc, min_ccu, max_ccu, mean_ccu, median_approx_ccu,
-                    sample_count, missing_rate, updated_at_ms
-                 ) VALUES (?1, ?2, NULL, NULL, NULL, NULL, 1, 1, ?3)",
-                params![app_id, day, now_ms],
-            )?;
-        }
-        (Some(agg), Some(count)) => {
-            let c = i64::from(count);
-            let old_total = agg.sample_count.max(0);
-            let old_missing = (agg.missing_rate * old_total as f64)
-                .round()
-                .clamp(0.0, old_total as f64) as i64;
-            let old_valid = old_total - old_missing;
-            let sample = old_total + 1;
-            let valid_samples = old_valid + 1;
-            let min_v = Some(agg.min_ccu.map_or(c, |m| m.min(c)));
-            let max_v = Some(agg.max_ccu.map_or(c, |m| m.max(c)));
-            let mean_v = agg.mean_ccu.map_or(c as f64, |m| {
-                (m * old_valid as f64 + c as f64) / valid_samples as f64
-            });
-            let missing_rate = old_missing as f64 / sample as f64;
-            conn.execute(
-                "UPDATE player_daily SET
-                    min_ccu = ?1, max_ccu = ?2, mean_ccu = ?3, median_approx_ccu = ?3,
-                    sample_count = ?4, missing_rate = ?5, updated_at_ms = ?6
-                 WHERE app_id = ?7 AND day_utc = ?8",
-                params![
-                    min_v,
-                    max_v,
-                    mean_v,
-                    sample,
-                    missing_rate,
-                    now_ms,
-                    app_id,
-                    day
-                ],
-            )?;
-        }
-        (Some(agg), None) => {
-            let old_total = agg.sample_count.max(0);
-            let old_missing = (agg.missing_rate * old_total as f64)
-                .round()
-                .clamp(0.0, old_total as f64) as i64;
-            let total_slots = old_total + 1;
-            let missing = (old_missing + 1) as f64 / total_slots as f64;
-            conn.execute(
-                "UPDATE player_daily SET
-                    sample_count = ?1, missing_rate = ?2, updated_at_ms = ?3
-                 WHERE app_id = ?4 AND day_utc = ?5",
-                params![total_slots, missing, now_ms, app_id, day],
-            )?;
-        }
-    }
+    let day_start_ms = now_ms.div_euclid(86_400_000).saturating_mul(86_400_000);
+    let day_end_ms = day_start_ms.saturating_add(86_400_000);
+    let mut stmt = conn.prepare(
+        "SELECT player_count
+         FROM player_snapshots
+         WHERE app_id = ?1 AND captured_at_ms >= ?2 AND captured_at_ms < ?3
+         ORDER BY player_count",
+    )?;
+    let samples = stmt
+        .query_map(params![app_id, day_start_ms, day_end_ms], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let sample_count = samples.len() as i64;
+    let valid: Vec<i64> = samples.into_iter().flatten().collect();
+    let valid_count = valid.len();
+    let min_ccu = valid.first().copied();
+    let max_ccu = valid.last().copied();
+    let mean_ccu = (!valid.is_empty())
+        .then(|| valid.iter().map(|value| *value as f64).sum::<f64>() / valid_count as f64);
+    let median_ccu = match valid_count {
+        0 => None,
+        count if count % 2 == 1 => Some(valid[count / 2] as f64),
+        count => Some((valid[count / 2 - 1] as f64 + valid[count / 2] as f64) / 2.0),
+    };
+    let missing_rate = if sample_count == 0 {
+        0.0
+    } else {
+        (sample_count as usize - valid_count) as f64 / sample_count as f64
+    };
+    conn.execute(
+        "INSERT INTO player_daily (
+            app_id, day_utc, min_ccu, max_ccu, mean_ccu, median_approx_ccu,
+            sample_count, missing_rate, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(app_id, day_utc) DO UPDATE SET
+            min_ccu = excluded.min_ccu,
+            max_ccu = excluded.max_ccu,
+            mean_ccu = excluded.mean_ccu,
+            median_approx_ccu = excluded.median_approx_ccu,
+            sample_count = excluded.sample_count,
+            missing_rate = excluded.missing_rate,
+            updated_at_ms = excluded.updated_at_ms",
+        params![
+            app_id,
+            day,
+            min_ccu,
+            max_ccu,
+            mean_ccu,
+            median_ccu,
+            sample_count,
+            missing_rate,
+            now_ms
+        ],
+    )?;
     Ok(())
-}
-
-trait OptionalCompat<T> {
-    fn optional_compat(self) -> StorageResult<Option<T>>;
-}
-
-impl<T> OptionalCompat<T> for Result<T, rusqlite::Error> {
-    fn optional_compat(self) -> StorageResult<Option<T>> {
-        match self {
-            Ok(v) => Ok(Some(v)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
 }
 
 fn app_type_str(value: AppTypeProposal) -> &'static str {

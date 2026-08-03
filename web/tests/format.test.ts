@@ -9,6 +9,9 @@ import {
   partyLabel,
   platformLabels,
   positiveRate,
+  recommendationFitBandLabel,
+  recommendationLabel,
+  recommendationSlotReasonLabel,
   SECTION_META,
   STALE_AFTER_MS,
 } from "../src/app/format";
@@ -56,6 +59,32 @@ describe("format helpers", () => {
     const now = 1_000_000_000_000;
     expect(isStale(now, now)).toBe(false);
     expect(isStale(now - STALE_AFTER_MS - 1, now)).toBe(true);
+  });
+
+  it("renders recommendation rank and index without implying a percentage", () => {
+    expect(recommendationLabel(3, 86, 0.8)).toBe("第 3 推荐 · 推荐指数 86");
+    expect(recommendationLabel(3, 86, 0.8, "excellent")).toBe(
+      "第 3 推荐 · 很适合 · 推荐指数 86",
+    );
+    expect(recommendationLabel(null, 86.4, 0.8)).toBe("推荐指数 86");
+    expect(recommendationLabel(2, null, 0.8)).toBe("第 2 推荐 · 资料较少，待观察");
+    expect(recommendationLabel(2, 86, 0.44)).toBe("第 2 推荐 · 资料较少，待观察");
+    expect(recommendationLabel(2, 86, undefined)).toBe("第 2 推荐 · 资料较少，待观察");
+    expect(recommendationLabel(2, 86, 0.9, "insufficient_data")).toBe(
+      "第 2 推荐 · 资料较少，待观察",
+    );
+  });
+
+  it("maps only supported recommendation labels", () => {
+    expect(recommendationFitBandLabel("excellent")).toBe("很适合");
+    expect(recommendationFitBandLabel("good")).toBe("适合");
+    expect(recommendationFitBandLabel("consider")).toBe("值得考虑");
+    expect(recommendationFitBandLabel("insufficient_data")).toBe("资料较少");
+    expect(recommendationFitBandLabel("future_value")).toBeNull();
+    expect(recommendationSlotReasonLabel("base")).toBe("综合适配");
+    expect(recommendationSlotReasonLabel("diversity")).toBe("多样性");
+    expect(recommendationSlotReasonLabel("explore")).toBe("探索");
+    expect(recommendationSlotReasonLabel("future_value")).toBeNull();
   });
 
   it("renders review-summary evidence readably, never raw JSON", () => {

@@ -15,11 +15,34 @@ export const FEED_SECTIONS: FeedSection[] = [
 ];
 
 /** Feed list sort after recommendation scoring. */
-export type FeedSort = "recommended" | "ccu" | "reviews" | "release_date";
+export type FeedSort = "recommended" | "fit_index" | "ccu" | "reviews" | "release_date";
 export type FeedSortOrder = "asc" | "desc";
 
+export type RecommendationFitBand =
+  | "excellent"
+  | "good"
+  | "consider"
+  | "insufficient_data";
+
+export type RecommendationSlotReason = "base" | "diversity" | "explore";
+export type RecommendationEventType = "exposure" | "detail_open" | "steam_click" | "play_intent";
+
+export interface FeatureFreshnessValue {
+  status: "fresh" | "unknown";
+  observed_at_ms: number | null;
+}
+
+export interface FeatureFreshness {
+  multiplayer: FeatureFreshnessValue;
+  reviews: FeatureFreshnessValue;
+  activity: FeatureFreshnessValue;
+  price: FeatureFreshnessValue;
+  release: FeatureFreshnessValue;
+}
+
 export const FEED_SORT_OPTIONS: { id: FeedSort; label: string }[] = [
-  { id: "recommended", label: "推荐分" },
+  { id: "recommended", label: "推荐顺序" },
+  { id: "fit_index", label: "适配指数" },
   { id: "ccu", label: "在线人数" },
   { id: "reviews", label: "评论数" },
   { id: "release_date", label: "发售日期" },
@@ -58,6 +81,8 @@ export interface SessionTokens {
 
 export interface UserPreferences {
   version: number;
+  /** 0 = untouched defaults, 1 = explicitly confirmed by the player. */
+  preference_confidence: number;
   party_size: number;
   /** 0 = pure coop preference, 1 = strong competitive preference. */
   coop_competitive: number;
@@ -75,6 +100,7 @@ export interface MetaResponse {
   api_version: string;
   service_version: string;
   algorithm_version: string;
+  config_version?: string | null;
   supported_sections: string[];
   ai_available: boolean;
   storage_enabled: boolean;
@@ -96,8 +122,19 @@ export interface FeedItem {
   total_positive: number | null;
   latest_ccu: number | null;
   typical_ccu_7d: number | null;
+  /** Deprecated raw relevance score; retained while older API responses age out. */
   score: number;
+  /** Deprecated alias whose historic value was not data confidence. */
   confidence: number;
+  /** One-based final position after diversity/exploration reranking. */
+  rank?: number | null;
+  /** Context-relative 0-100 index. Null means the evidence is too weak to quantify. */
+  recommendation_index?: number | null;
+  fit_band?: RecommendationFitBand | (string & {}) | null;
+  data_confidence?: number | null;
+  friend_fit?: number | null;
+  slot_reason?: RecommendationSlotReason | (string & {}) | null;
+  score_calibration_version?: string | null;
   party: {
     recommended_min: number | null;
     recommended_max: number | null;
@@ -109,10 +146,22 @@ export interface FeedItem {
   reasons: string[];
   cautions: string[];
   evidence_ids: string[];
+  reason_evidence?: string[];
+  feature_freshness?: FeatureFreshness;
   components: {
     friend_fit: number;
     section_score: number;
     personalized_score: number;
+    group_fit?: number;
+    mode_fit?: number;
+    access_fit?: number;
+    hosting_fit?: number;
+    session_fit?: number;
+    quality?: number;
+    activity?: number;
+    freshness?: number;
+    risk?: number;
+    relevance_score?: number;
     final_score: number;
   };
   algorithm_version: string;
@@ -132,9 +181,12 @@ export interface FeedResponse {
   total_pages: number;
   snapshot_at_ms: number;
   algorithm_version: string;
+  config_version?: string;
+  recommendation_run_id?: string | null;
+  score_semantics?: string;
   data_updated_at_ms: number;
   sort?: FeedSort;
-  order?: FeedSortOrder;
+  order?: FeedSortOrder | null;
 }
 
 export interface CalendarItem {
@@ -183,7 +235,14 @@ export interface NaturalLanguageRecommendationResponse {
     coop_competitive: number | null;
     self_hosting_willingness?: number | null;
     platforms?: string[];
+    demo_only?: boolean;
+    selected_section?: FeedSection | null;
+    selected_section_explicit?: boolean;
+    modes_preferred?: string[];
+    modes_excluded?: string[];
     hard_constraints?: string[];
+    applied_constraints?: string[];
+    unapplied_constraints?: string[];
     intent_confidence?: number | null;
     max_price_minor?: number | null;
     currency?: string | null;
@@ -207,6 +266,9 @@ export interface NaturalLanguageRecommendationResponse {
   ai_summary_evidence_ids?: string[];
   analysis_id?: string;
   algorithm_version: string;
+  config_version?: string | null;
+  recommendation_run_id?: string | null;
+  score_semantics?: string;
   data_updated_at_ms: number;
 }
 

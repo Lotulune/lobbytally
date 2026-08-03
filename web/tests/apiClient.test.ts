@@ -360,6 +360,36 @@ describe("ApiClient ETag cache", () => {
   });
 });
 
+describe("ApiClient recommendation attribution", () => {
+  it("posts a bounded idempotent recommendation event without account credentials", async () => {
+    const storage = new MemoryStorage();
+    const { fetchFn, calls } = makeFetchStub({
+      "POST /v1/recommendation-events": (call) => {
+        expect(call.headers["idempotency-key"]).toBe("exposure:42");
+        expect(call.headers.authorization).toBeUndefined();
+        expect(call.body).toEqual({
+          recommendation_run_id: "run-123",
+          app_id: 42,
+          event_type: "exposure",
+          client_created_at_ms: 1234,
+        });
+        return jsonResponse({ recommendation_event_id: 1 });
+      },
+    });
+    const client = new ApiClient({ baseUrl: "http://x", fetchFn, storage, now: () => 1234 });
+
+    await client.postRecommendationEvent({
+      recommendationRunId: "run-123",
+      appId: 42,
+      eventType: "exposure",
+      idempotencyKey: "exposure:42",
+      clientCreatedAtMs: 1234,
+    });
+
+    expect(calls).toHaveLength(1);
+  });
+});
+
 describe("ApiClient natural-language recommendations", () => {
   it("posts the query and exposes deterministic fallback metadata", async () => {
     const storage = new MemoryStorage();

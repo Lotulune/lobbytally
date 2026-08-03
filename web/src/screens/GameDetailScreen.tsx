@@ -124,7 +124,15 @@ interface DetailState {
   fromOfflineCache: boolean;
 }
 
-export function GameDetailScreen({ appId, onBack }: { appId: number; onBack: () => void }) {
+export function GameDetailScreen({
+  appId,
+  onBack,
+  recommendationRunId = null,
+}: {
+  appId: number;
+  onBack: () => void;
+  recommendationRunId?: string | null;
+}) {
   const [state, setState] = useState<DetailState>({
     detail: null,
     evidence: [],
@@ -265,14 +273,30 @@ export function GameDetailScreen({ appId, onBack }: { appId: number; onBack: () 
             {av.has_demo && <Chip tone="ok">有 Demo</Chip>}
           </div>
           <div className="detail-actions">
-            <VoteButton appId={game.app_id} intent={game.play_intent} size="large" />
+            <VoteButton
+              appId={game.app_id}
+              intent={game.play_intent}
+              size="large"
+              recommendationRunId={recommendationRunId}
+            />
             <a
               ref={steamBtnRef}
               className="btn primary"
               href={game.steam_url}
               target="_blank"
               rel="noreferrer noopener"
-              onClick={() => fireAction("confirm", steamBtnRef.current)}
+              onClick={() => {
+                if (recommendationRunId) {
+                  void apiClient
+                    .postRecommendationEvent({
+                      recommendationRunId,
+                      appId: game.app_id,
+                      eventType: "steam_click",
+                    })
+                    .catch(() => undefined);
+                }
+                fireAction("confirm", steamBtnRef.current);
+              }}
             >
               在 Steam 打开 ↗
             </a>

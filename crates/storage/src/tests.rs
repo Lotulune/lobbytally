@@ -330,6 +330,38 @@ fn feedback_requires_catalog_entry_and_full_idempotency_match() {
 }
 
 #[test]
+fn active_feedback_preserves_ownership_and_sentiment_dimensions() {
+    let (repo, _) = repo_with_clock(5_000);
+    repo.ensure_runtime_defaults().unwrap();
+    repo.seed_demo_if_empty().unwrap();
+    let session = repo.create_anonymous_session().unwrap();
+
+    repo.create_feedback(
+        &session.user_id,
+        548430,
+        FeedbackType::Like,
+        Some("run-dimensions"),
+        "feedback-like",
+        None,
+    )
+    .unwrap();
+    repo.create_feedback(
+        &session.user_id,
+        548430,
+        FeedbackType::Played,
+        Some("run-dimensions"),
+        "feedback-played",
+        None,
+    )
+    .unwrap();
+
+    let active = repo.list_active_feedback(&session.user_id).unwrap();
+    assert_eq!(active.len(), 2);
+    assert!(active.iter().any(|item| item.feedback_type == "like"));
+    assert!(active.iter().any(|item| item.feedback_type == "played"));
+}
+
+#[test]
 fn daily_ccu_mean_excludes_missing_samples_and_preserves_missing_rate() {
     let (repo, clock) = repo_with_clock(1_000);
     let proposal = |player_count, content_hash: &'static str| CcuProposal {
@@ -349,20 +381,24 @@ fn daily_ccu_mean_excludes_missing_samples_and_preserves_missing_rate() {
     repo.ingest_ccu(&proposal(None, "two")).unwrap();
     clock.advance_ms(1);
     repo.ingest_ccu(&proposal(Some(20), "three")).unwrap();
+    clock.advance_ms(1);
+    repo.ingest_ccu(&proposal(Some(100), "four")).unwrap();
 
-    let (sample_count, mean, missing_rate): (i64, f64, f64) = repo
+    let (sample_count, mean, median, missing_rate): (i64, f64, f64, f64) = repo
         .database()
         .with_conn(|conn| {
             Ok(conn.query_row(
-                "SELECT sample_count, mean_ccu, missing_rate FROM player_daily WHERE app_id = 42",
+                "SELECT sample_count, mean_ccu, median_approx_ccu, missing_rate
+                 FROM player_daily WHERE app_id = 42",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?)
         })
         .unwrap();
-    assert_eq!(sample_count, 3);
-    assert!((mean - 15.0).abs() < f64::EPSILON);
-    assert!((missing_rate - (1.0 / 3.0)).abs() < 1e-9);
+    assert_eq!(sample_count, 4);
+    assert!((mean - (130.0 / 3.0)).abs() < 1e-9);
+    assert!((median - 20.0).abs() < f64::EPSILON);
+    assert!((missing_rate - 0.25).abs() < 1e-9);
 }
 
 #[test]

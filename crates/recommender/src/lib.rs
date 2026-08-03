@@ -9,13 +9,20 @@ use mpgs_domain::{FeedSection, RankingSignals};
 use serde::{Deserialize, Serialize};
 
 pub use explain::{Explanation, explain};
-pub use mmr::mmr_rerank;
+pub use mmr::{mmr_rerank, mmr_rerank_with_tie_seed};
 pub use mpgs_domain::friend_fit;
-pub use personalize::{apply_personalization, hard_filter};
-pub use pipeline::{RankedCandidate, RankingInput, rank_feed, rank_feed_configured};
+pub use personalize::{
+    HardConstraints, apply_personalization, apply_personalization_with_constraints, hard_filter,
+    hard_filter_with_constraints,
+};
+pub use pipeline::{
+    RankedCandidate, RankingInput, SlotReason, rank_feed, rank_feed_configured,
+    rank_feed_configured_with_constraints, rank_feed_configured_with_constraints_and_tie_seed,
+    rank_feed_with_constraints,
+};
 
-pub const ALGORITHM_VERSION: &str = "rules-0.2.0";
-const PERSONAL_WEIGHT: f64 = 0.25;
+pub const ALGORITHM_VERSION: &str = "rules-0.3.0";
+const PERSONAL_WEIGHT: f64 = 0.45;
 const AI_WEIGHT: f64 = 0.15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -29,6 +36,29 @@ pub struct ScoreBreakdown {
     pub friend_fit: f64,
     pub section_score: f64,
     pub personalized_score: f64,
+    #[serde(default)]
+    pub group_fit: f64,
+    #[serde(default)]
+    pub mode_fit: f64,
+    #[serde(default)]
+    pub access_fit: f64,
+    #[serde(default)]
+    pub hosting_fit: f64,
+    #[serde(default)]
+    pub session_fit: f64,
+    #[serde(default)]
+    pub quality: f64,
+    /// Confidence-shrunk activity level with a smaller trend contribution.
+    #[serde(default)]
+    pub activity: f64,
+    #[serde(default)]
+    pub freshness: f64,
+    #[serde(default)]
+    pub risk: f64,
+    /// Continuous score used for ordering. Unlike the legacy display fields,
+    /// this preserves negative risk-adjusted values instead of clipping ties at 0.
+    #[serde(default)]
+    pub relevance_score: f64,
     pub final_score: f64,
 }
 
@@ -38,68 +68,88 @@ pub fn score(
     ai: Option<AiAdjustment>,
 ) -> ScoreBreakdown {
     let friend_fit = friend_fit(&signals.multiplayer);
-    let section_score = section_score(section, signals, friend_fit);
-    let personalized_score = blend_personal_fit(section_score, signals.personal_fit);
-    let final_score = blend_ai(personalized_score, ai);
+    let section_relevance = section_relevance(section, signals);
+    let personalized_relevance = blend_personal_relevance(section_relevance, signals.personal_fit);
+    let relevance_score = blend_ai_relevance(personalized_relevance, ai);
 
     ScoreBreakdown {
         friend_fit,
-        section_score,
-        personalized_score,
-        final_score,
+        section_score: unit(section_relevance),
+        personalized_score: unit(personalized_relevance),
+        group_fit: unit(signals.personal_components.group_fit),
+        mode_fit: unit(signals.personal_components.mode_fit),
+        access_fit: unit(signals.personal_components.access_fit),
+        hosting_fit: unit(signals.personal_components.hosting_fit),
+        session_fit: unit(signals.personal_components.session_fit),
+        quality: unit(signals.quality),
+        activity: unit(0.7 * unit(signals.popularity) + 0.3 * unit(signals.momentum)),
+        freshness: unit(match section {
+            FeedSection::Upcoming => signals.release_proximity,
+            _ => signals.freshness,
+        }),
+        risk: unit(signals.risk),
+        relevance_score,
+        final_score: unit(relevance_score),
     }
 }
 
-pub fn section_score(section: FeedSection, signals: &RankingSignals, friend_fit: f64) -> f64 {
+pub fn section_score(section: FeedSection, signals: &RankingSignals, _friend_fit: f64) -> f64 {
+    unit(section_relevance(section, signals))
+}
+
+/// Section-level, player-independent relevance. Positive weights within each
+/// section sum to one; player fit enters once, later, through the 45% blend.
+fn section_relevance(section: FeedSection, signals: &RankingSignals) -> f64 {
     let raw = match section {
         FeedSection::RecentRelease => {
-            0.35 * friend_fit
-                + 0.22 * unit(signals.quality)
+            0.40 * unit(signals.quality)
+                + 0.20 * unit(signals.popularity)
                 + 0.15 * unit(signals.momentum)
-                + 0.10 * unit(signals.evidence)
-                + 0.10 * unit(signals.freshness)
-                + 0.08 * unit(signals.data_confidence)
+                + 0.25 * unit(signals.freshness)
         }
         FeedSection::Upcoming => {
-            0.40 * friend_fit
-                + 0.25 * unit(signals.demo_playability)
-                + 0.12 * unit(signals.release_date_confidence)
-                + 0.10 * unit(signals.release_proximity)
-                + 0.08 * unit(signals.studio_prior)
-                + 0.05 * unit(signals.data_confidence)
+            0.35 * unit(signals.demo_playability)
+                + 0.20 * unit(signals.release_date_confidence)
+                + 0.25 * unit(signals.release_proximity)
+                + 0.20 * unit(signals.studio_prior)
         }
         FeedSection::PopularLegacy => {
-            0.35 * friend_fit
-                + 0.32 * unit(signals.popularity)
-                + 0.12 * unit(signals.quality)
-                + 0.10 * unit(signals.momentum)
-                + 0.11 * unit(signals.data_confidence)
+            0.40 * unit(signals.popularity)
+                + 0.20 * unit(signals.momentum)
+                + 0.30 * unit(signals.quality)
+                + 0.10 * unit(signals.maintenance_health)
         }
         FeedSection::ClassicLegacy => {
-            0.40 * friend_fit
-                + 0.30 * unit(signals.quality)
-                + 0.18 * unit(signals.evidence)
-                + 0.08 * unit(signals.longevity)
-                + 0.04 * unit(signals.maintenance_health)
+            0.45 * unit(signals.quality)
+                + 0.25 * unit(signals.longevity)
+                + 0.15 * unit(signals.maintenance_health)
+                + 0.15 * unit(signals.popularity)
         }
     };
 
-    unit(raw - unit(signals.risk))
+    raw - 0.20 * unit(signals.risk)
 }
 
 pub fn blend_personal_fit(base: f64, personal_fit: f64) -> f64 {
-    unit((1.0 - PERSONAL_WEIGHT) * unit(base) + PERSONAL_WEIGHT * unit(personal_fit))
+    unit(blend_personal_relevance(unit(base), personal_fit))
+}
+
+fn blend_personal_relevance(base: f64, personal_fit: f64) -> f64 {
+    (1.0 - PERSONAL_WEIGHT) * base + PERSONAL_WEIGHT * unit(personal_fit)
 }
 
 pub fn blend_ai(base: f64, ai: Option<AiAdjustment>) -> f64 {
-    let base = unit(base);
+    blend_ai_relevance(base, ai)
+}
+
+fn blend_ai_relevance(base: f64, ai: Option<AiAdjustment>) -> f64 {
     let Some(ai) = ai else {
         return base;
     };
 
     let confidence = unit(ai.confidence);
-    let effective = confidence * unit(ai.fit) + (1.0 - confidence) * base;
-    unit((1.0 - AI_WEIGHT) * base + AI_WEIGHT * effective)
+    let confidence_adjusted_target = confidence * unit(ai.fit) + (1.0 - confidence) * base;
+    (1.0 - AI_WEIGHT) * base + AI_WEIGHT * confidence_adjusted_target
 }
 
 pub(crate) fn unit(value: f64) -> f64 {
@@ -113,7 +163,8 @@ pub(crate) fn unit(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ALGORITHM_VERSION, AiAdjustment, RankingInput, blend_ai, friend_fit, rank_feed, score,
+        ALGORITHM_VERSION, AiAdjustment, HardConstraints, RankingInput, blend_ai, friend_fit,
+        rank_feed, rank_feed_with_constraints, score,
     };
     use mpgs_domain::{
         CandidateAvailability, FeedSection, MultiplayerSignals, RankingSignals, SteamAppId,
@@ -150,6 +201,9 @@ mod tests {
             app_id,
             name: format!("app-{app_id}"),
             dominant_mode: None,
+            taxonomy_tags: Vec::new(),
+            publisher: None,
+            series: None,
             recommended_min: Some(1),
             recommended_max: Some(4),
             availability: Default::default(),
@@ -186,6 +240,17 @@ mod tests {
             }),
         );
         assert!((adjusted - base).abs() <= 0.15);
+
+        let unbounded_base = -0.3;
+        let adjusted = blend_ai(
+            unbounded_base,
+            Some(AiAdjustment {
+                fit: 1.0,
+                confidence: 1.0,
+            }),
+        );
+        assert!((adjusted - (-0.105)).abs() < 1e-12);
+        assert_eq!(blend_ai(1.4, None), 1.4);
     }
 
     #[test]
@@ -206,7 +271,56 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_favors_cooperative_archetype() {
+    fn relevance_score_preserves_information_beyond_legacy_display_bounds() {
+        let signals = RankingSignals {
+            risk: 1.0,
+            personal_fit: 0.0,
+            ..Default::default()
+        };
+
+        let result = score(FeedSection::ClassicLegacy, &signals, None);
+
+        assert_eq!(result.final_score, 0.0);
+        assert!(result.relevance_score < 0.0);
+    }
+
+    #[test]
+    fn evidence_confidence_is_not_a_direct_popularity_bonus() {
+        let low_confidence = RankingSignals {
+            quality: 0.7,
+            popularity: 0.6,
+            momentum: 0.4,
+            evidence: 0.0,
+            data_confidence: 0.0,
+            freshness: 0.5,
+            longevity: 0.6,
+            maintenance_health: 0.7,
+            ..Default::default()
+        };
+        let high_confidence = RankingSignals {
+            evidence: 1.0,
+            data_confidence: 1.0,
+            ..low_confidence
+        };
+
+        for section in [
+            FeedSection::RecentRelease,
+            FeedSection::PopularLegacy,
+            FeedSection::ClassicLegacy,
+        ] {
+            let low = super::section_score(section, &low_confidence, 0.6);
+            let high = super::section_score(section, &high_confidence, 0.6);
+            assert_eq!(low, high, "{section:?} must not reward confidence itself");
+        }
+    }
+
+    #[test]
+    fn personal_fit_has_the_rules_0_3_seed_weight() {
+        assert!((super::blend_personal_fit(0.0, 1.0) - 0.45).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn objective_section_score_does_not_double_count_friend_fit() {
         let common = RankingSignals {
             quality: 0.85,
             popularity: 0.85,
@@ -228,13 +342,22 @@ mod tests {
         };
         let cooperative_score = score(FeedSection::ClassicLegacy, &cooperative, None);
         let matchmaking_score = score(FeedSection::ClassicLegacy, &matchmaking, None);
-        assert!(cooperative_score.final_score > matchmaking_score.final_score);
+        assert_eq!(
+            cooperative_score.section_score,
+            matchmaking_score.section_score
+        );
+        assert_eq!(cooperative_score.final_score, matchmaking_score.final_score);
     }
 
     #[test]
     fn prd_default_sort_coop_self_host_above_matchmaking_core() {
         // PRD: 帕鲁/方舟/深岩/雨中冒险2 熟人适配应高于 CS2 类匹配核心。
-        let prefs = UserPreferences::default();
+        let prefs = UserPreferences {
+            // This assertion represents an explicitly confirmed co-op profile;
+            // untouched onboarding defaults intentionally shrink to neutral.
+            preference_confidence: 1.0,
+            ..UserPreferences::default()
+        };
         let coop_ids = [1623730u32, 346110, 548430, 632360]; // Palworld, ARK, DRG, RoR2
         let match_ids = [730u32, 1172470]; // CS2, Apex
 
@@ -293,6 +416,29 @@ mod tests {
     }
 
     #[test]
+    fn play_intent_requires_community_evidence_and_has_a_three_point_cap() {
+        let prefs = UserPreferences::default();
+        let relevance_for = |count| {
+            let mut candidate = ranking(1, cooperative_signals());
+            candidate.play_intent_count = count;
+            rank_feed(FeedSection::ClassicLegacy, &[candidate], &prefs, None).items[0]
+                .score
+                .relevance_score
+        };
+
+        let baseline = relevance_for(0);
+        assert_eq!(relevance_for(4), baseline);
+        assert_eq!(relevance_for(5), baseline);
+
+        let first_lift = relevance_for(6) - baseline;
+        assert!((first_lift - 0.03 / 21.0).abs() < 1e-12);
+
+        let maximum_lift = relevance_for(u32::MAX) - baseline;
+        assert!(maximum_lift > first_lift);
+        assert!(maximum_lift <= 0.03);
+    }
+
+    #[test]
     fn competitive_preference_can_lift_matchmaking() {
         let prefs = UserPreferences {
             coop_competitive: 0.9,
@@ -342,7 +488,13 @@ mod tests {
                 availability,
                 ..base.clone()
             };
-            let ranked = rank_feed(FeedSection::ClassicLegacy, &[candidate], &prefs, None);
+            let ranked = rank_feed_with_constraints(
+                FeedSection::ClassicLegacy,
+                &[candidate],
+                &prefs,
+                &HardConstraints::ALL,
+                None,
+            );
             assert!(ranked.items.is_empty());
         }
 

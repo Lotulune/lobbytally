@@ -134,7 +134,12 @@ export function SettingsScreen() {
   // attempt can create/update once connectivity returns.
   const dirty = base === null ? true : preferencesChanged(base, draft);
 
-  const patch = (fields: Partial<UserPreferences>) => setDraft((d) => ({ ...d, ...fields }));
+  const patch = (fields: Partial<UserPreferences>) =>
+    setDraft((draftPreferences) => ({
+      ...draftPreferences,
+      ...fields,
+      preference_confidence: 1,
+    }));
 
   const save = async () => {
     if (!apiClient.isAccountAuthenticated()) {

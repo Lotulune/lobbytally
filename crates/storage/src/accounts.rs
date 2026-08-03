@@ -1185,13 +1185,15 @@ fn insert_default_preferences(conn: &Connection, user_id: &str, now_ms: i64) -> 
     let prefs = UserPreferences::default();
     conn.execute(
         "INSERT INTO user_preferences (
-            user_id, version, party_size, coop_competitive, session_minutes_min, session_minutes_max,
+            user_id, version, preference_confidence, party_size, coop_competitive,
+            session_minutes_min, session_minutes_max,
             budget_currency, budget_max_each_minor, platforms_json, self_hosting_willingness,
             languages_json, excluded_modes_json, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             user_id,
             prefs.version,
+            prefs.preference_confidence,
             prefs.party_size,
             prefs.coop_competitive,
             prefs.session_minutes_min,

@@ -14,6 +14,7 @@ export interface PendingFeedback {
   ownerUserId: string | null;
   appId: number;
   type: FeedbackType;
+  recommendationRunId?: string | null;
   idempotencyKey: string;
   clientCreatedAtMs: number;
   /** Set once the server acknowledged the write. */
@@ -28,6 +29,12 @@ export interface PendingFeedback {
 }
 
 export type FeedbackListener = (entries: PendingFeedback[]) => void;
+
+export interface ActiveFeedbackDimensions {
+  sentiment: PendingFeedback | null;
+  ownership: PendingFeedback | null;
+  reasons: PendingFeedback[];
+}
 
 interface QueueStorageShape {
   entries: Array<Omit<PendingFeedback, "ownerUserId"> & { ownerUserId?: string | null }>;
@@ -139,8 +146,39 @@ export class FeedbackQueue {
     return map;
   }
 
+  /**
+   * Effective feedback split by the server's independent dimensions. A newer
+   * sentiment replaces only the previous sentiment; ownership and each reason
+   * remain independently reversible.
+   */
+  activeDimensionsForApp(appId: number): ActiveFeedbackDimensions {
+    let sentiment: PendingFeedback | null = null;
+    let ownership: PendingFeedback | null = null;
+    const reasons = new Map<FeedbackType, PendingFeedback>();
+    for (const entry of this.entries) {
+      if (!this.belongsToCurrentOwner(entry) || entry.appId !== appId) continue;
+      if (entry.cancelled || entry.undone) continue;
+      if (entry.type === "like" || entry.type === "not_interested") {
+        sentiment = entry;
+      } else if (entry.type === "played") {
+        ownership = entry;
+      } else {
+        reasons.set(entry.type, entry);
+      }
+    }
+    return {
+      sentiment: sentiment ? { ...sentiment } : null,
+      ownership: ownership ? { ...ownership } : null,
+      reasons: Array.from(reasons.values(), (entry) => ({ ...entry })),
+    };
+  }
+
   /** Record feedback locally and try to sync immediately. Returns the local entry. */
-  submit(appId: number, type: FeedbackType): PendingFeedback {
+  submit(
+    appId: number,
+    type: FeedbackType,
+    recommendationRunId: string | null = null,
+  ): PendingFeedback {
     const ownerUserId = this.currentOwnerUserId();
     if (!ownerUserId) {
       throw new ApiError({ code: "unauthenticated", status: 401, message: "sign in to continue" });
@@ -150,6 +188,7 @@ export class FeedbackQueue {
       ownerUserId,
       appId,
       type,
+      recommendationRunId,
       idempotencyKey: newIdempotencyKey(),
       clientCreatedAtMs: Date.now(),
       feedbackId: null,
@@ -224,6 +263,7 @@ export class FeedbackQueue {
             type: entry.type,
             idempotencyKey: entry.idempotencyKey,
             clientCreatedAtMs: entry.clientCreatedAtMs,
+            recommendationRunId: entry.recommendationRunId ?? null,
           });
           entry.feedbackId = record.feedback_id;
           if (entry.cancelled) entry.undone = true;

@@ -23,6 +23,7 @@ pub mod offline_features;
 pub mod play_intent;
 pub mod quality;
 pub mod query;
+pub mod recommendation_telemetry;
 pub mod repo;
 pub mod retrieval;
 pub mod seed;
@@ -46,6 +47,12 @@ pub use offline_features::{
 };
 pub use quality::QualityFinding;
 pub use query::{GameCandidateRow, GameMediaAssetRow, resolve_display_dominant_mode};
+pub use recommendation_telemetry::{
+    InsertRecommendationEvent, InsertRecommendationItem, InsertRecommendationRun,
+    PurgedRecommendationTelemetry, RECOMMENDATION_TELEMETRY_RETENTION_MS,
+    RecommendationEventRecord, RecommendationItemAttribution, RecommendationRunRecord,
+    hash_candidate_set, hash_structured_context,
+};
 pub use repo::Repository;
 pub use retrieval::{
     AiCacheEntry, DocumentEmbedTarget, FtsHit, GameDocument, HASH_EMBED_DIMENSIONS,

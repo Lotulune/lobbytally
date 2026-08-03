@@ -4,6 +4,44 @@ use serde::{Deserialize, Serialize};
 
 pub type SteamAppId = u32;
 
+/// A sourced observation whose uncertainty is kept separate from its value.
+/// Ranking code should use [`Signal::effective_with`] instead of treating a
+/// missing or low-confidence fact as either confirmed support or rejection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Signal<T> {
+    pub value: Option<T>,
+    pub confidence: f64,
+    pub observed_at_ms: i64,
+    pub source: String,
+}
+
+impl<T> Default for Signal<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            confidence: 0.0,
+            observed_at_ms: 0,
+            source: String::new(),
+        }
+    }
+}
+
+impl Signal<f64> {
+    pub fn effective_with(&self, cohort_prior: f64) -> f64 {
+        let confidence = unit_interval(self.confidence);
+        let observed = self.value.map(unit_interval).unwrap_or(cohort_prior);
+        confidence * observed + (1.0 - confidence) * unit_interval(cohort_prior)
+    }
+}
+
+impl Signal<bool> {
+    pub fn effective_probability_with(&self, cohort_prior: f64) -> f64 {
+        let observed = self.value.map_or(cohort_prior, |value| f64::from(value));
+        let confidence = unit_interval(self.confidence);
+        confidence * observed + (1.0 - confidence) * unit_interval(cohort_prior)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +80,79 @@ impl FeedSection {
     }
 }
 
+/// Canonical multiplayer mode used by ranking and filtering.
+///
+/// Raw provider/profile labels are deliberately normalized at the domain
+/// boundary so display labels can evolve independently from ranking behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ModeFamily {
+    PrivateCoop,
+    SelfHosted,
+    MatchmadePvp,
+    PublicWorld,
+    Mixed,
+    GenericMultiplayer,
+    Unknown,
+}
+
+impl ModeFamily {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrivateCoop => "private_coop",
+            Self::SelfHosted => "self_hosted",
+            Self::MatchmadePvp => "matchmade_pvp",
+            Self::PublicWorld => "public_world",
+            Self::Mixed => "mixed",
+            Self::GenericMultiplayer => "generic_multiplayer",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse both canonical values and historical/provider aliases.
+    pub fn from_alias(value: &str) -> Self {
+        let normalized = value
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|ch| if matches!(ch, ' ' | '-') { '_' } else { ch })
+            .collect::<String>();
+
+        match normalized.as_str() {
+            "private_coop" | "coop" | "co_op" | "cooperative" | "online_coop" | "coop_only" => {
+                Self::PrivateCoop
+            }
+            "self_hosted"
+            | "self_host"
+            | "self_hosted_survival"
+            | "dedicated_server"
+            | "community_server" => Self::SelfHosted,
+            "matchmade_pvp"
+            | "matchmaking_competitive"
+            | "competitive"
+            | "versus"
+            | "vs"
+            | "pvp"
+            | "pvp_only" => Self::MatchmadePvp,
+            "public_world" | "public" | "mmo" | "mmorpg" | "shared_world" => Self::PublicWorld,
+            "mixed" | "hybrid" | "coop_pvp" | "pve_pvp" => Self::Mixed,
+            "generic_multiplayer" | "multiplayer" | "online_multiplayer" => {
+                Self::GenericMultiplayer
+            }
+            "" | "unknown" | "single_primary" | "singleplayer" | "single_player" => Self::Unknown,
+            other if other.contains("matchmak") || other.contains("competitive") => {
+                Self::MatchmadePvp
+            }
+            other if other.contains("pvp") || other.contains("versus") => Self::MatchmadePvp,
+            other if other.contains("self_host") || other.contains("dedicated") => Self::SelfHosted,
+            other if other.contains("public_world") || other.contains("mmo") => Self::PublicWorld,
+            other if other.contains("coop") || other.contains("co_op") => Self::PrivateCoop,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct MultiplayerSignals {
     pub private_session: f64,
@@ -57,6 +168,20 @@ pub struct MultiplayerSignals {
     pub service_shutdown_risk: f64,
     pub external_account_friction: f64,
     pub platform_or_anticheat_restriction: f64,
+}
+
+/// Player-relative fit components after observation confidence has been
+/// applied. Keeping these separate makes the final recommendation explainable
+/// without reverse-engineering one saturated aggregate score.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct PersonalFitSignals {
+    pub group_fit: f64,
+    pub mode_fit: f64,
+    pub access_fit: f64,
+    pub hosting_fit: f64,
+    pub session_fit: f64,
+    pub budget_fit: f64,
+    pub language_fit: f64,
 }
 
 /// Deterministic familiar-group multiplayer fit used by feed eligibility and
@@ -91,6 +216,14 @@ fn unit_interval(value: f64) -> f64 {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub struct RankingSignals {
     pub multiplayer: MultiplayerSignals,
+    /// Observation confidence for each multiplayer field. Values are kept in a
+    /// parallel structure to preserve the existing numeric ranking contract.
+    #[serde(default)]
+    pub multiplayer_confidence: MultiplayerSignals,
+    /// Distinguishes legacy callers (which only supplied aggregate confidence)
+    /// from candidates carrying per-capability confidence.
+    #[serde(default)]
+    pub has_multiplayer_confidence: bool,
     pub quality: f64,
     pub popularity: f64,
     pub momentum: f64,
@@ -105,6 +238,8 @@ pub struct RankingSignals {
     pub maintenance_health: f64,
     pub risk: f64,
     pub personal_fit: f64,
+    #[serde(default)]
+    pub personal_components: PersonalFitSignals,
 }
 
 /// User preference snapshot used by API and recommender personalization.
@@ -112,6 +247,10 @@ pub struct RankingSignals {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct UserPreferences {
     pub version: i64,
+    /// Confidence that the player explicitly confirmed these settings. Fresh
+    /// onboarding defaults use 0 and are shrunk to neutral during ranking.
+    #[serde(default)]
+    pub preference_confidence: f64,
     pub party_size: u8,
     /// 0 = pure coop preference, 1 = strong competitive preference.
     pub coop_competitive: f64,
@@ -163,15 +302,22 @@ impl Default for RecommendationConfig {
             classic_min_wilson: 0.82,
             classic_min_friend_fit: 0.55,
             classic_public_min_ccu: 1_000,
-            mmr_lambda: 0.75,
+            mmr_lambda: 0.85,
             candidate_limit: 10_000,
-            play_intent_weight: 0.15,
+            play_intent_weight: 0.03,
             play_intent_saturation: 8,
         }
     }
 }
 
 impl RecommendationConfig {
+    /// Effective community-vote contribution for rules-0.3. Older persisted
+    /// configurations may contain a larger value, so clamp at use time instead
+    /// of rejecting otherwise valid legacy JSON.
+    pub fn effective_play_intent_weight(&self) -> f64 {
+        self.play_intent_weight.clamp(0.0, 0.03)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=3_650).contains(&self.recent_days) {
             return Err("recent_days must be between 1 and 3650".into());
@@ -227,6 +373,7 @@ impl Default for UserPreferences {
     fn default() -> Self {
         Self {
             version: 1,
+            preference_confidence: 0.0,
             party_size: 4,
             coop_competitive: 0.15,
             session_minutes_min: 30,
@@ -245,6 +392,11 @@ impl UserPreferences {
     pub fn validate(&self) -> Result<(), String> {
         if self.version < 1 {
             return Err("version must be positive".into());
+        }
+        if !self.preference_confidence.is_finite()
+            || !(0.0..=1.0).contains(&self.preference_confidence)
+        {
+            return Err("preference_confidence must be between 0 and 1".into());
         }
         if !(1..=64).contains(&self.party_size) {
             return Err("party_size must be between 1 and 64".into());
@@ -330,7 +482,23 @@ impl FeedbackType {
 
 #[cfg(test)]
 mod tests {
-    use super::{FeedSection, FeedbackType, RecommendationConfig, UserPreferences};
+    use super::{
+        FeedSection, FeedbackType, ModeFamily, RecommendationConfig, Signal, UserPreferences,
+    };
+
+    #[test]
+    fn uncertain_signals_shrink_to_the_cohort_prior() {
+        let unknown = Signal::<bool>::default();
+        assert_eq!(unknown.effective_probability_with(0.5), 0.5);
+
+        let observed = Signal {
+            value: Some(true),
+            confidence: 0.25,
+            observed_at_ms: 123,
+            source: "fixture".into(),
+        };
+        assert!((observed.effective_probability_with(0.5) - 0.625).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn feed_section_names_are_stable() {
@@ -376,13 +544,65 @@ mod tests {
     }
 
     #[test]
+    fn mode_family_normalizes_historical_aliases() {
+        for alias in [
+            "competitive",
+            "versus",
+            "vs",
+            "pvp",
+            "pvp_only",
+            "matchmaking-competitive",
+        ] {
+            assert_eq!(ModeFamily::from_alias(alias), ModeFamily::MatchmadePvp);
+        }
+        assert_eq!(
+            ModeFamily::from_alias("self_hosted_survival"),
+            ModeFamily::SelfHosted
+        );
+        assert_eq!(ModeFamily::from_alias("Co-Op"), ModeFamily::PrivateCoop);
+        assert_eq!(
+            ModeFamily::from_alias("single_primary"),
+            ModeFamily::Unknown
+        );
+    }
+
+    #[test]
+    fn mode_family_serde_uses_canonical_names() {
+        let encoded = serde_json::to_string(&ModeFamily::MatchmadePvp).unwrap();
+        assert_eq!(encoded, r#""matchmade_pvp""#);
+        assert_eq!(
+            serde_json::from_str::<ModeFamily>(&encoded).unwrap(),
+            ModeFamily::MatchmadePvp
+        );
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn mode_family_openapi_schema_uses_canonical_names() {
+        let schema = <ModeFamily as utoipa::PartialSchema>::schema();
+        let rendered = serde_json::to_string(&schema).unwrap();
+        assert!(rendered.contains("matchmade_pvp"));
+        assert!(rendered.contains("private_coop"));
+    }
+
+    #[test]
     fn recommendation_config_defaults_and_partial_json_validate() {
         let defaults = RecommendationConfig::default();
+        assert_eq!(defaults.mmr_lambda, 0.85);
+        assert_eq!(defaults.play_intent_weight, 0.03);
         assert!(defaults.validate().is_ok());
         let partial: RecommendationConfig = serde_json::from_str(r#"{"recent_days":90}"#).unwrap();
         assert_eq!(partial.recent_days, 90);
         assert_eq!(partial.classic_min_reviews, defaults.classic_min_reviews);
         assert!(partial.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_play_intent_weight_is_accepted_but_effectively_capped() {
+        let legacy: RecommendationConfig =
+            serde_json::from_str(r#"{"play_intent_weight":0.15}"#).unwrap();
+        assert!(legacy.validate().is_ok());
+        assert_eq!(legacy.effective_play_intent_weight(), 0.03);
     }
 
     #[test]

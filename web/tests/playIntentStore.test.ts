@@ -38,6 +38,28 @@ describe("PlayIntentStore", () => {
     expect(store.effectiveVoted(10, false)).toBe(true);
   });
 
+  it("attributes an acknowledged want-to-play vote to its recommendation run", async () => {
+    const storage = new MemoryStorage();
+    const { fetchFn, calls } = makeFetchStub({
+      "POST /v1/games/10/play-intent": () =>
+        jsonResponse({ app_id: 10, count: 1, voted: true }),
+      "POST /v1/recommendation-events": () =>
+        jsonResponse({ recommendation_event_id: 1 }),
+    });
+    const store = new PlayIntentStore(accountClient(storage, fetchFn), storage);
+
+    store.toggle(10, false, "run-123");
+    await store.flush();
+
+    const event = calls.find((call) => call.url.endsWith("/v1/recommendation-events"));
+    expect(event?.headers["idempotency-key"]).toBe("play_intent:10");
+    expect(event?.body).toMatchObject({
+      recommendation_run_id: "run-123",
+      app_id: 10,
+      event_type: "play_intent",
+    });
+  });
+
   it("un-voting produces a negative delta against a server 'voted' baseline", () => {
     const storage = new MemoryStorage();
     const { client } = makeClient(storage, () => true);

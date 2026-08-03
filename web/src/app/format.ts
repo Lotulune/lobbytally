@@ -72,6 +72,88 @@ export function formatPercent(value: number | null): string {
   return `${Math.round(value * 100)}%`;
 }
 
+const RECOMMENDATION_CONFIDENCE_THRESHOLD = 0.45;
+
+/**
+ * Player-facing recommendation label. The index is a relative rank within the
+ * current context, not a probability, so it deliberately has no percent sign.
+ */
+export function recommendationLabel(
+  rank: number | null | undefined,
+  index: number | null | undefined,
+  dataConfidence: number | null | undefined,
+  fitBand?: string | null,
+): string {
+  const validRank = typeof rank === "number" && Number.isFinite(rank) && rank >= 1
+    ? Math.round(rank)
+    : null;
+  const hasEnoughData =
+    fitBand !== "insufficient_data" &&
+    typeof index === "number" &&
+    Number.isFinite(index) &&
+    typeof dataConfidence === "number" &&
+    Number.isFinite(dataConfidence) &&
+    dataConfidence >= RECOMMENDATION_CONFIDENCE_THRESHOLD;
+  const indexLabel = hasEnoughData
+    ? `推荐指数 ${Math.round(Math.min(100, Math.max(0, index)))}`
+    : "资料较少，待观察";
+  const fitLabel = hasEnoughData ? recommendationFitBandLabel(fitBand) : null;
+  return [validRank === null ? null : `第 ${validRank} 推荐`, fitLabel, indexLabel]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+export function hasLowRecommendationConfidence(
+  dataConfidence: number | null | undefined,
+): boolean {
+  return (
+    typeof dataConfidence === "number" &&
+    Number.isFinite(dataConfidence) &&
+    dataConfidence < RECOMMENDATION_CONFIDENCE_THRESHOLD
+  );
+}
+
+/** Keep evidence quality visible independently from the recommendation index. */
+export function recommendationDataReliabilityLabel(
+  dataConfidence: number | null | undefined,
+): string {
+  if (
+    typeof dataConfidence !== "number" ||
+    !Number.isFinite(dataConfidence)
+  ) {
+    return "数据可靠度未知";
+  }
+  const percentage = Math.round(Math.min(1, Math.max(0, dataConfidence)) * 100);
+  if (dataConfidence >= 0.8) return `数据可靠度高 · ${percentage}%`;
+  if (dataConfidence >= RECOMMENDATION_CONFIDENCE_THRESHOLD) {
+    return `数据可靠度中等 · ${percentage}%`;
+  }
+  return `数据可靠度低 · ${percentage}%`;
+}
+
+const FIT_BAND_LABELS: Record<string, string> = {
+  excellent: "很适合",
+  good: "适合",
+  consider: "值得考虑",
+  insufficient_data: "资料较少",
+};
+
+export function recommendationFitBandLabel(band: string | null | undefined): string | null {
+  if (!band) return null;
+  return FIT_BAND_LABELS[band] ?? null;
+}
+
+const SLOT_REASON_LABELS: Record<string, string> = {
+  base: "综合适配",
+  diversity: "多样性",
+  explore: "探索",
+};
+
+export function recommendationSlotReasonLabel(reason: string | null | undefined): string | null {
+  if (!reason) return null;
+  return SLOT_REASON_LABELS[reason] ?? null;
+}
+
 export function formatCount(value: number | null): string {
   if (value === null) return "未知";
   if (value >= 10_000) return `${(value / 10_000).toFixed(1)} 万`;

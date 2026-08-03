@@ -21,14 +21,18 @@ use mpgs_ai::{
     parse_structured_intent, rank_analysis_schema, rank_analysis_system_prompt, rule_game_summary,
     validate_rank_result, wrap_untrusted_data_block,
 };
-use mpgs_domain::{FeedSection, FeedbackType, RecommendationConfig, UserPreferences};
+use mpgs_domain::{FeedSection, FeedbackType, ModeFamily, RecommendationConfig, UserPreferences};
 use mpgs_recommender::{
-    ALGORITHM_VERSION, AiAdjustment, RankingInput, blend_ai, rank_feed_configured,
+    ALGORITHM_VERSION, AiAdjustment, Explanation, HardConstraints, RankedCandidate, RankingInput,
+    ScoreBreakdown, SlotReason, blend_ai, mmr_rerank_with_tie_seed,
+    rank_feed_configured_with_constraints_and_tie_seed,
 };
 use mpgs_storage::{
-    CreateOverrideRequest, EnqueueJob, Repository, StorageError,
+    CreateOverrideRequest, EnqueueJob, HybridHit, InsertRecommendationEvent,
+    InsertRecommendationItem, InsertRecommendationRun, Repository, StorageError,
     accounts::{AiMode, LoginAccount, PreferenceChoice, PutAiSettings, RegisterAccount},
     community::{CommunityFilters, CommunitySort},
+    hash_candidate_set, hash_structured_context,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -70,6 +74,12 @@ const MAX_LOGIN_IDENTITIES: usize = 100_000;
 const AI_CALL_WINDOW: Duration = Duration::from_secs(60);
 const AI_CALLS_PER_ACCOUNT: u32 = 10;
 const MAX_AI_CALL_IDENTITIES: usize = 100_000;
+const SCORE_SEMANTICS: &str = "context_percentile_v1";
+const SCORE_CALIBRATION_VERSION: &str = "context-percentile-v1";
+const MIN_INDEX_POOL_SIZE: usize = 10;
+const MIN_INDEX_DATA_CONFIDENCE: f64 = 0.45;
+const MIN_INDEX_FEATURES: usize = 3;
+const NATURAL_LANGUAGE_RECALL_LIMIT: usize = 300;
 
 #[derive(Debug, Clone, Copy)]
 struct LoginAttemptCounter {
@@ -209,6 +219,9 @@ struct MetaResponse {
     api_version: &'static str,
     service_version: &'static str,
     algorithm_version: String,
+    /// Active rule-parameter configuration; may lag the compiled algorithm on
+    /// an existing database until operators activate the new config.
+    config_version: Option<String>,
     /// SQLite schema migration version when storage is enabled.
     schema_version: Option<i64>,
     /// Compile-time git SHA from `MPGS_BUILD_GIT_SHA`, or `unknown` for local builds.
@@ -281,7 +294,34 @@ struct ScoreComponentsSchema {
     friend_fit: f64,
     section_score: f64,
     personalized_score: f64,
+    group_fit: f64,
+    mode_fit: f64,
+    access_fit: f64,
+    hosting_fit: f64,
+    session_fit: f64,
+    quality: f64,
+    activity: f64,
+    freshness: f64,
+    risk: f64,
+    relevance_score: f64,
     final_score: f64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+struct FeatureFreshnessValueSchema {
+    status: String,
+    observed_at_ms: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+struct FeatureFreshnessSchema {
+    multiplayer: FeatureFreshnessValueSchema,
+    reviews: FeatureFreshnessValueSchema,
+    activity: FeatureFreshnessValueSchema,
+    price: FeatureFreshnessValueSchema,
+    release: FeatureFreshnessValueSchema,
 }
 
 #[allow(dead_code)]
@@ -290,6 +330,8 @@ struct FeedItemSchema {
     app_id: u32,
     name: String,
     section: FeedSection,
+    /// One-based position in the final response ordering.
+    rank: usize,
     release_date: Option<String>,
     release_date_raw: Option<String>,
     release_date_precision: Option<String>,
@@ -299,14 +341,25 @@ struct FeedItemSchema {
     total_positive: Option<u32>,
     latest_ccu: Option<u32>,
     typical_ccu_7d: Option<u32>,
+    /// Deprecated raw ranking score. Prefer `recommendation_index`.
     score: f64,
+    /// Backward-compatible alias of `data_confidence`.
     confidence: f64,
+    data_confidence: f64,
+    friend_fit: f64,
+    /// Context-relative percentile index; absent when evidence is insufficient.
+    recommendation_index: Option<u8>,
+    fit_band: String,
+    slot_reason: String,
+    score_calibration_version: String,
     party: PartySchema,
     multiplayer: MultiplayerSummarySchema,
     play_intent: PlayIntentSummarySchema,
     reasons: Vec<String>,
     cautions: Vec<String>,
     evidence_ids: Vec<String>,
+    reason_evidence: Vec<String>,
+    feature_freshness: FeatureFreshnessSchema,
     components: ScoreComponentsSchema,
     algorithm_version: String,
     hybrid_score: Option<f64>,
@@ -327,7 +380,13 @@ struct FeedResponseSchema {
     total_pages: usize,
     snapshot_at_ms: i64,
     algorithm_version: String,
+    config_version: String,
     data_updated_at_ms: i64,
+    recommendation_run_id: Option<String>,
+    score_semantics: String,
+    sort: String,
+    /// Omitted for recommended ordering because direction does not apply.
+    order: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -378,7 +437,19 @@ struct NaturalLanguageInterpretationSchema {
     self_hosting_willingness: Option<f64>,
     platforms: Vec<String>,
     demo_only: bool,
-    selected_section: FeedSection,
+    /// Explicitly selected section; absent when recall spans all sections.
+    selected_section: Option<FeedSection>,
+    selected_section_explicit: bool,
+    max_price_minor: Option<i64>,
+    currency: Option<String>,
+    modes_preferred: Vec<String>,
+    modes_excluded: Vec<String>,
+    hard_constraints: Vec<String>,
+    /// Structured dimensions that were translated into recall, filtering, or scoring.
+    applied_constraints: Vec<String>,
+    /// Parsed dimensions that could not be represented faithfully by the current ranker.
+    unapplied_constraints: Vec<String>,
+    intent_confidence: Option<f64>,
 }
 
 #[allow(dead_code)]
@@ -389,12 +460,23 @@ struct NaturalLanguageResponseSchema {
     items: Vec<FeedItemSchema>,
     ai_status: String,
     ai_provider: String,
+    ai_model: Option<String>,
+    ai_protocol: Option<String>,
+    ai_route_version: Option<String>,
+    ai_used_model_fallback: bool,
+    ai_attempted_models: Vec<String>,
+    ai_multi_model: bool,
+    #[schema(value_type = Object)]
+    ai_routes: serde_json::Value,
     ai_latency_ms: u64,
     fallback_reason: Option<String>,
     ai_summary: Option<String>,
     ai_summary_evidence_ids: Vec<String>,
     algorithm_version: String,
+    config_version: String,
+    recommendation_run_id: Option<String>,
     data_updated_at_ms: i64,
+    score_semantics: String,
 }
 
 #[allow(dead_code)]
@@ -438,6 +520,7 @@ struct SearchItemSchema {
 struct SearchResponseSchema {
     items: Vec<SearchItemSchema>,
     algorithm_version: String,
+    config_version: String,
 }
 
 #[allow(dead_code)]
@@ -511,6 +594,7 @@ struct GameResponseSchema {
     latest_ccu: Option<u32>,
     availability: GameAvailabilitySchema,
     algorithm_version: String,
+    config_version: String,
     data_updated_at_ms: i64,
 }
 
@@ -541,6 +625,19 @@ struct FeedbackResponseSchema {
     #[schema(rename = "type")]
     feedback_type: String,
     recommendation_run_id: Option<String>,
+    created_at_ms: i64,
+}
+
+#[allow(dead_code)]
+#[derive(ToSchema)]
+struct RecommendationEventResponseSchema {
+    recommendation_event_id: i64,
+    recommendation_run_id: String,
+    app_id: u32,
+    event_type: String,
+    client_created_at_ms: Option<i64>,
+    #[schema(value_type = Object)]
+    metadata: serde_json::Value,
     created_at_ms: i64,
 }
 
@@ -598,6 +695,7 @@ impl utoipa::Modify for SecurityAddon {
         search_games,
         get_game,
         get_evidence,
+        post_recommendation_event,
         post_feedback,
         undo_feedback,
         set_play_intent
@@ -636,6 +734,8 @@ impl utoipa::Modify for SecurityAddon {
         MultiplayerSummarySchema,
         PlayIntentSummarySchema,
         ScoreComponentsSchema,
+        FeatureFreshnessValueSchema,
+        FeatureFreshnessSchema,
         CalendarItemSchema,
         CalendarResponseSchema,
         SearchItemSchema,
@@ -647,6 +747,8 @@ impl utoipa::Modify for SecurityAddon {
         GameAvailabilitySchema,
         EvidenceItemSchema,
         EvidenceResponseSchema,
+        RecommendationEventBody,
+        RecommendationEventResponseSchema,
         FeedbackBody,
         FeedbackResponseSchema,
         PlayIntentBody,
@@ -729,6 +831,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/games/{app_id}", get(get_game))
         .route("/v1/games/{app_id}/evidence", get(get_evidence))
         .route("/v1/games/{app_id}/play-intent", post(set_play_intent))
+        .route("/v1/recommendation-events", post(post_recommendation_event))
         .route("/v1/feedback", post(post_feedback))
         .route("/v1/feedback/{feedback_id}/undo", post(undo_feedback))
         .route("/admin/v1/games/{app_id}/overrides", post(create_override))
@@ -888,13 +991,13 @@ async fn health_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     tag = "public"
 )]
 async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
-    let (algorithm_version, schema_version, data_updated_at_ms) = match state.repo.as_ref() {
+    let (config_version, schema_version, data_updated_at_ms) = match state.repo.as_ref() {
         Some(repo) => {
             match storage_result(repo, |repo| {
                 let algorithm = repo.active_algorithm_config()?.version;
                 let schema = repo.database().schema_version()?;
                 let data_updated = repo.data_updated_at_ms().ok();
-                Ok((algorithm, Some(schema), data_updated))
+                Ok((Some(algorithm), Some(schema), data_updated))
             })
             .await
             {
@@ -902,7 +1005,7 @@ async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl In
                 Err(error) => return map_storage_error(error, None),
             }
         }
-        None => (ALGORITHM_VERSION.to_owned(), None, None),
+        None => (None, None, None),
     };
     let ai_task_models: Vec<String> = state
         .task_router
@@ -914,7 +1017,8 @@ async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl In
     let body = MetaResponse {
         api_version: "v1",
         service_version: env!("CARGO_PKG_VERSION"),
-        algorithm_version,
+        algorithm_version: ALGORITHM_VERSION.to_owned(),
+        config_version,
         schema_version,
         build_git_sha: build_git_sha(),
         data_updated_at_ms,
@@ -931,9 +1035,10 @@ async fn meta(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl In
         }),
     };
     let etag = weak_etag(&format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         body.service_version,
         body.algorithm_version,
+        body.config_version.as_deref().unwrap_or("none"),
         body.schema_version.unwrap_or(-1),
         body.build_git_sha,
         body.data_updated_at_ms.unwrap_or(0),
@@ -1824,7 +1929,7 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 struct CommunityQuery {
     sort: Option<String>,
@@ -2546,7 +2651,7 @@ async fn get_preferences(
 async fn put_preferences(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<UserPreferences>,
+    Json(raw_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let Some(repo) = require_repo(&state) else {
         return storage_disabled();
@@ -2555,13 +2660,32 @@ async fn put_preferences(
         Ok(id) => id,
         Err(resp) => return *resp,
     };
+    let confidence_was_supplied = raw_body.get("preference_confidence").is_some();
+    let mut body = match serde_json::from_value::<UserPreferences>(raw_body) {
+        Ok(body) => body,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                &format!("invalid preferences payload: {error}"),
+                None,
+            );
+        }
+    };
+    if !confidence_was_supplied {
+        let lookup_user_id = user_id.clone();
+        match storage_result(repo, move |repo| repo.get_preferences(&lookup_user_id)).await {
+            Ok(current) => body.preference_confidence = current.preference_confidence,
+            Err(error) => return map_storage_error(error, None),
+        }
+    }
     match storage_result(repo, move |repo| repo.put_preferences(&user_id, &body)).await {
         Ok(prefs) => (StatusCode::OK, Json(prefs)).into_response(),
         Err(error) => map_storage_error(error, None),
     }
 }
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 struct FeedQuery {
     limit: Option<i64>,
@@ -2573,21 +2697,24 @@ struct FeedQuery {
     self_hosting_willingness: Option<f64>,
     platforms: Option<String>,
     languages: Option<String>,
+    excluded_modes: Option<String>,
     session_minutes_min: Option<u32>,
     session_minutes_max: Option<u32>,
     max_price_minor: Option<i64>,
     currency: Option<String>,
     demo_only: Option<bool>,
     /// Ranking override after the recommendation score: `recommended` (default),
-    /// `ccu`, `reviews`, or `release_date`.
+    /// strict `fit_index`, `ccu`, `reviews`, or `release_date`.
     sort: Option<String>,
     /// `desc` (default for ccu/reviews) or `asc` (default for release_date).
+    /// Ignored when `sort=recommended`.
     order: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeedSort {
     Recommended,
+    FitIndex,
     Ccu,
     Reviews,
     ReleaseDate,
@@ -2597,6 +2724,7 @@ impl FeedSort {
     fn parse(raw: Option<&str>) -> Result<Self, ()> {
         match raw.map(str::trim).filter(|value| !value.is_empty()) {
             None | Some("recommended") | Some("score") => Ok(Self::Recommended),
+            Some("fit_index") | Some("relevance") | Some("fit") => Ok(Self::FitIndex),
             Some("ccu") | Some("players") | Some("player_count") => Ok(Self::Ccu),
             Some("reviews") | Some("review_count") => Ok(Self::Reviews),
             Some("release_date") | Some("release") | Some("date") => Ok(Self::ReleaseDate),
@@ -2607,6 +2735,7 @@ impl FeedSort {
     fn as_str(self) -> &'static str {
         match self {
             Self::Recommended => "recommended",
+            Self::FitIndex => "fit_index",
             Self::Ccu => "ccu",
             Self::Reviews => "reviews",
             Self::ReleaseDate => "release_date",
@@ -2622,6 +2751,12 @@ enum FeedSortOrder {
 
 impl FeedSortOrder {
     fn parse(raw: Option<&str>, sort: FeedSort) -> Result<Self, ()> {
+        // Recommended is an authored ranking (including diversity), not a scalar
+        // sort. Direction is deliberately ignored and canonicalized so it cannot
+        // change cursors, ETags, or the response contract.
+        if matches!(sort, FeedSort::Recommended) {
+            return Ok(Self::Desc);
+        }
         match raw.map(str::trim).filter(|value| !value.is_empty()) {
             None => Ok(match sort {
                 FeedSort::ReleaseDate => Self::Asc,
@@ -2647,12 +2782,17 @@ fn feed_result_context(
     order: FeedSortOrder,
     demo_only: bool,
 ) -> String {
+    let order = if matches!(sort, FeedSort::Recommended) {
+        "n/a"
+    } else {
+        order.as_str()
+    };
     format!(
         "{:016x}",
         hash64(&format!(
             "{preference_context}|sort={}|order={}|demo_only={demo_only}",
             sort.as_str(),
-            order.as_str()
+            order
         ))
     )
 }
@@ -2668,6 +2808,14 @@ fn feedback_personal_adjustment(feedback: Option<&str>, matchmaking_core: f64) -
     }
 }
 
+fn combined_feedback_personal_adjustment(feedback: &[&str], matchmaking_core: f64) -> f64 {
+    feedback
+        .iter()
+        .map(|feedback| feedback_personal_adjustment(Some(feedback), matchmaking_core))
+        .sum::<f64>()
+        .clamp(-0.5, 0.5)
+}
+
 #[derive(Debug, Clone)]
 struct FeedPresentation {
     release_date: Option<String>,
@@ -2679,6 +2827,95 @@ struct FeedPresentation {
     total_positive: Option<u32>,
     latest_ccu: Option<u32>,
     typical_ccu_7d: Option<u32>,
+    data_confidence: f64,
+    effective_feature_count: usize,
+    profile_observed_at_ms: Option<i64>,
+    reviews_observed_at_ms: Option<i64>,
+    activity_observed_at_ms: Option<i64>,
+    price_observed_at_ms: Option<i64>,
+    release_observed_at_ms: Option<i64>,
+}
+
+fn feature_freshness_value(observed_at_ms: Option<i64>) -> serde_json::Value {
+    json!({
+        "status": if observed_at_ms.is_some() { "fresh" } else { "unknown" },
+        "observed_at_ms": observed_at_ms,
+    })
+}
+
+fn context_percentile_indices(scores: impl IntoIterator<Item = (u32, f64)>) -> HashMap<u32, u8> {
+    let mut scores: Vec<_> = scores
+        .into_iter()
+        .filter(|(_, score)| score.is_finite())
+        .collect();
+    if scores.len() < MIN_INDEX_POOL_SIZE {
+        return HashMap::new();
+    }
+
+    scores.sort_by(|(left_id, left), (right_id, right)| {
+        right.total_cmp(left).then_with(|| left_id.cmp(right_id))
+    });
+    let total = scores.len() as f64;
+    let mut indices = HashMap::with_capacity(scores.len());
+    let mut start = 0usize;
+    while start < scores.len() {
+        let score = scores[start].1;
+        let mut end = start + 1;
+        while end < scores.len() && scores[end].1.total_cmp(&score).is_eq() {
+            end += 1;
+        }
+        // Ranks are one-based. `end` is exclusive, and therefore also equals
+        // the one-based rank of the last member in the tie group.
+        let midrank = ((start + 1) as f64 + end as f64) / 2.0;
+        let index = (100.0 * (total - midrank + 0.5) / total)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        for (app_id, _) in &scores[start..end] {
+            indices.insert(*app_id, index);
+        }
+        start = end;
+    }
+    indices
+}
+
+/// Compute the public index inside the exact response window. The index is a
+/// request-context comparison, not a probability or an all-catalog percentile;
+/// global position is communicated separately by `rank`.
+fn context_percentile_indices_for_window(
+    scores: impl IntoIterator<Item = (u32, f64)>,
+    offset: usize,
+    limit: usize,
+) -> HashMap<u32, u8> {
+    context_percentile_indices(scores.into_iter().skip(offset).take(limit))
+}
+
+fn visible_recommendation_index(
+    app_id: u32,
+    indices: &HashMap<u32, u8>,
+    presentation: Option<&FeedPresentation>,
+) -> Option<u8> {
+    let presentation = presentation?;
+    (presentation.data_confidence >= MIN_INDEX_DATA_CONFIDENCE
+        && presentation.effective_feature_count >= MIN_INDEX_FEATURES)
+        .then(|| indices.get(&app_id).copied())
+        .flatten()
+}
+
+fn fit_band(index: Option<u8>) -> &'static str {
+    match index {
+        Some(80..) => "excellent",
+        Some(60..) => "good",
+        Some(_) => "consider",
+        None => "insufficient_data",
+    }
+}
+
+fn slot_reason_str(reason: mpgs_recommender::SlotReason) -> &'static str {
+    match reason {
+        mpgs_recommender::SlotReason::Base => "base",
+        mpgs_recommender::SlotReason::Diversity => "diversity",
+        mpgs_recommender::SlotReason::Explore => "explore",
+    }
 }
 
 /// Public Steam header CDN fallback when local media is missing.
@@ -2713,7 +2950,18 @@ async fn get_feed(
     headers: HeaderMap,
     Path(section): Path<String>,
     Query(query): Query<FeedQuery>,
-) -> impl IntoResponse {
+) -> Response {
+    get_feed_inner(state, headers, section, query, true, None).await
+}
+
+async fn get_feed_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    section: String,
+    query: FeedQuery,
+    record_telemetry: bool,
+    internal_retrieval_ids: Option<&[u32]>,
+) -> Response {
     let Some(repo) = require_repo(&state) else {
         return storage_disabled();
     };
@@ -2751,11 +2999,16 @@ async fn get_feed(
         return *response;
     }
     let requested_limit = query.limit.unwrap_or(20);
-    if !(1..=100).contains(&requested_limit) {
+    let max_limit = if internal_retrieval_ids.is_some() {
+        NATURAL_LANGUAGE_RECALL_LIMIT as i64
+    } else {
+        100
+    };
+    if !(1..=max_limit).contains(&requested_limit) {
         return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
-            "limit must be between 1 and 100",
+            &format!("limit must be between 1 and {max_limit}"),
             None,
         );
     }
@@ -2766,7 +3019,7 @@ async fn get_feed(
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_argument",
-                "sort must be recommended, ccu, reviews, or release_date",
+                "sort must be recommended, fit_index, ccu, reviews, or release_date",
                 None,
             );
         }
@@ -2792,18 +3045,27 @@ async fn get_feed(
         }
         None => Vec::new(),
     };
-    let feedback_by_app: HashMap<_, _> = active_feedback
-        .iter()
-        .map(|feedback| (feedback.app_id, feedback.feedback_type.as_str()))
-        .collect();
+    let mut feedback_by_app: HashMap<u32, Vec<&str>> = HashMap::new();
+    for feedback in &active_feedback {
+        feedback_by_app
+            .entry(feedback.app_id)
+            .or_default()
+            .push(feedback.feedback_type.as_str());
+    }
     let preference_context = recommendation_context(
         &prefs,
         &active_feedback,
         &active_config.version,
         &active_config.config,
     );
+    let now_ms = repo.database().now_ms();
+    let today = mpgs_storage::util::day_utc_from_ms(now_ms);
+    let tie_seed = recommendation_tie_seed(user_id.as_deref(), &today);
     let demo_only = query.demo_only.unwrap_or(false);
-    let result_context = feed_result_context(&preference_context, feed_sort, feed_order, demo_only);
+    let result_context = format!(
+        "{}|tie_day={today}",
+        feed_result_context(&preference_context, feed_sort, feed_order, demo_only),
+    );
     let snapshot_ms = match storage_result(repo, |repo| repo.data_updated_at_ms()).await {
         Ok(value) => value,
         Err(error) => return map_storage_error(error, None),
@@ -2870,8 +3132,6 @@ async fn get_feed(
         return response;
     }
 
-    let now_ms = repo.database().now_ms();
-    let today = mpgs_storage::util::day_utc_from_ms(now_ms);
     let cutoff = mpgs_storage::util::day_utc_from_ms(
         now_ms.saturating_sub(i64::from(active_config.config.recent_days) * 24 * 60 * 60 * 1000),
     );
@@ -2903,13 +3163,21 @@ async fn get_feed(
             if demo_only && !row.has_demo {
                 return None;
             }
-            let signals = row.to_ranking_signals();
-            let feedback = feedback_by_app.get(&row.app_id).copied();
-            if matches!(feedback, Some("not_interested" | "party_size_mismatch")) {
+            let signals = row.to_ranking_signals_at(&today);
+            let feedback = feedback_by_app
+                .get(&row.app_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if feedback
+                .iter()
+                .any(|value| matches!(*value, "not_interested" | "party_size_mismatch"))
+            {
                 return None;
             }
-            let personal_adjustment =
-                feedback_personal_adjustment(feedback, signals.multiplayer.matchmaking_core);
+            let personal_adjustment = combined_feedback_personal_adjustment(
+                feedback,
+                signals.multiplayer.matchmaking_core,
+            );
             let availability = row.availability();
             let matches_section = mpgs_storage::query::section_matches(
                 section,
@@ -2922,6 +3190,27 @@ async fn get_feed(
             if !matches_section {
                 return None;
             }
+            let effective_feature_count = usize::from(
+                row.total_reviews.is_some_and(|reviews| reviews > 0)
+                    && row.total_positive.is_some(),
+            ) + usize::from(
+                row.latest_ccu.is_some() || row.typical_ccu_7d.is_some(),
+            ) + usize::from(row.release_date.is_some())
+                + usize::from(
+                    [
+                        signals.multiplayer_confidence.private_session,
+                        signals.multiplayer_confidence.self_host_or_dedicated,
+                        signals.multiplayer_confidence.online_coop,
+                        signals.multiplayer_confidence.group_size_fit,
+                        signals.multiplayer_confidence.drop_in_out,
+                        signals.multiplayer_confidence.cross_platform_fit,
+                        signals.multiplayer_confidence.matchmaking_core,
+                        signals.multiplayer_confidence.public_world_dependency,
+                    ]
+                    .into_iter()
+                    .any(|confidence| confidence > 0.0),
+                )
+                + usize::from(row.has_demo);
             presentation_by_app.insert(
                 row.app_id,
                 FeedPresentation {
@@ -2934,6 +3223,16 @@ async fn get_feed(
                     total_positive: row.total_positive,
                     latest_ccu: row.latest_ccu,
                     typical_ccu_7d: row.typical_ccu_7d,
+                    data_confidence: signals.data_confidence.clamp(0.0, 1.0),
+                    effective_feature_count,
+                    profile_observed_at_ms: row.profile_observed_at_ms,
+                    reviews_observed_at_ms: row.reviews_observed_at_ms,
+                    activity_observed_at_ms: row.activity_observed_at_ms,
+                    price_observed_at_ms: row.price_observed_at_ms,
+                    release_observed_at_ms: row
+                        .release_date
+                        .as_ref()
+                        .and(row.release_observed_at_ms),
                 },
             );
             let dominant_mode = row.display_dominant_mode();
@@ -2941,6 +3240,9 @@ async fn get_feed(
                 app_id: row.app_id,
                 name: row.name,
                 dominant_mode,
+                taxonomy_tags: row.taxonomy_tags,
+                publisher: row.publisher,
+                series: None,
                 recommended_min: row.recommended_min,
                 recommended_max: row.recommended_max,
                 availability,
@@ -2951,12 +3253,15 @@ async fn get_feed(
         })
         .collect();
 
-    let ranked = rank_feed_configured(
+    let hard_constraints = hard_constraints_from_feed_query(&query);
+    let ranked = rank_feed_configured_with_constraints_and_tie_seed(
         section,
         &inputs,
         &prefs,
+        &hard_constraints,
         &active_config.config,
-        &active_config.version,
+        ALGORITHM_VERSION,
+        tie_seed,
     );
     let mut ranked_items = ranked.items;
     apply_feed_sort(
@@ -2964,6 +3269,16 @@ async fn get_feed(
         feed_sort,
         feed_order,
         &presentation_by_app,
+    );
+    if let Some(retrieval_ids) = internal_retrieval_ids {
+        ranked_items = select_internal_recall_candidates(ranked_items, retrieval_ids, limit);
+    }
+    let recommendation_indices = context_percentile_indices_for_window(
+        ranked_items
+            .iter()
+            .map(|item| (item.app_id, item.score.relevance_score)),
+        offset,
+        limit,
     );
     let total = ranked_items.len();
     let limit_usize = limit;
@@ -2973,16 +3288,68 @@ async fn get_feed(
     } else {
         total.div_ceil(limit_usize)
     };
+    let candidate_ids: Vec<u32> = ranked_items.iter().map(|item| item.app_id).collect();
     let page: Vec<_> = ranked_items
         .into_iter()
         .skip(offset)
         .take(limit_usize)
-        .map(|item| {
+        .enumerate()
+        .map(|(page_index, item)| {
             let presentation = presentation_by_app.get(&item.app_id);
-            json!({
+            let recommendation_index = visible_recommendation_index(
+                item.app_id,
+                &recommendation_indices,
+                presentation,
+            );
+            let data_confidence = presentation
+                .map(|value| value.data_confidence)
+                .unwrap_or(0.0);
+            let ranking_metadata = (!record_telemetry).then(|| {
+                json!({
+                    "taxonomy_tags": item.taxonomy_tags,
+                    "publisher": item.publisher,
+                    "series": item.series,
+                })
+            });
+            let score_components = json!({
+                "friend_fit": item.score.friend_fit,
+                "section_score": item.score.section_score,
+                "personalized_score": item.score.personalized_score,
+                "group_fit": item.score.group_fit,
+                "mode_fit": item.score.mode_fit,
+                "access_fit": item.score.access_fit,
+                "hosting_fit": item.score.hosting_fit,
+                "session_fit": item.score.session_fit,
+                "quality": item.score.quality,
+                "activity": item.score.activity,
+                "freshness": item.score.freshness,
+                "risk": item.score.risk,
+                "relevance_score": item.score.relevance_score,
+                "final_score": item.score.final_score,
+            });
+            let feature_freshness = json!({
+                "multiplayer": feature_freshness_value(
+                    presentation.and_then(|value| value.profile_observed_at_ms),
+                ),
+                "reviews": feature_freshness_value(
+                    presentation.and_then(|value| value.reviews_observed_at_ms),
+                ),
+                "activity": feature_freshness_value(
+                    presentation.and_then(|value| value.activity_observed_at_ms),
+                ),
+                "price": feature_freshness_value(
+                    presentation.and_then(|value| value.price_observed_at_ms),
+                ),
+                "release": feature_freshness_value(
+                    presentation.and_then(|value| value.release_observed_at_ms),
+                ),
+            });
+            let reason_evidence = item.explanation.evidence_ids.clone();
+            let mut response_item = json!({
                 "app_id": item.app_id,
                 "name": item.name,
                 "section": section.as_str(),
+                "rank": offset + page_index + 1,
                 "release_date": presentation.and_then(|value| value.release_date.clone()),
                 "release_date_raw": presentation.and_then(|value| value.release_date_raw.clone()),
                 "release_date_precision": presentation.and_then(|value| value.release_date_precision.clone()),
@@ -2994,7 +3361,17 @@ async fn get_feed(
                 "latest_ccu": presentation.and_then(|value| value.latest_ccu),
                 "typical_ccu_7d": presentation.and_then(|value| value.typical_ccu_7d),
                 "score": item.score.final_score,
-                "confidence": item.score.friend_fit,
+                "confidence": data_confidence,
+                "data_confidence": data_confidence,
+                "friend_fit": item.score.friend_fit,
+                "recommendation_index": recommendation_index,
+                "fit_band": fit_band(recommendation_index),
+                "slot_reason": if matches!(feed_sort, FeedSort::Recommended) {
+                    slot_reason_str(item.slot_reason)
+                } else {
+                    "base"
+                },
+                "score_calibration_version": SCORE_CALIBRATION_VERSION,
                 "party": {
                     "recommended_min": item.recommended_min,
                     "recommended_max": item.recommended_max,
@@ -3009,16 +3386,39 @@ async fn get_feed(
                 "reasons": item.explanation.reasons,
                 "cautions": item.explanation.cautions,
                 "evidence_ids": item.explanation.evidence_ids,
-                "components": {
-                    "friend_fit": item.score.friend_fit,
-                    "section_score": item.score.section_score,
-                    "personalized_score": item.score.personalized_score,
-                    "final_score": item.score.final_score,
-                },
+                "reason_evidence": reason_evidence,
+                "feature_freshness": feature_freshness,
+                "components": score_components,
                 "algorithm_version": item.algorithm_version,
-            })
+            });
+            if let Some(metadata) = ranking_metadata
+                && let Some(object) = response_item.as_object_mut()
+            {
+                // Only internal natural-language recall receives these fields;
+                // the regular feed contract remains unchanged.
+                object.insert("_ranking_metadata".into(), metadata);
+            }
+            response_item
         })
         .collect();
+
+    let recommendation_run_id = if record_telemetry {
+        record_recommendation_run(
+            repo,
+            "feed",
+            section.as_str(),
+            &active_config.version,
+            &result_context,
+            snapshot_ms,
+            offset,
+            limit,
+            &candidate_ids,
+            &page,
+        )
+        .await
+    } else {
+        None
+    };
 
     let next_offset = offset.saturating_add(limit_usize);
     let next_cursor = if next_offset < total {
@@ -3041,12 +3441,105 @@ async fn get_feed(
         "page": page_number,
         "total_pages": total_pages,
         "snapshot_at_ms": snapshot_ms,
-        "algorithm_version": active_config.version,
+        "algorithm_version": ALGORITHM_VERSION,
+        "config_version": active_config.version,
         "data_updated_at_ms": snapshot_ms,
+        "recommendation_run_id": recommendation_run_id,
+        "score_semantics": SCORE_SEMANTICS,
         "sort": feed_sort.as_str(),
-        "order": feed_order.as_str(),
+        "order": (!matches!(feed_sort, FeedSort::Recommended)).then(|| feed_order.as_str()),
     });
     (StatusCode::OK, [(header::ETAG, etag)], Json(body)).into_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_recommendation_run(
+    repo: &Repository,
+    request_kind: &str,
+    feed_section: &str,
+    config_version: &str,
+    result_context: &str,
+    snapshot_ms: i64,
+    offset: usize,
+    limit: usize,
+    candidate_ids: &[u32],
+    page: &[serde_json::Value],
+) -> Option<String> {
+    let context_hash = match hash_structured_context(&json!({
+        "schema": 1,
+        "request_kind": request_kind,
+        "section": feed_section,
+        "result_context": result_context,
+        "snapshot_ms": snapshot_ms,
+        "offset": offset,
+        "limit": limit,
+    })) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "failed to hash recommendation context");
+            return None;
+        }
+    };
+    let candidate_set_hash = match hash_candidate_set(candidate_ids) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "failed to hash recommendation candidate set");
+            return None;
+        }
+    };
+    let run_input = InsertRecommendationRun {
+        // A deployment-keyed subject pseudonym is not configured yet. Never
+        // fall back to hashing a raw account id with an unkeyed digest.
+        subject_hash: None,
+        request_kind: request_kind.to_owned(),
+        feed_section: feed_section.to_owned(),
+        algorithm_version: ALGORITHM_VERSION.into(),
+        config_version: config_version.to_owned(),
+        score_semantics: SCORE_SEMANTICS.into(),
+        context_schema_version: 1,
+        context_hash,
+        candidate_set_hash,
+        candidate_count: u32::try_from(candidate_ids.len()).unwrap_or(u32::MAX),
+    };
+    let items: Vec<InsertRecommendationItem> = page
+        .iter()
+        .filter_map(|item| {
+            let app_id = u32::try_from(item.get("app_id")?.as_u64()?).ok()?;
+            let rank = u32::try_from(item.get("rank")?.as_u64()?).ok()?;
+            let components = item.get("components")?.clone();
+            Some(InsertRecommendationItem {
+                app_id,
+                rank,
+                relevance_score: components.get("relevance_score")?.as_f64()?,
+                recommendation_index: item
+                    .get("recommendation_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u8::try_from(value).ok()),
+                data_confidence: item.get("data_confidence")?.as_f64()?,
+                slot_reason: item.get("slot_reason")?.as_str()?.to_owned(),
+                score_components: components,
+            })
+        })
+        .collect();
+    if items.len() != page.len() {
+        tracing::warn!(
+            expected = page.len(),
+            actual = items.len(),
+            "recommendation item attribution was incomplete"
+        );
+        return None;
+    }
+    match storage_result(repo, move |repo| {
+        repo.insert_recommendation_run_with_items(&run_input, &items)
+    })
+    .await
+    {
+        Ok(run) => Some(run.recommendation_run_id),
+        Err(error) => {
+            tracing::warn!(%error, "failed to atomically persist recommendation attribution");
+            None
+        }
+    }
 }
 
 fn apply_feed_sort(
@@ -3063,39 +3556,35 @@ fn apply_feed_sort(
         let right_p = presentation.get(&right.app_id);
         let primary = match sort {
             FeedSort::Recommended => std::cmp::Ordering::Equal,
-            FeedSort::Ccu => {
-                let left_ccu = left_p
-                    .and_then(|value| value.typical_ccu_7d.or(value.latest_ccu))
-                    .unwrap_or(0);
-                let right_ccu = right_p
-                    .and_then(|value| value.typical_ccu_7d.or(value.latest_ccu))
-                    .unwrap_or(0);
-                left_ccu.cmp(&right_ccu)
-            }
-            FeedSort::Reviews => {
-                let left_reviews = left_p.and_then(|value| value.total_reviews).unwrap_or(0);
-                let right_reviews = right_p.and_then(|value| value.total_reviews).unwrap_or(0);
-                left_reviews.cmp(&right_reviews)
-            }
-            FeedSort::ReleaseDate => {
-                let left_date = left_p
+            FeedSort::FitIndex => match order {
+                FeedSortOrder::Asc => left
+                    .score
+                    .relevance_score
+                    .total_cmp(&right.score.relevance_score),
+                FeedSortOrder::Desc => right
+                    .score
+                    .relevance_score
+                    .total_cmp(&left.score.relevance_score),
+            },
+            FeedSort::Ccu => compare_optional_missing_last(
+                left_p.and_then(|value| value.typical_ccu_7d.or(value.latest_ccu)),
+                right_p.and_then(|value| value.typical_ccu_7d.or(value.latest_ccu)),
+                order,
+            ),
+            FeedSort::Reviews => compare_optional_missing_last(
+                left_p.and_then(|value| value.total_reviews),
+                right_p.and_then(|value| value.total_reviews),
+                order,
+            ),
+            FeedSort::ReleaseDate => compare_optional_missing_last(
+                left_p
                     .and_then(|value| value.release_date.as_deref())
-                    .unwrap_or("");
-                let right_date = right_p
+                    .filter(|value| !value.is_empty()),
+                right_p
                     .and_then(|value| value.release_date.as_deref())
-                    .unwrap_or("");
-                // Missing dates always sort last regardless of direction.
-                match (left_date.is_empty(), right_date.is_empty()) {
-                    (true, true) => std::cmp::Ordering::Equal,
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    (false, false) => left_date.cmp(right_date),
-                }
-            }
-        };
-        let primary = match order {
-            FeedSortOrder::Asc => primary,
-            FeedSortOrder::Desc => primary.reverse(),
+                    .filter(|value| !value.is_empty()),
+                order,
+            ),
         };
         primary
             .then_with(|| {
@@ -3109,6 +3598,59 @@ fn apply_feed_sort(
     });
 }
 
+/// Select an internal natural-language recall page from the complete ranked
+/// section. Retrieval IDs are considered only when they survived all filtering
+/// and ranking admission; absent (for example hard-filtered) IDs cannot be
+/// materialized by this function. Remaining capacity is filled by strict
+/// relevance so the later cross-section MMR is the only diversity pass that
+/// influences the natural-language response.
+fn select_internal_recall_candidates(
+    mut ranked: Vec<RankedCandidate>,
+    retrieval_ids: &[u32],
+    limit: usize,
+) -> Vec<RankedCandidate> {
+    if ranked.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .score
+            .relevance_score
+            .total_cmp(&left.score.relevance_score)
+            .then_with(|| right.data_confidence.total_cmp(&left.data_confidence))
+            .then_with(|| left.app_id.cmp(&right.app_id))
+    });
+    let fill_order: Vec<u32> = ranked.iter().map(|item| item.app_id).collect();
+    let mut eligible: HashMap<u32, RankedCandidate> =
+        ranked.into_iter().map(|item| (item.app_id, item)).collect();
+    let mut selected = Vec::with_capacity(limit.min(eligible.len()));
+    for app_id in retrieval_ids.iter().chain(fill_order.iter()) {
+        if let Some(item) = eligible.remove(app_id) {
+            selected.push(item);
+            if selected.len() == limit {
+                break;
+            }
+        }
+    }
+    selected
+}
+
+fn compare_optional_missing_last<T: Ord>(
+    left: Option<T>,
+    right: Option<T>,
+    order: FeedSortOrder,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(left), Some(right)) => match order {
+            FeedSortOrder::Asc => left.cmp(&right),
+            FeedSortOrder::Desc => right.cmp(&left),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct NaturalLanguageInterpretation {
     party_size: Option<u8>,
@@ -3117,7 +3659,9 @@ struct NaturalLanguageInterpretation {
     self_hosting_willingness: Option<f64>,
     platforms: Vec<String>,
     demo_only: bool,
-    selected_section: FeedSection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_section: Option<FeedSection>,
+    selected_section_explicit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_price_minor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3128,6 +3672,10 @@ struct NaturalLanguageInterpretation {
     modes_excluded: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hard_constraints: Vec<String>,
+    #[serde(default)]
+    applied_constraints: Vec<String>,
+    #[serde(default)]
+    unapplied_constraints: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     intent_confidence: Option<f64>,
 }
@@ -3203,10 +3751,23 @@ async fn natural_language_recommendations(
     {
         apply_structured_intent(&mut interpreted, &merged);
     }
+    finalize_natural_language_constraints(&mut interpreted);
+
+    // Recall before section pagination. The RRF list is only an admission hint:
+    // each section still applies objective filters, request hard constraints,
+    // negative feedback, and the complete deterministic ranking before a hit is
+    // allowed into the shared pool.
+    let hybrid_hits = if let Some(repo) = state.repo.as_ref() {
+        natural_language_hybrid_hits(&state, repo, &query).await
+    } else {
+        Vec::new()
+    };
+    let retrieval_ids: Vec<u32> = hybrid_hits.iter().map(|hit| hit.app_id).collect();
 
     let feed_query = FeedQuery {
-        // Rank and validate the required Top 20, then truncate the public response.
-        limit: Some(20),
+        // Internal recall may inspect up to 300 admitted games from each fully
+        // ranked section. The cross-section union is capped separately below.
+        limit: Some(NATURAL_LANGUAGE_RECALL_LIMIT as i64),
         page: None,
         cursor: None,
         party_size: interpreted.party_size,
@@ -3214,6 +3775,8 @@ async fn natural_language_recommendations(
         self_hosting_willingness: interpreted.self_hosting_willingness,
         platforms: (!interpreted.platforms.is_empty()).then(|| interpreted.platforms.join(",")),
         languages: None,
+        excluded_modes: (!interpreted.modes_excluded.is_empty())
+            .then(|| interpreted.modes_excluded.join(",")),
         session_minutes_min: None,
         session_minutes_max: interpreted.session_minutes_max,
         max_price_minor: interpreted.max_price_minor,
@@ -3222,91 +3785,81 @@ async fn natural_language_recommendations(
         sort: None,
         order: None,
     };
-    let feed_response = get_feed(
-        State(state.clone()),
-        headers.clone(),
-        Path(interpreted.selected_section.as_str().to_owned()),
-        Query(feed_query),
-    )
-    .await
-    .into_response();
-    if feed_response.status() != StatusCode::OK {
-        return feed_response;
-    }
-
-    let (_, feed_body) = feed_response.into_parts();
-    let bytes = match axum::body::to_bytes(feed_body, 2 * 1024 * 1024).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "failed to assemble recommendation response",
-                None,
-            );
-        }
+    let sections: Vec<FeedSection> = if interpreted.selected_section_explicit {
+        interpreted
+            .selected_section
+            .map_or_else(|| FeedSection::ALL.to_vec(), |section| vec![section])
+    } else {
+        FeedSection::ALL.to_vec()
     };
-    let feed: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(feed) => feed,
-        Err(_) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "failed to decode recommendation response",
-                None,
-            );
-        }
-    };
-    let mut items = feed
-        .get("items")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    // Best-effort hybrid retrieval boost among the deterministic candidate set.
-    if let Some(repo) = state.repo.as_ref() {
-        let _ = storage_result(repo, |repo| {
-            // Ensure demo/local catalogs have retrieval docs without blocking requests on large DBs.
-            if repo.document_count().unwrap_or(0) == 0 {
-                let _ = repo.sync_retrieval_from_catalog(2_000, 0, true);
-            }
-            Ok(())
-        })
+    let mut feed = serde_json::Value::Null;
+    let mut items_by_app = HashMap::<u32, serde_json::Value>::new();
+    for recall_section in sections {
+        let feed_response = get_feed_inner(
+            state.clone(),
+            headers.clone(),
+            recall_section.as_str().to_owned(),
+            feed_query.clone(),
+            false,
+            Some(&retrieval_ids),
+        )
         .await;
-        let query_embedding = if state.embedding.is_available() {
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                state.embedding.embed(&[EmbeddingInput {
-                    id: "nl-query".into(),
-                    text: query.clone(),
-                }]),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .and_then(|mut embeddings| (embeddings.len() == 1).then(|| embeddings.remove(0)))
-        } else {
-            None
+        if feed_response.status() != StatusCode::OK {
+            return feed_response;
+        }
+        let (_, feed_body) = feed_response.into_parts();
+        let bytes = match axum::body::to_bytes(feed_body, 4 * 1024 * 1024).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to assemble recommendation response",
+                    None,
+                );
+            }
         };
-        let query_for_search = query.clone();
-        let search_result = if let Some(embedding) = query_embedding {
-            let provider = state.embedding.name().to_owned();
-            storage_result(repo, move |repo| {
-                repo.hybrid_search_with_vector(
-                    &query_for_search,
-                    &embedding.vector,
-                    &provider,
-                    &embedding.model,
-                    40,
-                )
-            })
-            .await
-        } else {
-            storage_result(repo, move |repo| repo.hybrid_search(&query_for_search, 40)).await
+        let recalled: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to decode recommendation response",
+                    None,
+                );
+            }
         };
-        if let Ok(hits) = search_result {
-            reorder_items_by_hybrid(&mut items, &hits);
+        if feed.is_null() {
+            feed = recalled.clone();
+        }
+        for item in recalled
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(app_id) = item
+                .get("app_id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                continue;
+            };
+            let item_score = json_item_relevance(item);
+            let replace = items_by_app
+                .get(&app_id)
+                .is_none_or(|current| item_score > json_item_relevance(current));
+            if replace {
+                items_by_app.insert(app_id, item.clone());
+            }
         }
     }
+    let mut items = build_natural_language_candidate_pool(
+        items_by_app,
+        &hybrid_hits,
+        NATURAL_LANGUAGE_RECALL_LIMIT,
+    );
     let resolved_ai = match custom_ai {
         Some(custom) => {
             let Some(account_user_id) = account_user_id.as_deref() else {
@@ -3385,7 +3938,57 @@ async fn natural_language_recommendations(
         )
         .await
     };
+    // Section feeds have already been diversified independently. Once their
+    // candidates are unioned and AI has supplied its bounded numeric blend,
+    // rebuild one global baseline and run MMR exactly once for the response.
+    let nl_mmr_lambda = if let Some(repo) = state.repo.as_ref() {
+        storage_result(repo, |repo| repo.active_algorithm_config())
+            .await
+            .map(|config| config.config.mmr_lambda)
+            .unwrap_or_else(|_| RecommendationConfig::default().mmr_lambda)
+    } else {
+        RecommendationConfig::default().mmr_lambda
+    };
+    let nl_tie_seed = state.repo.as_ref().map_or(0, |repo| {
+        let day = mpgs_storage::util::day_utc_from_ms(repo.database().now_ms());
+        recommendation_tie_seed(account_user_id.as_deref(), &day)
+    });
+    global_natural_language_rerank(&mut items, nl_mmr_lambda, nl_tie_seed);
+    let nl_candidate_ids: Vec<u32> = items.iter().map(json_app_id).collect();
     items.truncate(output_limit as usize);
+    strip_internal_ranking_metadata(&mut items);
+    let config_version = feed
+        .get("config_version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let data_updated_at_ms = feed
+        .get("data_updated_at_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let nl_context = hash_structured_context(&interpreted)
+        .unwrap_or_else(|_| "structured-intent-unavailable".to_owned());
+    let nl_section = interpreted
+        .selected_section
+        .map(FeedSection::as_str)
+        .unwrap_or("all");
+    let recommendation_run_id = if let Some(repo) = state.repo.as_ref() {
+        record_recommendation_run(
+            repo,
+            "natural_language",
+            nl_section,
+            &config_version,
+            &nl_context,
+            data_updated_at_ms,
+            0,
+            items.len(),
+            &nl_candidate_ids,
+            &items,
+        )
+        .await
+    } else {
+        None
+    };
     let rank_route = task_router.and_then(|router| router.route_for(AiTaskType::RankExplain));
     let intent_route = task_router.and_then(|router| router.route_for(AiTaskType::IntentParse));
     Json(json!({
@@ -3415,44 +4018,273 @@ async fn natural_language_recommendations(
         "ai_summary": enhance.summary,
         "ai_summary_evidence_ids": enhance.summary_evidence_ids,
         "algorithm_version": feed.get("algorithm_version").cloned().unwrap_or(json!(ALGORITHM_VERSION)),
-        "data_updated_at_ms": feed.get("data_updated_at_ms").cloned().unwrap_or(json!(0)),
+        "config_version": config_version,
+        "recommendation_run_id": recommendation_run_id,
+        "data_updated_at_ms": data_updated_at_ms,
+        "score_semantics": SCORE_SEMANTICS,
     }))
     .into_response()
 }
 
-fn reorder_items_by_hybrid(items: &mut [serde_json::Value], hits: &[mpgs_storage::HybridHit]) {
-    if items.is_empty() || hits.is_empty() {
+async fn natural_language_hybrid_hits(
+    state: &AppState,
+    repo: &Repository,
+    query: &str,
+) -> Vec<HybridHit> {
+    // Catalog indexing is cursor-driven by the scheduler. A request never runs
+    // a partial first-N sync: an unavailable or not-yet-populated index simply
+    // falls back to the deterministic relevance pool below.
+    let query_embedding = if state.embedding.is_available() {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.embedding.embed(&[EmbeddingInput {
+                id: "nl-query".into(),
+                text: query.to_owned(),
+            }]),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|mut embeddings| (embeddings.len() == 1).then(|| embeddings.remove(0)))
+    } else {
+        None
+    };
+    let query_for_search = query.to_owned();
+    let result = if let Some(embedding) = query_embedding {
+        let provider = state.embedding.name().to_owned();
+        storage_result(repo, move |repo| {
+            repo.hybrid_search_with_vector(
+                &query_for_search,
+                &embedding.vector,
+                &provider,
+                &embedding.model,
+                NATURAL_LANGUAGE_RECALL_LIMIT as u32,
+            )
+        })
+        .await
+    } else {
+        storage_result(repo, move |repo| {
+            repo.hybrid_search(&query_for_search, NATURAL_LANGUAGE_RECALL_LIMIT as u32)
+        })
+        .await
+    };
+    match result {
+        Ok(hits) => hits,
+        Err(error) => {
+            tracing::warn!(%error, "natural-language hybrid recall unavailable; using deterministic fallback");
+            Vec::new()
+        }
+    }
+}
+
+/// Form one cross-section pool. RRF hits retain admission priority, but only if
+/// a fully-ranked section emitted them after all filters. Strict relevance fills
+/// the remaining slots deterministically when retrieval is empty or incomplete.
+fn build_natural_language_candidate_pool(
+    mut eligible: HashMap<u32, serde_json::Value>,
+    hits: &[HybridHit],
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    if eligible.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut fill_order: Vec<u32> = eligible.keys().copied().collect();
+    fill_order.sort_by(|left, right| {
+        json_item_relevance(&eligible[right])
+            .total_cmp(&json_item_relevance(&eligible[left]))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut selected = Vec::with_capacity(limit.min(eligible.len()));
+    for hit in hits {
+        let Some(mut item) = eligible.remove(&hit.app_id) else {
+            continue;
+        };
+        if let Some(object) = item.as_object_mut() {
+            object.insert("hybrid_score".into(), json!(hit.score));
+        }
+        selected.push(item);
+        if selected.len() == limit {
+            return selected;
+        }
+    }
+    for app_id in fill_order {
+        let Some(item) = eligible.remove(&app_id) else {
+            continue;
+        };
+        selected.push(item);
+        if selected.len() == limit {
+            break;
+        }
+    }
+    selected
+}
+
+fn json_app_id(item: &serde_json::Value) -> u32 {
+    item.get("app_id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(u32::MAX)
+}
+
+fn json_item_relevance(item: &serde_json::Value) -> f64 {
+    item.pointer("/components/relevance_score")
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| item.get("score").and_then(serde_json::Value::as_f64))
+        .filter(|value| value.is_finite())
+        .unwrap_or(f64::NEG_INFINITY)
+}
+
+fn global_natural_language_rerank(items: &mut Vec<serde_json::Value>, lambda: f64, tie_seed: u64) {
+    if items.is_empty() {
         return;
     }
-    let score_by_id: std::collections::HashMap<u32, f64> =
-        hits.iter().map(|h| (h.app_id, h.score)).collect();
-    items.sort_by(|a, b| {
-        let id_a = a.get("app_id").and_then(|v| v.as_u64()).map(|v| v as u32);
-        let id_b = b.get("app_id").and_then(|v| v.as_u64()).map(|v| v as u32);
-        let ha = id_a
-            .and_then(|id| score_by_id.get(&id).copied())
-            .unwrap_or(0.0);
-        let hb = id_b
-            .and_then(|id| score_by_id.get(&id).copied())
-            .unwrap_or(0.0);
-        match hb.partial_cmp(&ha).unwrap_or(std::cmp::Ordering::Equal) {
-            std::cmp::Ordering::Equal => {
-                let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            other => other,
+    let mut json_by_app = HashMap::with_capacity(items.len());
+    let mut ranked = Vec::with_capacity(items.len());
+    let mut malformed = Vec::new();
+    for item in std::mem::take(items) {
+        let Some(candidate) = ranked_candidate_from_json(&item) else {
+            malformed.push(item);
+            continue;
+        };
+        json_by_app.insert(candidate.app_id, item);
+        ranked.push(candidate);
+    }
+
+    let reranked = mmr_rerank_with_tie_seed(ranked, lambda, 2, tie_seed);
+    let mut ordered = Vec::with_capacity(json_by_app.len() + malformed.len());
+    for candidate in reranked {
+        let Some(mut item) = json_by_app.remove(&candidate.app_id) else {
+            continue;
+        };
+        if let Some(object) = item.as_object_mut() {
+            object.insert(
+                "slot_reason".into(),
+                json!(slot_reason_str(candidate.slot_reason)),
+            );
         }
-    });
-    for item in items.iter_mut() {
-        if let Some(app_id) = item
-            .get("app_id")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            && let Some(score) = score_by_id.get(&app_id)
-            && let Some(obj) = item.as_object_mut()
-        {
-            obj.insert("hybrid_score".into(), json!(score));
+        ordered.push(item);
+    }
+    // Generated feed items are always well-formed. This defensive tail keeps a
+    // malformed internal item from being silently lost if that contract regresses.
+    for mut item in malformed {
+        if let Some(object) = item.as_object_mut() {
+            object
+                .entry("slot_reason".to_owned())
+                .or_insert_with(|| json!("base"));
+        }
+        ordered.push(item);
+    }
+    *items = ordered;
+    refresh_json_ranking_metadata(items);
+}
+
+fn ranked_candidate_from_json(item: &serde_json::Value) -> Option<RankedCandidate> {
+    let app_id = item
+        .get("app_id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())?;
+    let component = |field: &str| {
+        item.pointer(&format!("/components/{field}"))
+            .and_then(serde_json::Value::as_f64)
+    };
+    let relevance_score = json_item_relevance(item);
+    let final_score = item
+        .get("score")
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| component("final_score"))
+        .unwrap_or(relevance_score);
+    let strings = |field: &str| {
+        item.get(field)
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    Some(RankedCandidate {
+        app_id,
+        name: item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        dominant_mode: item
+            .pointer("/multiplayer/dominant_mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        taxonomy_tags: item
+            .pointer("/_ranking_metadata/taxonomy_tags")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        publisher: item
+            .pointer("/_ranking_metadata/publisher")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        series: item
+            .pointer("/_ranking_metadata/series")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        recommended_min: item
+            .pointer("/party/recommended_min")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok()),
+        recommended_max: item
+            .pointer("/party/recommended_max")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok()),
+        data_confidence: item
+            .get("data_confidence")
+            .and_then(serde_json::Value::as_f64)
+            .or_else(|| item.get("confidence").and_then(serde_json::Value::as_f64))
+            .unwrap_or(0.0),
+        score: ScoreBreakdown {
+            friend_fit: component("friend_fit")
+                .or_else(|| item.get("friend_fit").and_then(serde_json::Value::as_f64))
+                .unwrap_or(0.0),
+            section_score: component("section_score").unwrap_or(0.0),
+            personalized_score: component("personalized_score").unwrap_or(0.0),
+            group_fit: component("group_fit").unwrap_or(0.0),
+            mode_fit: component("mode_fit").unwrap_or(0.0),
+            access_fit: component("access_fit").unwrap_or(0.0),
+            hosting_fit: component("hosting_fit").unwrap_or(0.0),
+            session_fit: component("session_fit").unwrap_or(0.0),
+            quality: component("quality").unwrap_or(0.0),
+            activity: component("activity").unwrap_or(0.0),
+            freshness: component("freshness").unwrap_or(0.0),
+            risk: component("risk").unwrap_or(0.0),
+            relevance_score,
+            final_score,
+        },
+        explanation: Explanation {
+            reasons: strings("reasons"),
+            cautions: strings("cautions"),
+            evidence_ids: strings("evidence_ids"),
+        },
+        slot_reason: SlotReason::Base,
+        algorithm_version: item
+            .get("algorithm_version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(ALGORITHM_VERSION)
+            .to_owned(),
+    })
+}
+
+fn strip_internal_ranking_metadata(items: &mut [serde_json::Value]) {
+    for item in items {
+        if let Some(object) = item.as_object_mut() {
+            object.remove("_ranking_metadata");
         }
     }
 }
@@ -3841,7 +4673,7 @@ async fn enhance_natural_language_with_ai(
     repo: Option<&Repository>,
     cache_scope: &str,
     query: &str,
-    items: &mut Vec<serde_json::Value>,
+    items: &mut [serde_json::Value],
     admission: Option<&AiCallAdmission>,
 ) -> AiEnhanceOutcome {
     const AI_MAX_RECOMMENDATIONS: usize = 8;
@@ -4144,28 +4976,42 @@ fn validate_rank_result_with_safe_degradation(
     }
 }
 
-fn apply_validated_ai_rank(items: &mut Vec<serde_json::Value>, validated: &mpgs_ai::AiRankResult) {
-    let mut by_id: std::collections::HashMap<u32, serde_json::Value> = items
-        .drain(..)
-        .filter_map(|item| {
-            let app_id = item
-                .get("app_id")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32)?;
-            Some((app_id, item))
+fn apply_validated_ai_rank(items: &mut [serde_json::Value], validated: &mpgs_ai::AiRankResult) {
+    let ai_by_id: HashMap<_, _> = validated
+        .recommendations
+        .iter()
+        .map(|item| (item.app_id, item))
+        .collect();
+    let original_positions: HashMap<u32, usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(position, item)| {
+            item.get("app_id")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .map(|app_id| (app_id, position))
         })
         .collect();
 
-    let mut reordered = Vec::new();
-    for ai_item in &validated.recommendations {
-        let Some(mut item) = by_id.remove(&ai_item.app_id) else {
+    // AI output is a set of bounded numeric adjustments, never an authoritative
+    // ordering. Mutating the existing set in place also guarantees an AI response
+    // cannot add, restore, or accidentally drop a deterministic candidate.
+    for item in items.iter_mut() {
+        let Some(app_id) = item
+            .get("app_id")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            continue;
+        };
+        let Some(ai_item) = ai_by_id.get(&app_id) else {
             continue;
         };
         let base = item
             .get("components")
-            .and_then(|c| c.get("personalized_score"))
-            .and_then(|v| v.as_f64())
-            .or_else(|| item.get("score").and_then(|v| v.as_f64()))
+            .and_then(|components| components.get("relevance_score"))
+            .and_then(|value| value.as_f64())
+            .or_else(|| item.get("score").and_then(|value| value.as_f64()))
             .unwrap_or(0.0);
         let blended = blend_ai(
             base,
@@ -4192,20 +5038,106 @@ fn apply_validated_ai_rank(items: &mut Vec<serde_json::Value>, validated: &mpgs_
                 }
                 obj.insert("cautions".into(), json!(cautions));
             }
+            if !ai_item.reason_evidence_ids.is_empty() {
+                for field in ["evidence_ids", "reason_evidence"] {
+                    let mut evidence = obj
+                        .get(field)
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for evidence_id in &ai_item.reason_evidence_ids {
+                        if !evidence
+                            .iter()
+                            .any(|value| value.as_str() == Some(evidence_id.as_str()))
+                        {
+                            evidence.push(json!(evidence_id));
+                        }
+                    }
+                    obj.insert(field.into(), json!(evidence));
+                }
+            }
             if let Some(components) = obj.get_mut("components").and_then(|v| v.as_object_mut()) {
+                components.insert("relevance_score".into(), json!(blended));
                 components.insert("final_score".into(), json!(blended));
             }
         }
-        reordered.push(item);
     }
-    let mut rest: Vec<_> = by_id.into_values().collect();
-    rest.sort_by(|a, b| {
-        let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+
+    items.sort_by(|left, right| {
+        let left_score = left
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(f64::NEG_INFINITY);
+        let right_score = right
+            .get("score")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(f64::NEG_INFINITY);
+        let left_id = left
+            .get("app_id")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok());
+        let right_id = right
+            .get("app_id")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok());
+        right_score
+            .total_cmp(&left_score)
+            .then_with(|| {
+                left_id
+                    .and_then(|id| original_positions.get(&id).copied())
+                    .unwrap_or(usize::MAX)
+                    .cmp(
+                        &right_id
+                            .and_then(|id| original_positions.get(&id).copied())
+                            .unwrap_or(usize::MAX),
+                    )
+            })
+            .then_with(|| left_id.cmp(&right_id))
     });
-    reordered.extend(rest);
-    *items = reordered;
+    refresh_json_ranking_metadata(items);
+}
+
+fn refresh_json_ranking_metadata(items: &mut [serde_json::Value]) {
+    let indices = context_percentile_indices(items.iter().filter_map(|item| {
+        Some((
+            item.get("app_id")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u32::try_from(value).ok())?,
+            item.get("components")
+                .and_then(|components| components.get("relevance_score"))
+                .and_then(|value| value.as_f64())
+                .or_else(|| item.get("score").and_then(|value| value.as_f64()))?,
+        ))
+    }));
+    for (position, item) in items.iter_mut().enumerate() {
+        let app_id = item
+            .get("app_id")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok());
+        let had_visible_index = item
+            .get("recommendation_index")
+            .is_some_and(|value| !value.is_null());
+        let data_confidence = item
+            .get("data_confidence")
+            .and_then(|value| value.as_f64())
+            .or_else(|| item.get("confidence").and_then(|value| value.as_f64()))
+            .unwrap_or(0.0);
+        let recommendation_index = app_id
+            .filter(|_| had_visible_index && data_confidence >= MIN_INDEX_DATA_CONFIDENCE)
+            .and_then(|id| indices.get(&id).copied());
+        if let Some(object) = item.as_object_mut() {
+            object.insert("rank".into(), json!(position + 1));
+            object.insert("recommendation_index".into(), json!(recommendation_index));
+            object.insert("fit_band".into(), json!(fit_band(recommendation_index)));
+            object
+                .entry("slot_reason".to_owned())
+                .or_insert_with(|| json!("base"));
+            object.insert(
+                "score_calibration_version".into(),
+                json!(SCORE_CALIBRATION_VERSION),
+            );
+        }
+    }
 }
 
 fn ai_route_cache_identity(
@@ -5343,19 +6275,68 @@ fn interpret_natural_language(query: &str) -> NaturalLanguageInterpretation {
         platforms.push("linux".to_owned());
     }
     let demo_only = contains_any(&normalized, &["demo", "试玩", "playtest", "测试版"]);
-    let selected_section =
-        if contains_any(&normalized, &["即将", "未发售", "coming soon"]) || demo_only {
-            FeedSection::Upcoming
-        } else if contains_any(
-            &normalized,
-            &["经典", "老游戏", "反复刷", "耐玩", "replayable"],
-        ) {
-            FeedSection::ClassicLegacy
-        } else if contains_any(&normalized, &["热门", "人多", "popular"]) {
-            FeedSection::PopularLegacy
-        } else {
-            FeedSection::RecentRelease
-        };
+    let upcoming_explicit =
+        contains_any(&normalized, &["即将", "未发售", "coming soon"]) || demo_only;
+    let classic_explicit = contains_any(
+        &normalized,
+        &["经典", "老游戏", "反复刷", "耐玩", "replayable"],
+    );
+    let popular_explicit = contains_any(&normalized, &["热门", "人多", "popular"]);
+    let detected_section = if upcoming_explicit {
+        FeedSection::Upcoming
+    } else if classic_explicit {
+        FeedSection::ClassicLegacy
+    } else if popular_explicit {
+        FeedSection::PopularLegacy
+    } else {
+        FeedSection::RecentRelease
+    };
+    let mut modes_preferred = Vec::new();
+    if contains_any(&normalized, &["合作", "coop", "co-op", "co op"]) {
+        modes_preferred.push("private_coop".to_owned());
+    }
+    if contains_any(&normalized, &["竞技", "排位", "competitive", "ranked"])
+        && coop_competitive.is_some_and(|value| value >= 0.65)
+    {
+        modes_preferred.push("matchmade_pvp".to_owned());
+    }
+    if self_hosting_willingness.is_some() {
+        modes_preferred.push("self_hosted".to_owned());
+    }
+    let mut modes_excluded = Vec::new();
+    if contains_any(
+        &normalized,
+        &[
+            "不要pvp",
+            "不要 pvp",
+            "不玩pvp",
+            "不玩 pvp",
+            "排除竞技",
+            "拒绝竞技",
+            "no pvp",
+        ],
+    ) {
+        modes_excluded.push("matchmade_pvp".to_owned());
+    }
+    let mut hard_constraints = Vec::new();
+    if party_size.is_some() {
+        hard_constraints.push("party_size".to_owned());
+    }
+    if session_minutes_max.is_some() {
+        hard_constraints.push("session_minutes".to_owned());
+    }
+    if !platforms.is_empty() {
+        hard_constraints.push("platforms".to_owned());
+    }
+    if demo_only {
+        hard_constraints.push("demo_required".to_owned());
+    }
+    if self_hosting_willingness.is_some() {
+        hard_constraints.push("self_hosting".to_owned());
+    }
+    if !modes_excluded.is_empty() {
+        hard_constraints.push("modes_excluded".to_owned());
+    }
     NaturalLanguageInterpretation {
         party_size,
         session_minutes_max,
@@ -5363,12 +6344,16 @@ fn interpret_natural_language(query: &str) -> NaturalLanguageInterpretation {
         self_hosting_willingness,
         platforms,
         demo_only,
-        selected_section,
+        selected_section: (upcoming_explicit || classic_explicit || popular_explicit)
+            .then_some(detected_section),
+        selected_section_explicit: upcoming_explicit || classic_explicit || popular_explicit,
         max_price_minor: None,
         currency: None,
-        modes_preferred: Vec::new(),
-        modes_excluded: Vec::new(),
-        hard_constraints: Vec::new(),
+        modes_preferred,
+        modes_excluded,
+        hard_constraints,
+        applied_constraints: Vec::new(),
+        unapplied_constraints: Vec::new(),
         intent_confidence: None,
     }
 }
@@ -5446,11 +6431,144 @@ fn apply_structured_intent(
     }
     if intent.demo_required == Some(true) {
         interpreted.demo_only = true;
+        interpreted.selected_section = Some(FeedSection::Upcoming);
+        interpreted.selected_section_explicit = true;
     }
     interpreted.modes_preferred = intent.modes_preferred.clone();
     interpreted.modes_excluded = intent.modes_excluded.clone();
     interpreted.hard_constraints = intent.hard_constraints.clone();
     interpreted.intent_confidence = Some(intent.confidence);
+}
+
+/// Normalize parsed mode aliases and report which structured dimensions the
+/// deterministic feed can actually honor. Keeping this accounting next to the
+/// query translation prevents the UI from presenting an inferred field as an
+/// enforced filter when the current ranker only has a soft approximation.
+fn finalize_natural_language_constraints(interpreted: &mut NaturalLanguageInterpretation) {
+    interpreted.applied_constraints.clear();
+    interpreted.unapplied_constraints.clear();
+
+    if interpreted.party_size.is_some() {
+        push_hard(&mut interpreted.applied_constraints, "party_size");
+    }
+    if interpreted.session_minutes_max.is_some() {
+        push_hard(&mut interpreted.applied_constraints, "session_minutes");
+    }
+    if !interpreted.platforms.is_empty() {
+        push_hard(&mut interpreted.applied_constraints, "platforms");
+    }
+    if interpreted.max_price_minor.is_some() {
+        push_hard(&mut interpreted.applied_constraints, "budget");
+    }
+    if interpreted.demo_only {
+        push_hard(&mut interpreted.applied_constraints, "demo_required");
+    }
+    if interpreted.selected_section_explicit {
+        push_hard(&mut interpreted.applied_constraints, "selected_section");
+    }
+    if interpreted.coop_competitive.is_some() {
+        push_hard(&mut interpreted.applied_constraints, "coop_competitive");
+    }
+    if interpreted.self_hosting_willingness.is_some() {
+        push_hard(
+            &mut interpreted.applied_constraints,
+            "self_hosting_preference",
+        );
+    }
+
+    let mut normalized_preferred = Vec::new();
+    let mut prefers_coop = false;
+    let mut prefers_pvp = false;
+    let mut prefers_self_hosting = false;
+    for raw in std::mem::take(&mut interpreted.modes_preferred) {
+        let family = ModeFamily::from_alias(&raw);
+        if family == ModeFamily::Unknown {
+            push_hard(
+                &mut interpreted.unapplied_constraints,
+                &format!("modes_preferred:{raw}"),
+            );
+            normalized_preferred.push(raw);
+            continue;
+        }
+        push_hard(&mut normalized_preferred, family.as_str());
+        match family {
+            ModeFamily::PrivateCoop => prefers_coop = true,
+            ModeFamily::MatchmadePvp => prefers_pvp = true,
+            ModeFamily::SelfHosted => prefers_self_hosting = true,
+            ModeFamily::PublicWorld | ModeFamily::Mixed | ModeFamily::GenericMultiplayer => {
+                push_hard(
+                    &mut interpreted.unapplied_constraints,
+                    &format!("modes_preferred:{}", family.as_str()),
+                );
+            }
+            ModeFamily::Unknown => unreachable!("handled above"),
+        }
+    }
+    interpreted.modes_preferred = normalized_preferred;
+    if prefers_coop && prefers_pvp {
+        push_hard(
+            &mut interpreted.unapplied_constraints,
+            "modes_preferred:coop_and_pvp",
+        );
+    } else if prefers_coop {
+        interpreted.coop_competitive = Some(0.1);
+        push_hard(&mut interpreted.applied_constraints, "modes_preferred");
+    } else if prefers_pvp {
+        interpreted.coop_competitive = Some(0.85);
+        push_hard(&mut interpreted.applied_constraints, "modes_preferred");
+    }
+    if prefers_self_hosting {
+        interpreted.self_hosting_willingness = Some(1.0);
+        push_hard(&mut interpreted.applied_constraints, "modes_preferred");
+    }
+
+    let mut normalized_excluded = Vec::new();
+    for raw in std::mem::take(&mut interpreted.modes_excluded) {
+        let family = ModeFamily::from_alias(&raw);
+        if family == ModeFamily::Unknown {
+            push_hard(
+                &mut interpreted.unapplied_constraints,
+                &format!("modes_excluded:{raw}"),
+            );
+            continue;
+        }
+        push_hard(&mut normalized_excluded, family.as_str());
+    }
+    interpreted.modes_excluded = normalized_excluded;
+    if !interpreted.modes_excluded.is_empty() {
+        push_hard(&mut interpreted.applied_constraints, "modes_excluded");
+    }
+
+    // Hosting willingness is represented by a scoring signal today, but there
+    // is no objective self-hosting hard-filter dimension in HardConstraints.
+    if interpreted
+        .hard_constraints
+        .iter()
+        .any(|field| field == "self_hosting")
+    {
+        push_hard(
+            &mut interpreted.unapplied_constraints,
+            "self_hosting_hard_filter",
+        );
+    }
+    for field in interpreted.hard_constraints.clone() {
+        let represented = matches!(
+            field.as_str(),
+            "party_size"
+                | "platforms"
+                | "budget"
+                | "session_minutes"
+                | "demo_required"
+                | "modes_excluded"
+                | "self_hosting"
+        );
+        if !represented {
+            push_hard(
+                &mut interpreted.unapplied_constraints,
+                &format!("hard_constraint:{field}"),
+            );
+        }
+    }
 }
 
 fn push_hard(list: &mut Vec<String>, field: &str) {
@@ -5799,7 +6917,8 @@ async fn search_games(
                     "release_state": g.release_state,
                     "release_date": g.release_date,
                 })).collect::<Vec<_>>(),
-                "algorithm_version": active_config.version,
+                "algorithm_version": ALGORITHM_VERSION,
+                "config_version": active_config.version,
             });
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -5930,7 +7049,8 @@ async fn get_game(
                     "price_currency": game.price_currency,
                     "has_demo": game.has_demo,
                 },
-                "algorithm_version": active_config.version,
+                "algorithm_version": ALGORITHM_VERSION,
+                "config_version": active_config.version,
                 "data_updated_at_ms": data_updated_at_ms,
             });
             (StatusCode::OK, [(header::ETAG, etag)], Json(body)).into_response()
@@ -6063,9 +7183,30 @@ async fn get_evidence(
                     Err(error) => return map_storage_error(error, None),
                 };
             for (feature, value) in [
-                ("private_session", game.private_session),
-                ("self_hosted_server", game.self_hosted_server),
-                ("online_coop", game.online_coop),
+                (
+                    "private_session",
+                    game.private_session.map(serde_json::Value::from),
+                ),
+                (
+                    "self_hosted_server",
+                    game.self_hosted_server.map(serde_json::Value::from),
+                ),
+                ("online_coop", game.online_coop.map(serde_json::Value::from)),
+                (
+                    "matchmaking_core",
+                    game.resolved_matchmaking_core()
+                        .map(serde_json::Value::from),
+                ),
+                (
+                    "public_world_dependency",
+                    game.resolved_public_world_dependency()
+                        .map(serde_json::Value::from),
+                ),
+                (
+                    "service_shutdown_risk",
+                    game.resolved_service_shutdown_risk()
+                        .map(serde_json::Value::from),
+                ),
             ] {
                 let requested = query.feature.as_deref().is_none_or(|name| name == feature);
                 if requested
@@ -6110,6 +7251,132 @@ async fn get_evidence(
         }
         Err(error) => map_storage_error(error, None),
     }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct RecommendationEventBody {
+    recommendation_run_id: String,
+    app_id: u32,
+    event_type: String,
+    client_created_at_ms: Option<i64>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/recommendation-events",
+    request_body = RecommendationEventBody,
+    params(("Idempotency-Key" = String, Header, description = "Client-generated idempotency key")),
+    responses(
+        (status = 201, body = RecommendationEventResponseSchema),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+        (status = 409, body = ErrorBody)
+    ),
+    tag = "recommendations"
+)]
+async fn post_recommendation_event(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<RecommendationEventBody>,
+) -> impl IntoResponse {
+    let Some(repo) = require_repo(&state) else {
+        return storage_disabled();
+    };
+    let Some((event_type, event_category)) = public_recommendation_event(&body.event_type) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "event_type must be one of exposure, detail_open, steam_click, or play_intent",
+            None,
+        );
+    };
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 128)
+    else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Idempotency-Key header must contain between 1 and 128 bytes",
+            None,
+        );
+    };
+    if body.recommendation_run_id.trim().is_empty() || body.recommendation_run_id.len() > 128 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "recommendation_run_id must contain between 1 and 128 bytes",
+            None,
+        );
+    }
+
+    let recommendation_run_id = body.recommendation_run_id;
+    let app_id = body.app_id;
+    let attribution_run_id = recommendation_run_id.clone();
+    match storage_result(repo, move |repo| {
+        repo.recommendation_item_attribution(&attribution_run_id, app_id)
+    })
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "recommendation_run_id does not contain this app",
+                None,
+            );
+        }
+        Err(error) => return map_storage_error(error, None),
+    }
+
+    let event = InsertRecommendationEvent {
+        recommendation_run_id,
+        app_id,
+        event_type: event_type.to_owned(),
+        idempotency_key,
+        client_created_at_ms: body.client_created_at_ms,
+        metadata: json!({
+            "schema_version": 1,
+            "event_category": event_category,
+            "source": "public_recommendation_event_api",
+        }),
+    };
+    match storage_result(repo, move |repo| repo.insert_recommendation_event(&event)).await {
+        Ok(record) => (
+            StatusCode::CREATED,
+            Json(recommendation_event_json(&record)),
+        )
+            .into_response(),
+        Err(error) => map_storage_error(error, None),
+    }
+}
+
+fn public_recommendation_event(event_type: &str) -> Option<(&'static str, &'static str)> {
+    match event_type {
+        "exposure" => Some(("exposure", "impression")),
+        "detail_open" => Some(("detail_open", "engagement")),
+        "steam_click" => Some(("steam_click", "outbound")),
+        "play_intent" => Some(("play_intent", "intent")),
+        _ => None,
+    }
+}
+
+fn recommendation_event_json(
+    record: &mpgs_storage::RecommendationEventRecord,
+) -> serde_json::Value {
+    json!({
+        "recommendation_event_id": record.recommendation_event_id,
+        "recommendation_run_id": record.recommendation_run_id,
+        "app_id": record.app_id,
+        "event_type": record.event_type,
+        "client_created_at_ms": record.client_created_at_ms,
+        "metadata": record.metadata,
+        "created_at_ms": record.created_at_ms,
+    })
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -6167,19 +7434,61 @@ async fn post_feedback(
             None,
         );
     };
+    let app_id = body.app_id;
+    let recommendation_run_id = body.recommendation_run_id.clone();
+    let client_created_at_ms = body.client_created_at_ms;
+    if let Some(run_id) = recommendation_run_id.as_ref() {
+        let run_id = run_id.clone();
+        match storage_result(repo, move |repo| {
+            repo.recommendation_item_attribution(&run_id, app_id)
+        })
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "recommendation_run_id does not contain this app",
+                    None,
+                );
+            }
+            Err(error) => return map_storage_error(error, None),
+        }
+    }
+    let feedback_user_id = user_id.clone();
+    let feedback_run_id = recommendation_run_id.clone();
+    let feedback_idem = idem.clone();
     match storage_result(repo, move |repo| {
         repo.create_feedback(
-            &user_id,
-            body.app_id,
+            &feedback_user_id,
+            app_id,
             feedback_type,
-            body.recommendation_run_id.as_deref(),
-            &idem,
-            body.client_created_at_ms,
+            feedback_run_id.as_deref(),
+            &feedback_idem,
+            client_created_at_ms,
         )
     })
     .await
     {
-        Ok(record) => (StatusCode::CREATED, Json(record_json(&record))).into_response(),
+        Ok(record) => {
+            if let Some(run_id) = recommendation_run_id {
+                let event = InsertRecommendationEvent {
+                    recommendation_run_id: run_id,
+                    app_id,
+                    event_type: feedback_type.as_str().to_owned(),
+                    idempotency_key: idem,
+                    client_created_at_ms,
+                    metadata: json!({ "feedback_type": feedback_type.as_str() }),
+                };
+                if let Err(error) =
+                    storage_result(repo, move |repo| repo.insert_recommendation_event(&event)).await
+                {
+                    tracing::warn!(%error, app_id, "failed to persist attributed feedback event");
+                }
+            }
+            (StatusCode::CREATED, Json(record_json(&record))).into_response()
+        }
         Err(error) => map_storage_error(error, None),
     }
 }
@@ -6768,6 +8077,9 @@ fn apply_feed_overrides(
     if let Some(languages) = query.languages.as_deref() {
         prefs.languages = parse_csv_filter("languages", languages)?;
     }
+    if let Some(excluded_modes) = query.excluded_modes.as_deref() {
+        prefs.excluded_modes = parse_csv_filter("excluded_modes", excluded_modes)?;
+    }
     if let Some(value) = query.session_minutes_min {
         prefs.session_minutes_min = value;
     }
@@ -6788,6 +8100,19 @@ fn apply_feed_overrides(
             None,
         ))
     })
+}
+
+fn hard_constraints_from_feed_query(query: &FeedQuery) -> HardConstraints {
+    HardConstraints {
+        modes: query.excluded_modes.is_some()
+            || query.coop_competitive.is_some()
+            || query.self_hosting_willingness.is_some(),
+        party_size: query.party_size.is_some(),
+        platforms: query.platforms.is_some(),
+        languages: query.languages.is_some(),
+        session_length: query.session_minutes_min.is_some() || query.session_minutes_max.is_some(),
+        budget: query.max_price_minor.is_some() || query.currency.is_some(),
+    }
 }
 
 fn parse_csv_filter(name: &str, value: &str) -> Result<Vec<String>, Box<Response>> {
@@ -6820,6 +8145,16 @@ fn hash64(payload: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+/// Derive ranking entropy without returning, logging, or persisting the raw
+/// account identifier. The UTC day is part of both the seed and feed context,
+/// so cursors/ETags cannot silently reuse yesterday's exact-tie ordering.
+fn recommendation_tie_seed(user_id: Option<&str>, utc_day: &str) -> u64 {
+    hash64(&format!(
+        "recommendation-tie-v1|{}|{utc_day}",
+        user_id.unwrap_or("public")
+    ))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -6946,6 +8281,43 @@ mod tests {
         }
     }
 
+    fn recall_candidate(app_id: u32, relevance_score: f64) -> RankedCandidate {
+        RankedCandidate {
+            app_id,
+            name: format!("game-{app_id}"),
+            dominant_mode: Some("private_coop".into()),
+            taxonomy_tags: vec!["coop".into()],
+            publisher: None,
+            series: None,
+            recommended_min: Some(1),
+            recommended_max: Some(4),
+            data_confidence: 0.8,
+            score: ScoreBreakdown {
+                friend_fit: 0.5,
+                section_score: relevance_score,
+                personalized_score: relevance_score,
+                group_fit: 0.5,
+                mode_fit: 0.5,
+                access_fit: 0.5,
+                hosting_fit: 0.5,
+                session_fit: 0.5,
+                quality: 0.5,
+                activity: 0.5,
+                freshness: 0.5,
+                risk: 0.0,
+                relevance_score,
+                final_score: relevance_score.clamp(0.0, 1.0),
+            },
+            explanation: Explanation {
+                reasons: Vec::new(),
+                cautions: Vec::new(),
+                evidence_ids: Vec::new(),
+            },
+            slot_reason: SlotReason::Base,
+            algorithm_version: ALGORITHM_VERSION.into(),
+        }
+    }
+
     fn test_router_with_rank_models(primary: &str, fallbacks: &[&str]) -> TaskRouter {
         let mut routes = mpgs_ai::default_task_routes();
         let route = routes
@@ -7016,7 +8388,7 @@ mod tests {
             base,
             feed_result_context("prefs", FeedSort::Ccu, FeedSortOrder::Desc, false)
         );
-        assert_ne!(
+        assert_eq!(
             base,
             feed_result_context("prefs", FeedSort::Recommended, FeedSortOrder::Asc, false)
         );
@@ -7027,9 +8399,450 @@ mod tests {
     }
 
     #[test]
+    fn generic_natural_language_recall_is_not_pinned_to_recent() {
+        let generic = interpret_natural_language("四人合作，单局一小时以内，不要太竞技");
+        assert_eq!(generic.selected_section, None);
+        assert!(!generic.selected_section_explicit);
+
+        let classic = interpret_natural_language("想找四人耐玩的经典老游戏");
+        assert_eq!(classic.selected_section, Some(FeedSection::ClassicLegacy));
+        assert!(classic.selected_section_explicit);
+
+        let upcoming = interpret_natural_language("想玩即将发售的多人 demo");
+        assert_eq!(upcoming.selected_section, Some(FeedSection::Upcoming));
+        assert!(upcoming.selected_section_explicit);
+    }
+
+    #[test]
+    fn natural_language_constraints_report_what_is_really_applied() {
+        let mut interpreted = interpret_natural_language("四人合作，不要 pvp，想要自建服 demo");
+        finalize_natural_language_constraints(&mut interpreted);
+
+        assert_eq!(interpreted.party_size, Some(4));
+        assert!(interpreted.demo_only);
+        assert!(
+            interpreted
+                .modes_preferred
+                .iter()
+                .any(|mode| mode == "private_coop")
+        );
+        assert!(
+            interpreted
+                .modes_excluded
+                .iter()
+                .any(|mode| mode == "matchmade_pvp")
+        );
+        assert!(
+            interpreted
+                .applied_constraints
+                .iter()
+                .any(|field| field == "modes_excluded")
+        );
+        assert!(
+            interpreted
+                .unapplied_constraints
+                .iter()
+                .any(|field| field == "self_hosting_hard_filter")
+        );
+    }
+
+    #[test]
+    fn rrf_hit_beyond_the_old_top_75_is_admitted_from_the_full_ranked_section() {
+        let ranked = (1..=100)
+            .map(|app_id| recall_candidate(app_id, 1.0 - f64::from(app_id) / 1_000.0))
+            .collect();
+
+        let selected = select_internal_recall_candidates(ranked, &[100], 75);
+        let ids: Vec<u32> = selected.iter().map(|item| item.app_id).collect();
+
+        assert_eq!(selected.len(), 75);
+        assert_eq!(
+            ids[0], 100,
+            "RRF admission must happen before page truncation"
+        );
+        assert!(ids.contains(&1), "relevance still fills remaining capacity");
+
+        let eligible = selected
+            .into_iter()
+            .map(|item| {
+                let app_id = item.app_id;
+                (
+                    app_id,
+                    json!({
+                        "app_id": app_id,
+                        "score": item.score.final_score,
+                        "components": {"relevance_score": item.score.relevance_score},
+                    }),
+                )
+            })
+            .collect();
+        let hit = HybridHit {
+            app_id: 100,
+            score: 1.0 / 61.0,
+            fts_rank: Some(1.0),
+            vector_score: None,
+        };
+        let union = build_natural_language_candidate_pool(eligible, &[hit], 75);
+        assert_eq!(json_app_id(&union[0]), 100);
+        assert!(union[0].get("hybrid_score").is_some());
+    }
+
+    #[test]
+    fn retrieval_cannot_revive_an_id_absent_after_hard_filters() {
+        // `999` represents a game removed before ranking by an objective/request
+        // hard filter or negative feedback. It is deliberately absent here.
+        let ranked = vec![recall_candidate(1, 0.9), recall_candidate(2, 0.8)];
+        let selected = select_internal_recall_candidates(ranked, &[999, 2], 2);
+        let ids: Vec<u32> = selected.iter().map(|item| item.app_id).collect();
+
+        assert_eq!(ids, vec![2, 1]);
+        assert!(!ids.contains(&999));
+
+        let eligible = selected
+            .into_iter()
+            .map(|item| {
+                let app_id = item.app_id;
+                (
+                    app_id,
+                    json!({
+                        "app_id": app_id,
+                        "score": item.score.final_score,
+                        "components": {"relevance_score": item.score.relevance_score},
+                    }),
+                )
+            })
+            .collect();
+        let hits = vec![
+            HybridHit {
+                app_id: 999,
+                score: 1.0,
+                fts_rank: Some(1.0),
+                vector_score: None,
+            },
+            HybridHit {
+                app_id: 2,
+                score: 0.9,
+                fts_rank: Some(0.9),
+                vector_score: None,
+            },
+        ];
+        let union = build_natural_language_candidate_pool(eligible, &hits, 2);
+        assert_eq!(
+            union.iter().map(json_app_id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn natural_language_global_mmr_is_stable_and_preserves_honest_slot_reasons() {
+        let item = |app_id: u32, score: f64, mode: &str, tags: &[&str]| {
+            json!({
+                "app_id": app_id,
+                "name": format!("game-{app_id}"),
+                "score": score,
+                "confidence": 0.8,
+                "data_confidence": 0.8,
+                "recommendation_index": 80,
+                "party": {"recommended_min": 1, "recommended_max": 4},
+                "multiplayer": {"dominant_mode": mode},
+                "components": {
+                    "friend_fit": 0.8,
+                    "section_score": score,
+                    "personalized_score": score,
+                    "relevance_score": score,
+                    "final_score": score,
+                },
+                "reasons": [],
+                "cautions": [],
+                "evidence_ids": [],
+                "algorithm_version": ALGORITHM_VERSION,
+                "_ranking_metadata": {
+                    "taxonomy_tags": tags,
+                    "publisher": null,
+                    "series": null,
+                },
+            })
+        };
+        let original = vec![
+            item(2, 0.99, "private_coop", &["action", "coop"]),
+            item(3, 0.98, "matchmade_pvp", &["strategy", "pvp"]),
+            item(1, 1.0, "private_coop", &["action", "coop"]),
+        ];
+        let mut forward = original.clone();
+        let mut reverse = original.into_iter().rev().collect();
+
+        global_natural_language_rerank(&mut forward, 0.5, 123);
+        global_natural_language_rerank(&mut reverse, 0.5, 123);
+
+        let ids = |items: &[serde_json::Value]| items.iter().map(json_app_id).collect::<Vec<_>>();
+        assert_eq!(ids(&forward), vec![1, 3, 2]);
+        assert_eq!(ids(&forward), ids(&reverse));
+        assert_eq!(forward[0]["slot_reason"], "base");
+        assert_eq!(forward[1]["slot_reason"], "diversity");
+        assert_eq!(forward[0]["rank"], 1);
+        assert_eq!(forward[1]["rank"], 2);
+        assert_eq!(forward[2]["rank"], 3);
+    }
+
+    #[test]
+    fn recommendation_tie_seed_is_stable_per_user_day_and_rotates_context() {
+        let seed = recommendation_tie_seed(Some("account-a"), "2026-08-02");
+        assert_eq!(
+            seed,
+            recommendation_tie_seed(Some("account-a"), "2026-08-02")
+        );
+        assert_ne!(
+            seed,
+            recommendation_tie_seed(Some("account-a"), "2026-08-03")
+        );
+        assert_ne!(
+            seed,
+            recommendation_tie_seed(Some("account-b"), "2026-08-02")
+        );
+        assert_eq!(
+            recommendation_tie_seed(None, "2026-08-02"),
+            recommendation_tie_seed(Some("public"), "2026-08-02")
+        );
+    }
+
+    #[test]
+    fn recommended_order_is_ignored_but_scalar_sort_order_is_validated() {
+        assert_eq!(
+            FeedSortOrder::parse(Some("asc"), FeedSort::Recommended),
+            Ok(FeedSortOrder::Desc)
+        );
+        assert_eq!(
+            FeedSortOrder::parse(Some("not-an-order"), FeedSort::Recommended),
+            Ok(FeedSortOrder::Desc)
+        );
+        assert_eq!(
+            FeedSortOrder::parse(Some("asc"), FeedSort::Ccu),
+            Ok(FeedSortOrder::Asc)
+        );
+        assert_eq!(
+            FeedSortOrder::parse(Some("invalid"), FeedSort::Ccu),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn fit_index_is_a_strict_scalar_sort_with_aliases_and_direction() {
+        assert_eq!(FeedSort::parse(Some("fit_index")), Ok(FeedSort::FitIndex));
+        assert_eq!(FeedSort::parse(Some("relevance")), Ok(FeedSort::FitIndex));
+        assert_eq!(FeedSort::parse(Some("fit")), Ok(FeedSort::FitIndex));
+        assert_eq!(
+            FeedSortOrder::parse(None, FeedSort::FitIndex),
+            Ok(FeedSortOrder::Desc)
+        );
+
+        let presentation = HashMap::new();
+        let original = vec![
+            recall_candidate(1, 0.2),
+            recall_candidate(2, 0.9),
+            recall_candidate(3, 0.5),
+        ];
+        let mut descending = original.clone();
+        apply_feed_sort(
+            &mut descending,
+            FeedSort::FitIndex,
+            FeedSortOrder::Desc,
+            &presentation,
+        );
+        assert_eq!(
+            descending
+                .iter()
+                .map(|item| item.app_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+
+        let mut ascending = original;
+        apply_feed_sort(
+            &mut ascending,
+            FeedSort::FitIndex,
+            FeedSortOrder::Asc,
+            &presentation,
+        );
+        assert_eq!(
+            ascending.iter().map(|item| item.app_id).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+    }
+
+    #[test]
+    fn optional_feed_sort_values_are_missing_last_in_both_directions() {
+        use std::cmp::Ordering::{Greater, Less};
+
+        assert_eq!(
+            compare_optional_missing_last(None, Some(1_u32), FeedSortOrder::Asc),
+            Greater
+        );
+        assert_eq!(
+            compare_optional_missing_last(None, Some(1_u32), FeedSortOrder::Desc),
+            Greater
+        );
+        assert_eq!(
+            compare_optional_missing_last(Some(1_u32), Some(2), FeedSortOrder::Asc),
+            Less
+        );
+        assert_eq!(
+            compare_optional_missing_last(Some(1_u32), Some(2), FeedSortOrder::Desc),
+            Greater
+        );
+    }
+
+    #[test]
+    fn context_percentile_uses_midrank_for_exact_ties() {
+        let mut scores = vec![(1, 0.9), (2, 0.9)];
+        scores.extend((3..=10).map(|app_id| (app_id, 1.0 - f64::from(app_id) / 10.0)));
+        let indices = context_percentile_indices(scores);
+
+        assert_eq!(indices.get(&1), indices.get(&2));
+        assert_eq!(indices.get(&1), Some(&90));
+        assert!(indices[&1] > indices[&10]);
+        assert!(context_percentile_indices((1..10).map(|id| (id, 1.0))).is_empty());
+    }
+
+    #[test]
+    fn recommendation_index_uses_the_returned_request_window() {
+        let full_section = (1_u32..=524)
+            .map(|app_id| (app_id, 1.0 - f64::from(app_id) / 1_000.0))
+            .collect::<Vec<_>>();
+
+        let indices = context_percentile_indices_for_window(full_section, 0, 20);
+
+        assert_eq!(indices.len(), 20);
+        assert_eq!(indices.values().copied().collect::<HashSet<_>>().len(), 20);
+        assert_eq!(indices.get(&1), Some(&98));
+        assert_eq!(indices.get(&20), Some(&3));
+        assert!(!indices.contains_key(&21));
+    }
+
+    #[test]
+    fn recommendation_index_is_hidden_when_evidence_is_insufficient() {
+        let indices = context_percentile_indices((1..=10).map(|id| (id, f64::from(11 - id))));
+        let presentation = |data_confidence, effective_feature_count| FeedPresentation {
+            release_date: None,
+            release_date_raw: None,
+            release_date_precision: None,
+            cover_url: None,
+            cover_updated_at_ms: None,
+            total_reviews: None,
+            total_positive: None,
+            latest_ccu: None,
+            typical_ccu_7d: None,
+            data_confidence,
+            effective_feature_count,
+            profile_observed_at_ms: None,
+            reviews_observed_at_ms: None,
+            activity_observed_at_ms: None,
+            price_observed_at_ms: None,
+            release_observed_at_ms: None,
+        };
+
+        assert_eq!(
+            visible_recommendation_index(1, &indices, Some(&presentation(0.8, 3))),
+            Some(95)
+        );
+        assert_eq!(
+            visible_recommendation_index(1, &indices, Some(&presentation(0.44, 3))),
+            None
+        );
+        assert_eq!(
+            visible_recommendation_index(1, &indices, Some(&presentation(0.8, 2))),
+            None
+        );
+        assert_eq!(fit_band(None), "insufficient_data");
+    }
+
+    #[test]
+    fn ai_rank_is_a_bounded_score_adjustment_not_array_order() {
+        let mut items = vec![
+            json!({
+                "app_id": 1,
+                "score": 0.9,
+                "confidence": 0.8,
+                "data_confidence": 0.8,
+                "recommendation_index": 90,
+                "components": {"personalized_score": 0.1, "final_score": 0.9}
+            }),
+            json!({
+                "app_id": 2,
+                "score": 0.8,
+                "confidence": 0.8,
+                "data_confidence": 0.8,
+                "recommendation_index": 80,
+                "evidence_ids": [],
+                "reason_evidence": [],
+                "components": {"personalized_score": 0.8, "final_score": 0.8}
+            }),
+            json!({
+                "app_id": 3,
+                "score": 0.79,
+                "confidence": 0.8,
+                "data_confidence": 0.8,
+                "recommendation_index": 70,
+                "components": {"personalized_score": 0.79, "final_score": 0.79}
+            }),
+        ];
+        let validated = mpgs_ai::AiRankResult {
+            // This order deliberately disagrees with the bounded blended scores.
+            recommendations: vec![
+                mpgs_ai::AiRankItem {
+                    app_id: 1,
+                    fit_score: 0.0,
+                    confidence: 1.0,
+                    reason_evidence_ids: Vec::new(),
+                    reasons: Vec::new(),
+                    cautions: Vec::new(),
+                },
+                mpgs_ai::AiRankItem {
+                    app_id: 2,
+                    fit_score: 1.0,
+                    confidence: 1.0,
+                    reason_evidence_ids: vec!["feature:test:2".into()],
+                    reasons: vec!["evidence-backed reason".into()],
+                    cautions: Vec::new(),
+                },
+                // A forged/restored id is ignored even if this helper is called
+                // without the normal upstream candidate validation.
+                mpgs_ai::AiRankItem {
+                    app_id: 999,
+                    fit_score: 1.0,
+                    confidence: 1.0,
+                    reason_evidence_ids: Vec::new(),
+                    reasons: Vec::new(),
+                    cautions: Vec::new(),
+                },
+            ],
+            summary: String::new(),
+            summary_evidence_ids: Vec::new(),
+        };
+
+        apply_validated_ai_rank(&mut items, &validated);
+
+        let ids: Vec<_> = items
+            .iter()
+            .filter_map(|item| item.get("app_id").and_then(|value| value.as_u64()))
+            .collect();
+        assert_eq!(ids, vec![2, 3, 1]);
+        assert_eq!(items.len(), 3);
+        assert!((items[2]["score"].as_f64().unwrap() - 0.765).abs() < 1e-12);
+        assert!((items[0]["score"].as_f64().unwrap() - 0.83).abs() < 1e-12);
+        assert_eq!(items[0]["rank"], 1);
+        assert_eq!(items[0]["evidence_ids"], json!(["feature:test:2"]));
+        assert_eq!(items[0]["reason_evidence"], json!(["feature:test:2"]));
+        assert_eq!(items[1]["rank"], 2);
+        assert_eq!(items[2]["rank"], 3);
+    }
+
+    #[test]
     fn played_feedback_demotes_discovery_results() {
         assert!(feedback_personal_adjustment(Some("played"), 0.0) < 0.0);
         assert!(feedback_personal_adjustment(Some("like"), 0.0) > 0.0);
+        assert!(
+            (combined_feedback_personal_adjustment(&["played", "like"], 0.0) - 0.1).abs() < 1e-12
+        );
     }
 
     #[test]

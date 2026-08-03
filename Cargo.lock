@@ -1160,9 +1160,12 @@ name = "mpgs-dbtool"
 version = "0.1.0"
 dependencies = [
  "mpgs-ai",
+ "mpgs-domain",
+ "mpgs-recommender",
  "mpgs-steam-source",
  "mpgs-storage",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

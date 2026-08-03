@@ -83,6 +83,13 @@ function constraintLabels(result: NaturalLanguageRecommendationResponse): string
   if (interpreted.platforms && interpreted.platforms.length > 0) {
     add("platforms", platformLabels(interpreted.platforms));
   }
+  if (interpreted.demo_only) add("demo_required", "必须提供 Demo/Playtest");
+  for (const mode of interpreted.modes_excluded ?? []) {
+    labels.push(`排除 ${mode}`);
+  }
+  for (const mode of interpreted.modes_preferred ?? []) {
+    labels.push(`偏好 ${mode}`);
+  }
   if (interpreted.max_price_minor != null && interpreted.currency) {
     add(
       "budget",
@@ -99,7 +106,31 @@ function constraintLabels(result: NaturalLanguageRecommendationResponse): string
   return labels;
 }
 
-export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: number) => void }) {
+function unappliedConstraintLabels(result: NaturalLanguageRecommendationResponse): string[] {
+  const labels: Record<string, string> = {
+    party_size: "人数条件",
+    session_minutes: "单局时长",
+    platforms: "平台条件",
+    budget: "预算条件",
+    demo_required: "Demo / Playtest 条件",
+    selected_section: "推荐分区",
+    coop_competitive: "合作 / 竞技偏好",
+    self_hosting_preference: "开服偏好",
+    modes_preferred: "玩法偏好",
+    modes_excluded: "排除玩法",
+  };
+  return (result.interpreted.unapplied_constraints ?? []).map((value) => {
+    const [field = "", detail] = value.split(":", 2);
+    const label = labels[field] ?? "未理解的条件";
+    return detail ? `${label}：${detail}` : label;
+  });
+}
+
+export function NaturalLanguageScreen({
+  onOpenGame,
+}: {
+  onOpenGame: (appId: number, recommendationRunId?: string | null) => void;
+}) {
   const [query, setQuery] = useState("");
   const [result, setResult] = useState<NaturalLanguageRecommendationResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -169,6 +200,7 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
 
   const aiEnhanced = result !== null && (result.ai_status === "used" || result.ai_status === "cached");
   const constraints = result ? constraintLabels(result) : [];
+  const unappliedConstraints = result ? unappliedConstraintLabels(result) : [];
 
   return (
     <section className="nl-screen" aria-label="自然语言推荐">
@@ -236,7 +268,9 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
               </div>
             </div>
             <div className="nl-analysis-row">
-              <span className="nl-analysis-label">识别到的条件</span>
+              <span className="nl-analysis-label">
+                {result.interpreted.applied_constraints ? "已应用的条件" : "识别到的条件"}
+              </span>
               <div className="statusline">
                 {constraints.length > 0 ? (
                   constraints.map((label, index) => <Chip key={`${label}-${index}`}>{label}</Chip>)
@@ -245,6 +279,18 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
                 )}
               </div>
             </div>
+            {unappliedConstraints.length > 0 && (
+              <div className="nl-analysis-row">
+                <span className="nl-analysis-label">尚未应用</span>
+                <div className="statusline">
+                  {unappliedConstraints.map((label, index) => (
+                    <Chip key={`${label}-${index}`} tone="warn">
+                      {label}
+                    </Chip>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="nl-analysis-row">
               <span className="nl-analysis-label">数据</span>
               <div className="statusline">
@@ -282,7 +328,12 @@ export function NaturalLanguageScreen({ onOpenGame }: { onOpenGame: (appId: numb
           ) : (
             <div className="feed-grid" aria-busy={loading}>
               {result.items.map((item) => (
-                <GameCard key={item.app_id} item={item} onOpen={onOpenGame} />
+                <GameCard
+                  key={item.app_id}
+                  item={item}
+                  onOpen={onOpenGame}
+                  recommendationRunId={result.recommendation_run_id ?? null}
+                />
               ))}
             </div>
           )}

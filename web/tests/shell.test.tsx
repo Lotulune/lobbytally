@@ -65,10 +65,36 @@ vi.mock("../src/app/connection", () => ({
 }));
 
 vi.mock("../src/screens/FeedScreen", () => ({
-  FeedScreen: () => <div>feed</div>,
+  FeedScreen: ({
+    section,
+    onOpenGame,
+  }: {
+    section: string;
+    onOpenGame: (appId: number, recommendationRunId?: string | null) => void;
+  }) => (
+    <div data-testid="feed-state" data-section={section} data-run-id="feed-run-123">
+      <input data-testid="feed-sort-state" defaultValue="recommended:desc:page-3" />
+      <article data-app-id="42" tabIndex={0}>
+        <button type="button" onClick={() => onOpenGame(42, "feed-run-123")}>
+          open feed game
+        </button>
+      </article>
+    </div>
+  ),
 }));
 vi.mock("../src/screens/GameDetailScreen", () => ({
-  GameDetailScreen: () => <div>detail</div>,
+  GameDetailScreen: ({
+    onBack,
+    recommendationRunId,
+  }: {
+    onBack: () => void;
+    recommendationRunId?: string | null;
+  }) => (
+    <div data-testid="detail-state" data-run-id={recommendationRunId ?? ""}>
+      detail
+      <button type="button" onClick={onBack}>back to list</button>
+    </div>
+  ),
 }));
 vi.mock("../src/screens/SearchScreen", () => ({
   SearchScreen: () => <div>search</div>,
@@ -80,7 +106,21 @@ vi.mock("../src/screens/SettingsScreen", () => ({
   SettingsScreen: () => <div>settings</div>,
 }));
 vi.mock("../src/screens/NaturalLanguageScreen", () => ({
-  NaturalLanguageScreen: () => <div>natural language</div>,
+  NaturalLanguageScreen: ({
+    onOpenGame,
+  }: {
+    onOpenGame: (appId: number, recommendationRunId?: string | null) => void;
+  }) => (
+    <div data-testid="nl-state" data-run-id="nl-run-456">
+      <input data-testid="nl-query-state" defaultValue="" />
+      <div data-testid="nl-loaded-results">loaded recommendations</div>
+      <article data-app-id="84" tabIndex={0}>
+        <button type="button" onClick={() => onOpenGame(84, "nl-run-456")}>
+          open natural-language game
+        </button>
+      </article>
+    </div>
+  ),
 }));
 vi.mock("../src/screens/AiSettingsScreen", () => ({
   AiSettingsScreen: () => <div>ai settings</div>,
@@ -98,8 +138,19 @@ vi.mock("../src/screens/shell/useNavShortcuts", () => ({
   useNavShortcuts: () => {},
 }));
 vi.mock("../src/screens/shell/Topbar", () => ({
-  Topbar: ({ profile }: { profile: AccountProfile | null }) => (
-    <div data-testid="shell-profile">{profile?.username ?? "signed-out"}</div>
+  Topbar: ({
+    profile,
+    onNavigate,
+  }: {
+    profile: AccountProfile | null;
+    onNavigate: (view: { kind: "natural-language" }) => void;
+  }) => (
+    <div>
+      <div data-testid="shell-profile">{profile?.username ?? "signed-out"}</div>
+      <button type="button" onClick={() => onNavigate({ kind: "natural-language" })}>
+        show natural language
+      </button>
+    </div>
   ),
 }));
 
@@ -187,6 +238,79 @@ describe("Shell account profile loading", () => {
     expect(host.querySelector('[data-testid="shell-profile"]')?.textContent).toBe(
       "account-b",
     );
+    unmount();
+  });
+});
+
+describe("Shell game-detail return state", () => {
+  it("keeps feed controls/run state mounted and restores scroll and card focus", () => {
+    shellTestState.authenticated = false;
+    shellTestState.userId = null;
+    const { host, unmount } = mountShell();
+    const main = host.querySelector<HTMLElement>("main.main")!;
+    const stateNode = host.querySelector<HTMLElement>('[data-testid="feed-state"]')!;
+    const sortState = host.querySelector<HTMLInputElement>('[data-testid="feed-sort-state"]')!;
+    sortState.value = "ccu:asc:page-3";
+    main.scrollTop = 420;
+
+    act(() => {
+      Array.from(host.querySelectorAll("button"))
+        .find((button) => button.textContent === "open feed game")
+        ?.click();
+    });
+    expect(host.textContent).toContain("detail");
+    expect(host.querySelector<HTMLElement>('[data-testid="detail-state"]')?.dataset.runId).toBe(
+      "feed-run-123",
+    );
+    main.scrollTop = 0;
+
+    act(() => {
+      Array.from(host.querySelectorAll("button"))
+        .find((button) => button.textContent === "back to list")
+        ?.click();
+    });
+    expect(host.querySelector('[data-testid="feed-state"]')).toBe(stateNode);
+    expect(sortState.value).toBe("ccu:asc:page-3");
+    expect(stateNode.dataset.section).toBe("recent_release");
+    expect(stateNode.dataset.runId).toBe("feed-run-123");
+    expect(main.scrollTop).toBe(420);
+    expect(document.activeElement).toBe(stateNode.querySelector('[data-app-id="42"]'));
+    unmount();
+  });
+
+  it("keeps a natural-language query, loaded results and run id across detail", () => {
+    shellTestState.authenticated = false;
+    shellTestState.userId = null;
+    const { host, unmount } = mountShell();
+
+    act(() => {
+      Array.from(host.querySelectorAll("button"))
+        .find((button) => button.textContent === "show natural language")
+        ?.click();
+    });
+    const stateNode = host.querySelector<HTMLElement>('[data-testid="nl-state"]')!;
+    const query = host.querySelector<HTMLInputElement>('[data-testid="nl-query-state"]')!;
+    query.value = "四个人短局合作";
+
+    act(() => {
+      Array.from(host.querySelectorAll("button"))
+        .find((button) => button.textContent === "open natural-language game")
+        ?.click();
+    });
+    expect(host.querySelector<HTMLElement>('[data-testid="detail-state"]')?.dataset.runId).toBe(
+      "nl-run-456",
+    );
+    act(() => {
+      Array.from(host.querySelectorAll("button"))
+        .find((button) => button.textContent === "back to list")
+        ?.click();
+    });
+
+    expect(host.querySelector('[data-testid="nl-state"]')).toBe(stateNode);
+    expect(query.value).toBe("四个人短局合作");
+    expect(stateNode.dataset.runId).toBe("nl-run-456");
+    expect(stateNode.textContent).toContain("loaded recommendations");
+    expect(document.activeElement).toBe(stateNode.querySelector('[data-app-id="84"]'));
     unmount();
   });
 });

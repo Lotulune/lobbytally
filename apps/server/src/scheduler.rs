@@ -5,7 +5,7 @@
 
 use std::{env, time::Duration};
 
-use mpgs_storage::{DataRefreshStatus, EnqueueJob, Repository};
+use mpgs_storage::{DataRefreshStatus, EnqueueJob, Repository, RetrievalSyncStats};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 
@@ -13,8 +13,11 @@ const DEFAULT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_CATALOG_SYNC_INTERVAL_SECS: u64 = 15 * 60;
 const DEFAULT_CANDIDATE_COLLECTION_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_ENRICHMENT_INTERVAL_SECS: u64 = 5 * 60;
+const RECOMMENDATION_TELEMETRY_RETENTION_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const RETRIEVAL_SYNC_BATCH_SIZE: u32 = 2_000;
 const TASK_INTERVAL_MIN_SECS: u64 = 60;
 const TASK_INTERVAL_MAX_SECS: u64 = 86_400;
+const TELEMETRY_RETENTION_TASK: &str = "recommendation_telemetry_retention";
 
 #[derive(Clone, Copy)]
 struct TaskIntervals {
@@ -234,28 +237,112 @@ fn run_once_with_schedule(
     let retrieval_previous = previous_status
         .iter()
         .find(|status| status.task_name == "retrieval_sync");
-    match repo.sync_retrieval_from_catalog(2_000, 0, true) {
-        Ok(stats) => repo.update_data_refresh_status(
-            "retrieval_sync",
-            Some(now_ms),
-            Some(next_run_at_ms),
-            None,
-            Some(&stats.apps_scanned.to_string()),
-            coverage_ratio,
-        )?,
+    sync_retrieval_batch(
+        repo,
+        retrieval_previous,
+        now_ms,
+        next_run_at_ms,
+        RETRIEVAL_SYNC_BATCH_SIZE,
+        true,
+    )?;
+    let telemetry_previous = previous_status
+        .iter()
+        .find(|status| status.task_name == TELEMETRY_RETENTION_TASK);
+    run_recommendation_telemetry_retention(repo, telemetry_previous, now_ms, next_run_at_ms)?;
+    Ok(())
+}
+
+fn run_recommendation_telemetry_retention(
+    repo: &Repository,
+    previous: Option<&DataRefreshStatus>,
+    now_ms: i64,
+    retry_at_ms: i64,
+) -> mpgs_storage::StorageResult<()> {
+    let due = previous
+        .and_then(|status| status.next_run_at_ms)
+        .is_none_or(|next_run_at_ms| next_run_at_ms <= now_ms);
+    if !due {
+        return Ok(());
+    }
+
+    match repo.purge_expired_recommendation_telemetry() {
+        Ok(purged) => {
+            let next_run_at_ms = now_ms.saturating_add(
+                (RECOMMENDATION_TELEMETRY_RETENTION_INTERVAL_SECS as i64).saturating_mul(1_000),
+            );
+            repo.update_data_refresh_status(
+                TELEMETRY_RETENTION_TASK,
+                Some(now_ms),
+                Some(next_run_at_ms),
+                None,
+                None,
+                None,
+            )?;
+            info!(
+                runs = purged.runs,
+                items = purged.items,
+                events = purged.events,
+                "expired recommendation telemetry purged"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            // A failed retention pass must not erase the last known success.
+            // Retry on the scheduler cadence rather than waiting another day.
+            repo.update_data_refresh_status(
+                TELEMETRY_RETENTION_TASK,
+                previous.and_then(|status| status.last_success_at_ms),
+                Some(retry_at_ms),
+                Some("telemetry_retention_failed"),
+                previous.and_then(|status| status.cursor_value.as_deref()),
+                previous.and_then(|status| status.coverage_ratio),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn sync_retrieval_batch(
+    repo: &Repository,
+    previous: Option<&DataRefreshStatus>,
+    now_ms: i64,
+    next_run_at_ms: i64,
+    batch_size: u32,
+    write_embeddings: bool,
+) -> mpgs_storage::StorageResult<RetrievalSyncStats> {
+    // Older releases stored the number scanned here. Treating that numeric
+    // value as an app-id cursor is safe: it may repeat work once, but cannot
+    // skip the high app ids that were previously invisible after the first
+    // fixed 2,000 rows. Invalid values restart a full pass.
+    let after_app_id = previous
+        .and_then(|status| status.cursor_value.as_deref())
+        .and_then(|cursor| cursor.parse::<u32>().ok())
+        .unwrap_or(0);
+    match repo.sync_retrieval_from_catalog(batch_size, after_app_id, write_embeddings) {
+        Ok(stats) => {
+            let next_cursor = stats.next_after_app_id.to_string();
+            repo.update_data_refresh_status(
+                "retrieval_sync",
+                Some(now_ms),
+                Some(next_run_at_ms),
+                None,
+                Some(&next_cursor),
+                Some(stats.coverage_ratio()),
+            )?;
+            Ok(stats)
+        }
         Err(error) => {
             repo.update_data_refresh_status(
                 "retrieval_sync",
-                retrieval_previous.and_then(|status| status.last_success_at_ms),
+                previous.and_then(|status| status.last_success_at_ms),
                 Some(next_run_at_ms),
                 Some("retrieval_sync_failed"),
-                retrieval_previous.and_then(|status| status.cursor_value.as_deref()),
-                coverage_ratio,
+                previous.and_then(|status| status.cursor_value.as_deref()),
+                previous.and_then(|status| status.coverage_ratio),
             )?;
-            return Err(error);
+            Err(error)
         }
     }
-    Ok(())
 }
 
 fn steam_web_api_key_configured() -> bool {
@@ -290,7 +377,55 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use mpgs_storage::{Database, FakeClock, Repository};
+    use mpgs_storage::{
+        Database, FakeClock, InsertRecommendationItem, InsertRecommendationRun,
+        RECOMMENDATION_TELEMETRY_RETENTION_MS, Repository, hash_candidate_set,
+        hash_structured_context,
+    };
+    use serde_json::json;
+
+    fn insert_telemetry(repo: &Repository) -> (String, u32) {
+        let app_id = repo
+            .database()
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT app_id FROM apps ORDER BY app_id LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|app_id| app_id as u32)
+                .map_err(Into::into)
+            })
+            .unwrap();
+        let run = repo
+            .insert_recommendation_run(&InsertRecommendationRun {
+                subject_hash: None,
+                request_kind: "feed".into(),
+                feed_section: "recent".into(),
+                algorithm_version: "rules-0.3.0".into(),
+                config_version: "rules-0.3.0".into(),
+                score_semantics: "context_percentile_v1".into(),
+                context_schema_version: 1,
+                context_hash: hash_structured_context(&json!({"section": "recent"})).unwrap(),
+                candidate_set_hash: hash_candidate_set(&[app_id]).unwrap(),
+                candidate_count: 1,
+            })
+            .unwrap();
+        repo.insert_recommendation_items(
+            &run.recommendation_run_id,
+            &[InsertRecommendationItem {
+                app_id,
+                rank: 1,
+                relevance_score: 0.75,
+                recommendation_index: Some(50),
+                data_confidence: 0.8,
+                slot_reason: "base".into(),
+                score_components: json!({"quality": 0.7}),
+            }],
+        )
+        .unwrap();
+        (run.recommendation_run_id, app_id)
+    }
 
     #[test]
     fn records_only_completed_derived_work_as_success() {
@@ -411,6 +546,197 @@ mod tests {
                 .has_active_job("steam", "collect_candidates", "scheduled")
                 .unwrap(),
             "candidate collection waits for its longer interval"
+        );
+    }
+
+    #[test]
+    fn retrieval_sync_persists_cursor_until_full_catalog_coverage() {
+        let db = Database::open_in_memory().unwrap();
+        let repo = Repository::new(db);
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        repo.seed_demo_if_empty().unwrap();
+        let catalog_apps = repo
+            .database()
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM apps", [], |row| row.get::<_, i64>(0))
+                    .map_err(Into::into)
+            })
+            .unwrap() as u32;
+        assert!(catalog_apps > 2);
+
+        let mut previous_coverage = 0.0;
+        let mut batches = 0;
+        loop {
+            let statuses = repo.data_refresh_status().unwrap();
+            let previous = statuses
+                .iter()
+                .find(|status| status.task_name == "retrieval_sync");
+            let stats = sync_retrieval_batch(&repo, previous, 100, 200, 2, false).unwrap();
+            batches += 1;
+
+            let updated = repo
+                .data_refresh_status()
+                .unwrap()
+                .into_iter()
+                .find(|status| status.task_name == "retrieval_sync")
+                .unwrap();
+            assert_eq!(
+                updated.cursor_value.as_deref(),
+                Some(stats.next_after_app_id.to_string().as_str())
+            );
+            let coverage = updated.coverage_ratio.unwrap();
+            assert!(coverage >= previous_coverage);
+            assert_eq!(coverage, stats.coverage_ratio());
+
+            if !stats.has_more {
+                assert_eq!(updated.cursor_value.as_deref(), Some("0"));
+                assert_eq!(coverage, 1.0);
+                break;
+            }
+            assert_ne!(updated.cursor_value.as_deref(), Some("0"));
+            assert!(coverage < 1.0);
+            previous_coverage = coverage;
+            assert!(
+                batches <= catalog_apps,
+                "persisted cursor must make progress"
+            );
+        }
+
+        assert_eq!(batches, catalog_apps.div_ceil(2));
+        let indexed_apps = repo
+            .database()
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(DISTINCT app_id) FROM game_documents",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap() as u32;
+        assert_eq!(indexed_apps, catalog_apps);
+    }
+
+    #[test]
+    fn scheduler_purges_expired_telemetry_once_per_daily_cadence() {
+        let clock = Arc::new(FakeClock::new(1_000));
+        let db = Database::open_in_memory_with_clock(clock.clone()).unwrap();
+        let repo = Repository::new(db);
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        repo.seed_demo_if_empty().unwrap();
+
+        let (expired_run_id, app_id) = insert_telemetry(&repo);
+        clock.advance_ms(RECOMMENDATION_TELEMETRY_RETENTION_MS + 1);
+        run_once_with_catalog_sync(&repo, DEFAULT_INTERVAL_SECS, false).unwrap();
+        assert!(
+            repo.recommendation_item_attribution(&expired_run_id, app_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let first_status = repo
+            .data_refresh_status()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.task_name == TELEMETRY_RETENTION_TASK)
+            .unwrap();
+        let first_success_at_ms = first_status.last_success_at_ms.unwrap();
+        assert_eq!(first_success_at_ms, repo.database().now_ms());
+        assert_eq!(
+            first_status.next_run_at_ms,
+            Some(
+                first_success_at_ms
+                    + (RECOMMENDATION_TELEMETRY_RETENTION_INTERVAL_SECS as i64) * 1_000
+            )
+        );
+        assert!(first_status.last_error_category.is_none());
+
+        let (next_run_id, next_app_id) = insert_telemetry(&repo);
+        repo.database()
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    "UPDATE recommendation_items SET expires_at_ms = ?2
+                     WHERE recommendation_run_id = ?1",
+                    (&next_run_id, first_success_at_ms + 1),
+                )?;
+                conn.execute(
+                    "UPDATE recommendation_runs SET expires_at_ms = ?2
+                     WHERE recommendation_run_id = ?1",
+                    (&next_run_id, first_success_at_ms + 1),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        clock.advance_ms((DEFAULT_INTERVAL_SECS as i64) * 1_000);
+        run_once_with_catalog_sync(&repo, DEFAULT_INTERVAL_SECS, false).unwrap();
+        assert!(
+            repo.recommendation_item_attribution(&next_run_id, next_app_id)
+                .unwrap()
+                .is_some(),
+            "a scheduler tick before the daily deadline must not run retention again"
+        );
+
+        clock.advance_ms(
+            (RECOMMENDATION_TELEMETRY_RETENTION_INTERVAL_SECS as i64
+                - DEFAULT_INTERVAL_SECS as i64)
+                * 1_000,
+        );
+        run_once_with_catalog_sync(&repo, DEFAULT_INTERVAL_SECS, false).unwrap();
+        assert!(
+            repo.recommendation_item_attribution(&next_run_id, next_app_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn telemetry_retention_failure_is_observable_and_retries_on_scheduler_cadence() {
+        let clock = Arc::new(FakeClock::new(10_000));
+        let db = Database::open_in_memory_with_clock(clock).unwrap();
+        let repo = Repository::new(db);
+        repo.migrate().unwrap();
+        repo.update_data_refresh_status(
+            TELEMETRY_RETENTION_TASK,
+            Some(7_000),
+            Some(9_000),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        repo.database()
+            .with_conn_mut(|conn| {
+                conn.execute("DROP TABLE recommendation_events", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let previous = repo
+            .data_refresh_status()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.task_name == TELEMETRY_RETENTION_TASK)
+            .unwrap();
+        let retry_at_ms = 10_000 + (DEFAULT_INTERVAL_SECS as i64) * 1_000;
+        assert!(
+            run_recommendation_telemetry_retention(&repo, Some(&previous), 10_000, retry_at_ms,)
+                .is_err()
+        );
+
+        let failed = repo
+            .data_refresh_status()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.task_name == TELEMETRY_RETENTION_TASK)
+            .unwrap();
+        assert_eq!(failed.last_success_at_ms, Some(7_000));
+        assert_eq!(failed.next_run_at_ms, Some(retry_at_ms));
+        assert_eq!(
+            failed.last_error_category.as_deref(),
+            Some("telemetry_retention_failed")
         );
     }
 }

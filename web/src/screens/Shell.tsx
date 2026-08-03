@@ -4,7 +4,7 @@
 // account profile, demo mode, pending feedback) live here and are passed to
 // the presentational Topbar as props.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AccountProfile } from "../api/types";
 import { subscribeAccountGate } from "../app/auth";
 import { getConnectionManager, type ConnectionSnapshot } from "../app/connection";
@@ -34,8 +34,36 @@ export function Shell() {
   const [connection, setConnection] = useState<ConnectionSnapshot | null>(null);
   // Where the game detail returns to (the list the user opened it from).
   const lastListView = useRef<ListView>(DEFAULT_VIEW);
+  const mainRef = useRef<HTMLElement>(null);
+  const returnPosition = useRef<{
+    view: ListView;
+    scrollTop: number;
+    focusAppId: number;
+    recommendationRunId: string | null;
+  } | null>(null);
+  const pendingRestore = useRef(false);
   useEffect(() => {
     if (view.kind !== "game") lastListView.current = view;
+  }, [view]);
+
+  // Restore the exact list position after React has made the retained list
+  // visible again. Keeping the source screen mounted preserves its loaded
+  // results, controls and recommendation run id; this handles viewport/focus.
+  useLayoutEffect(() => {
+    const main = mainRef.current;
+    if (view.kind === "game") {
+      if (main) main.scrollTop = 0;
+      return;
+    }
+    if (!pendingRestore.current) return;
+    const saved = returnPosition.current;
+    pendingRestore.current = false;
+    if (!saved) return;
+    if (!main) return;
+    main.scrollTop = saved.scrollTop;
+    main
+      .querySelector<HTMLElement>(`[data-app-id="${saved.focusAppId}"]`)
+      ?.focus({ preventScroll: true });
   }, [view]);
 
   useEffect(() => {
@@ -118,12 +146,25 @@ export function Shell() {
   const navigate = useCallback((next: View) => setView(next), []);
   useNavShortcuts(navigate);
 
-  const openGame = useCallback((appId: number) => setView({ kind: "game", appId }), []);
-  const backToList = useCallback(() => setView(lastListView.current), []);
+  const openGame = useCallback((appId: number, recommendationRunId: string | null = null) => {
+    returnPosition.current = {
+      view: lastListView.current,
+      scrollTop: mainRef.current?.scrollTop ?? 0,
+      focusAppId: appId,
+      recommendationRunId,
+    };
+    setView({ kind: "game", appId });
+  }, []);
+  const backToList = useCallback(() => {
+    const saved = returnPosition.current;
+    pendingRestore.current = true;
+    setView(saved?.view ?? lastListView.current);
+  }, []);
   const leaveAccountArea = useCallback(() => {
     setProfile(null);
     setView(DEFAULT_VIEW);
   }, []);
+  const visibleListView: ListView = view.kind === "game" ? lastListView.current : view;
 
   return (
     <div className="shell">
@@ -157,16 +198,45 @@ export function Shell() {
         </div>
       )}
 
-      <main className="main">
-        {view.kind === "feed" && <FeedScreen section={view.section} onOpenGame={openGame} />}
-        {view.kind === "search" && <SearchScreen onOpenGame={openGame} />}
-        {view.kind === "natural-language" && <NaturalLanguageScreen onOpenGame={openGame} />}
-        {view.kind === "community" && <CommunityScreen onOpenGame={openGame} />}
-        {view.kind === "calendar" && <CalendarScreen onOpenGame={openGame} />}
-        {view.kind === "settings" && <SettingsScreen />}
-        {view.kind === "profile" && profile && <ProfileScreen profile={profile} onUpdated={setProfile} onDeleted={leaveAccountArea} />}
-        {view.kind === "ai-settings" && profile && <AiSettingsScreen />}
-        {view.kind === "game" && <GameDetailScreen appId={view.appId} onBack={backToList} />}
+      <main className="main" ref={mainRef}>
+        <div hidden={view.kind === "game"} aria-hidden={view.kind === "game" || undefined}>
+          {visibleListView.kind === "feed" && (
+            <FeedScreen
+              section={visibleListView.section}
+              onOpenGame={openGame}
+            />
+          )}
+          {visibleListView.kind === "search" && (
+            <SearchScreen onOpenGame={openGame} />
+          )}
+          {visibleListView.kind === "natural-language" && (
+            <NaturalLanguageScreen onOpenGame={openGame} />
+          )}
+          {visibleListView.kind === "community" && (
+            <CommunityScreen onOpenGame={openGame} />
+          )}
+          {visibleListView.kind === "calendar" && (
+            <CalendarScreen onOpenGame={openGame} />
+          )}
+          {visibleListView.kind === "settings" && <SettingsScreen />}
+          {visibleListView.kind === "profile" && profile && (
+            <ProfileScreen profile={profile} onUpdated={setProfile} onDeleted={leaveAccountArea} />
+          )}
+          {visibleListView.kind === "ai-settings" && profile && (
+            <AiSettingsScreen />
+          )}
+        </div>
+        {view.kind === "game" && (
+          <GameDetailScreen
+            appId={view.appId}
+            onBack={backToList}
+            recommendationRunId={
+              returnPosition.current?.focusAppId === view.appId
+                ? returnPosition.current.recommendationRunId
+                : null
+            }
+          />
+        )}
       </main>
       <AuthDialog open={authOpen} onClose={() => setAuthOpen(false)} />
     </div>

@@ -89,6 +89,16 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0017_media_backfill_state",
         include_str!("../../../migrations/0017_media_backfill_state.sql"),
     ),
+    (
+        18,
+        "0018_recommendation_telemetry",
+        include_str!("../../../migrations/0018_recommendation_telemetry.sql"),
+    ),
+    (
+        19,
+        "0019_preference_confidence",
+        include_str!("../../../migrations/0019_preference_confidence.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {

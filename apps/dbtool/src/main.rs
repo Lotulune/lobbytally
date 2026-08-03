@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod golden_evaluation;
+mod recommendation_audit;
+
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -185,6 +188,8 @@ fn run() -> Result<(), String> {
     let cmd = args.next().ok_or_else(|| usage().to_owned())?;
 
     match cmd.as_str() {
+        "recommendation-golden-evaluate" => golden_evaluation::run_command(args),
+        "recommendation-audit" => recommendation_audit::run_command(args),
         "migrate" => {
             let db_path = required_path(args.next(), "--db path")?;
             let db = Database::open(&db_path).map_err(err)?;
@@ -1512,7 +1517,7 @@ fn collect_steam_catalog(
         })?;
         stats.success_count = stats.success_count.saturating_add(ingested as i64);
         println!(
-            "progress catalog_apps={} page={} rows={} next_last_appid={} pass_complete={}",
+            "progress catalog_apps={} page={} rows={} skipped_missing_name={} next_last_appid={} pass_complete={}",
             repo.count_apps().map_err(|error| CollectionError {
                 category: "storage",
                 message: error.to_string(),
@@ -1520,6 +1525,7 @@ fn collect_steam_catalog(
             })?,
             page_index + 1,
             ingested,
+            page.skipped_missing_name,
             cursor.last_appid,
             !cursor.is_in_progress(),
         );
@@ -2468,6 +2474,8 @@ fn configured_store_locale() -> Result<(String, String), String> {
 fn usage() -> &'static str {
     "mpgs-dbtool <command> [args]\n\n\
      Commands:\n\
+       recommendation-golden-evaluate <labels.json> [--json]\n\
+       recommendation-audit <db-path> --as-of YYYY-MM-DD [--user-id ID] [--top N] [--strict] [--json]\n\
        migrate <db-path>\n\
        integrity <db-path>\n\
        m3-audit <db-path>\n\

@@ -39,14 +39,40 @@ function makeClient(storage: MemoryStorage, online: () => boolean) {
 describe("FeedbackQueue", () => {
   it("optimistically records and syncs feedback", async () => {
     const storage = new MemoryStorage();
-    const { client } = makeClient(storage, () => true);
+    const { client, calls } = makeClient(storage, () => true);
     const queue = new FeedbackQueue(client, storage);
-    queue.submit(548430, "like");
+    queue.submit(548430, "like", "run-123");
     // active immediately, before network settles
     expect(queue.activeByApp().get(548430)?.type).toBe("like");
     await queue.flush();
     const entry = queue.activeByApp().get(548430);
     expect(entry?.feedbackId).not.toBeNull();
+    expect(
+      calls.find((call) => call.url.endsWith("/v1/feedback"))?.body,
+    ).toMatchObject({ recommendation_run_id: "run-123" });
+  });
+
+  it("keeps sentiment, ownership and reason feedback in independent dimensions", async () => {
+    const storage = new MemoryStorage();
+    const { client } = makeClient(storage, () => false);
+    const queue = new FeedbackQueue(client, storage);
+    queue.submit(42, "like");
+    queue.submit(42, "played");
+    queue.submit(42, "party_size_mismatch");
+    queue.submit(42, "hosting_friction");
+    const dislike = queue.submit(42, "not_interested");
+
+    const active = queue.activeDimensionsForApp(42);
+    expect(active.sentiment?.type).toBe("not_interested");
+    expect(active.ownership?.type).toBe("played");
+    expect(active.reasons.map((entry) => entry.type).sort()).toEqual([
+      "hosting_friction",
+      "party_size_mismatch",
+    ]);
+
+    await queue.undo(dislike.localId);
+    expect(queue.activeDimensionsForApp(42).sentiment?.type).toBe("like");
+    expect(queue.activeDimensionsForApp(42).ownership?.type).toBe("played");
   });
 
   it("keeps unsynced feedback across a simulated reload and replays it", async () => {

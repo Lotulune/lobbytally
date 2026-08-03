@@ -28,6 +28,7 @@ import type {
   MetaResponse,
   NaturalLanguageRecommendationResponse,
   PlayIntentResult,
+  RecommendationEventType,
   SearchResponse,
   SessionTokens,
   StorageLike,
@@ -604,7 +605,7 @@ export class ApiClient {
     if (!isFirstPage) {
       return this.uncachedGet<FeedResponse>(path, this.hasSession());
     }
-    const cacheKey = `feed:v4:${section}:${query.limit ?? "d"}:${query.partySize ?? "p"}:${
+    const cacheKey = `feed:v5:${section}:${query.limit ?? "d"}:${query.partySize ?? "p"}:${
       query.demoOnly ? 1 : 0
     }:${query.sort ?? "recommended"}:${query.order ?? "auto"}:${this.session?.user_id ?? "anon"}`;
     return this.cachedGet<FeedResponse>(cacheKey, path, this.hasSession());
@@ -717,6 +718,7 @@ export class ApiClient {
     type: FeedbackType;
     idempotencyKey: string;
     clientCreatedAtMs: number;
+    recommendationRunId?: string | null;
   }): Promise<FeedbackRecord> {
     const response = await this.accountResponse(
       "POST",
@@ -724,11 +726,34 @@ export class ApiClient {
       {
         app_id: args.appId,
         type: args.type,
+        recommendation_run_id: args.recommendationRunId ?? undefined,
         client_created_at_ms: args.clientCreatedAtMs,
       },
       { headers: { "idempotency-key": args.idempotencyKey } },
     );
     return (await response.json()) as FeedbackRecord;
+  }
+
+  async postRecommendationEvent(args: {
+    recommendationRunId: string;
+    appId: number;
+    eventType: RecommendationEventType;
+    idempotencyKey?: string;
+    clientCreatedAtMs?: number;
+  }): Promise<void> {
+    const idempotencyKey =
+      args.idempotencyKey ??
+      `${args.eventType}:${args.appId}:${this.now()}:${randomId()}`;
+    await this.rawJson<unknown>("POST", "/v1/recommendation-events", {
+      auth: false,
+      headers: { "idempotency-key": idempotencyKey },
+      body: {
+        recommendation_run_id: args.recommendationRunId,
+        app_id: args.appId,
+        event_type: args.eventType,
+        client_created_at_ms: args.clientCreatedAtMs,
+      },
+    });
   }
 
   async undoFeedback(feedbackId: number): Promise<FeedbackRecord> {

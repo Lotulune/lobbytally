@@ -167,12 +167,20 @@ pub fn list_active_feedback(
         "WITH ranked AS (
              SELECT app_id, feedback_type,
                     ROW_NUMBER() OVER (
-                        PARTITION BY app_id ORDER BY created_at_ms DESC, feedback_id DESC
+                        PARTITION BY app_id,
+                            CASE
+                                WHEN feedback_type = 'played' THEN 'ownership'
+                                WHEN feedback_type IN ('like', 'not_interested') THEN 'sentiment'
+                                ELSE 'reason:' || feedback_type
+                            END
+                        ORDER BY created_at_ms DESC, feedback_id DESC
                     ) AS row_num
              FROM feedback_events
              WHERE user_id = ?1 AND feedback_type <> 'undo' AND undone_by IS NULL
          )
-         SELECT app_id, feedback_type FROM ranked WHERE row_num = 1 ORDER BY app_id",
+         SELECT app_id, feedback_type FROM ranked
+         WHERE row_num = 1
+         ORDER BY app_id, feedback_type",
     )?;
     let rows = stmt.query_map(params![user_id], |row| {
         Ok(ActiveFeedback {

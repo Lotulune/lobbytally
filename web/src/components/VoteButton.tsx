@@ -11,11 +11,13 @@ export function VoteButton({
   appId,
   intent,
   size = "small",
+  recommendationRunId = null,
 }: {
   appId: number;
   /** Optional: cached responses from before this feature may lack the field. */
   intent?: PlayIntentSummary;
   size?: "small" | "large";
+  recommendationRunId?: string | null;
 }) {
   const { fireAction } = useTheme();
   const [, force] = useState(0);
@@ -33,14 +35,14 @@ export function VoteButton({
       className={`vote-btn${voted ? " voted" : ""}${size === "large" ? " large" : ""}`}
       aria-pressed={voted}
       aria-label={voted ? `取消想玩，共 ${count} 人想玩` : `标记想玩，共 ${count} 人想玩`}
-      title="越多人想玩，越靠前"
+      title="全站票数达到最低样本后，仅小幅影响推荐"
       onClick={(event) => {
         event.stopPropagation();
         if (!apiClient.isAccountAuthenticated()) {
           requestAccountSignIn();
           return;
         }
-        playIntentStore.toggle(appId, base.voted);
+        playIntentStore.toggle(appId, base.voted, recommendationRunId);
         fireAction(voted ? "dismiss" : "like", event.currentTarget);
       }}
     >

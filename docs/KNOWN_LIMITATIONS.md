@@ -18,6 +18,15 @@
 - 价格区域默认 `CN/schinese`；历史 US/USD 快照不代表中国区完成。
 - 日历/Demo 依赖易变商店字段 + 人工回退。
 
+## 推荐与校准
+
+- 黄金矩阵评估器已经存在，但仓库没有可声明为生产有效的 200+ 人工相关性矩阵，当前线上权重未由玩家标注自动冻结。
+- `recommendation_index` 仍是当前请求实际返回页/窗口内的中位秩指数，不是整分区百分位或接受概率；分页/窗口变化可能改变指数。曝光位置校正、isotonic calibration、影子流量和分阶段放量尚未实现。
+- 推荐 run/item、反馈事件、公开 `exposure/detail_open/steam_click/play_intent` 接口及 Web 上报已接线；但曝光仍以卡片挂载代理而非 viewport 确认，Demo 跳转也没有独立枚举，因此不能声称完整线上漏斗归因率。
+- 反馈 Storage 已保留 sentiment、ownership 与多个 reason 维度，但公开 API 仍一次提交一个 legacy `type`，尚无跨游戏的 90 天半衰期偏好学习。
+- Feed 已公开卡片级 `reason_evidence[]` 与五组 `feature_freshness`，但尚无逐句证据映射和逐卡解释完整性保证；低覆盖特征必须继续显示未知/资料不足。
+- 玩家 Feed 的精确同分已接入稳定用户每日哈希，AppID 仅作哈希碰撞后的技术兜底；无请求身份的内部兼容入口仍按 AppID。公开指数继续让精确相关性同分共享同一值，不制造假精度。
+
 ## 技术
 
 - 单主 SQLite，无 active-active、无网络文件系统部署。

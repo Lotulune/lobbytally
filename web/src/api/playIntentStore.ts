@@ -18,6 +18,8 @@ interface VoteEntry {
   pending: boolean;
   /** Account that owns this override; null quarantines an unowned legacy record. */
   ownerUserId: string | null;
+  /** Run that exposed this game; retained until positive intent attribution succeeds. */
+  recommendationRunId: string | null;
 }
 
 export type PlayIntentListener = () => void;
@@ -33,6 +35,7 @@ interface LegacyVoteEntry {
   userId?: string | null;
   ownerUserId?: string | null;
   appId?: number;
+  recommendationRunId?: string | null;
 }
 
 export class PlayIntentStore {
@@ -58,7 +61,7 @@ export class PlayIntentStore {
       const rows: Array<[string, LegacyVoteEntry]> = Array.isArray(stored)
         ? stored.map((entry, index) => [String(index), entry])
         : Object.entries(stored);
-      let migrated = !Array.isArray(stored) || parsed.v !== 2;
+      let migrated = !Array.isArray(stored) || parsed.v !== 3;
       for (const [storageKey, entry] of rows) {
         if (typeof entry?.voted !== "boolean") continue;
         const appId =
@@ -83,6 +86,8 @@ export class PlayIntentStore {
           voted: entry.voted,
           pending: entry.pending ?? false,
           ownerUserId,
+          recommendationRunId:
+            typeof entry.recommendationRunId === "string" ? entry.recommendationRunId : null,
         };
         this.entries.set(this.entryKey(appId, ownerUserId), normalized);
       }
@@ -96,7 +101,7 @@ export class PlayIntentStore {
     try {
       this.storage.setItem(
         STORE_KEY,
-        JSON.stringify({ v: 2, entries: Array.from(this.entries.values()) }),
+        JSON.stringify({ v: 3, entries: Array.from(this.entries.values()) }),
       );
     } catch {
       // best effort
@@ -137,12 +142,19 @@ export class PlayIntentStore {
   }
 
   /** Flip the vote optimistically and sync. `serverVoted` is the latest known flag. */
-  toggle(appId: number, serverVoted: boolean): void {
+  toggle(appId: number, serverVoted: boolean, recommendationRunId: string | null = null): void {
     const ownerUserId = this.currentOwnerUserId();
     if (!ownerUserId) return;
     const key = this.entryKey(appId, ownerUserId);
     const current = this.entries.get(key)?.voted ?? serverVoted;
-    this.entries.set(key, { appId, voted: !current, pending: true, ownerUserId });
+    const voted = !current;
+    this.entries.set(key, {
+      appId,
+      voted,
+      pending: true,
+      ownerUserId,
+      recommendationRunId: voted ? recommendationRunId : null,
+    });
     this.persist();
     void this.sync(key);
   }
@@ -163,20 +175,9 @@ export class PlayIntentStore {
       if (!entry?.pending) return;
       if (!this.belongsToCurrentOwner(entry)) return;
       const desired = entry.voted;
+      let result;
       try {
-        const result = await this.client.setPlayIntent(entry.appId, desired);
-        const current = this.entries.get(key);
-        if (!current) return;
-        if (current.voted !== desired) continue;
-        // Keep a short-lived override until a server payload reflects the ack.
-        this.entries.set(key, {
-          appId: current.appId,
-          voted: result.voted,
-          pending: false,
-          ownerUserId: current.ownerUserId,
-        });
-        this.persist();
-        return;
+        result = await this.client.setPlayIntent(entry.appId, desired);
       } catch (error) {
         const current = this.entries.get(key);
         if (!current) return;
@@ -195,6 +196,45 @@ export class PlayIntentStore {
         this.persist();
         return;
       }
+
+      let current = this.entries.get(key);
+      if (!current) return;
+      if (current.voted !== desired) continue;
+      if (result.voted && current.recommendationRunId) {
+        try {
+          await this.client.postRecommendationEvent({
+            recommendationRunId: current.recommendationRunId,
+            appId: current.appId,
+            eventType: "play_intent",
+            idempotencyKey: `play_intent:${current.appId}`,
+          });
+        } catch (error) {
+          current = this.entries.get(key);
+          if (!current || current.voted !== desired) continue;
+          if (
+            error instanceof ApiError &&
+            (error.offline || error.status === 408 || error.status === 429 || error.status >= 500)
+          ) {
+            return;
+          }
+          // The vote itself succeeded. A permanently invalid/stale run must not
+          // undo that user action; discard only its attribution context.
+          current = { ...current, recommendationRunId: null };
+          this.entries.set(key, current);
+        }
+      }
+      current = this.entries.get(key);
+      if (!current || current.voted !== desired) continue;
+      // Keep a short-lived override until a server payload reflects the ack.
+      this.entries.set(key, {
+        appId: current.appId,
+        voted: result.voted,
+        pending: false,
+        ownerUserId: current.ownerUserId,
+        recommendationRunId: null,
+      });
+      this.persist();
+      return;
     }
   }
 

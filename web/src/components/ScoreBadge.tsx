@@ -1,11 +1,24 @@
-// Recommendation fit-score badge (.score-badge).
+// Context-relative recommendation badge (.score-badge).
 
-import { formatPercent } from "../app/format";
+import { recommendationLabel } from "../app/format";
 
-export function ScoreBadge({ score }: { score: number | null }) {
+export function ScoreBadge({
+  rank,
+  recommendationIndex,
+  dataConfidence,
+  fitBand,
+}: {
+  rank: number | null | undefined;
+  recommendationIndex: number | null | undefined;
+  dataConfidence: number | null | undefined;
+  fitBand?: string | null;
+}) {
   return (
-    <span className="score-badge" title="综合适配分">
-      {formatPercent(score)}
+    <span
+      className="score-badge"
+      title="当前推荐列表中的相对位置，不代表喜欢或购买概率"
+    >
+      {recommendationLabel(rank, recommendationIndex, dataConfidence, fitBand)}
     </span>
   );
 }

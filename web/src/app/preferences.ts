@@ -161,6 +161,7 @@ export const SESSION_OPTIONS: { label: string; min: number; max: number }[] = [
 export function defaultPreferences(): UserPreferences {
   return {
     version: 1,
+    preference_confidence: 0,
     party_size: 4,
     coop_competitive: 0.15,
     session_minutes_min: 30,
@@ -183,6 +184,7 @@ function sameSet(a: string[], b: string[]): boolean {
 /** True when the editable fields of `next` differ from `base` (version ignored). */
 export function preferencesChanged(base: UserPreferences, next: UserPreferences): boolean {
   return (
+    base.preference_confidence !== next.preference_confidence ||
     base.party_size !== next.party_size ||
     base.coop_competitive !== next.coop_competitive ||
     base.session_minutes_min !== next.session_minutes_min ||
@@ -198,6 +200,7 @@ export function preferencesChanged(base: UserPreferences, next: UserPreferences)
 
 export function editablePreferencePatch(preferences: UserPreferences): PendingPreferencesPatch {
   return {
+    preference_confidence: preferences.preference_confidence,
     party_size: preferences.party_size,
     coop_competitive: preferences.coop_competitive,
     session_minutes_min: preferences.session_minutes_min,

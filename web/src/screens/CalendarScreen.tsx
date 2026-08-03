@@ -52,7 +52,12 @@ function CalendarRow({
 }) {
   const earlyLabel = earlyDataLabel(item.early_data, item.review_total);
   return (
-    <button type="button" className="cal-row" onClick={() => onOpenGame(item.app_id)}>
+    <button
+      type="button"
+      className="cal-row"
+      data-app-id={item.app_id}
+      onClick={() => onOpenGame(item.app_id)}
+    >
       <span className="cal-day">{formatReleaseDate(item.release_date, item.release_date_raw, item.release_date_precision)}</span>
       <GameMedia coverUrl={item.cover_url ?? null} name={item.canonical_name} appId={item.app_id} compact />
       <span className="cal-name">{item.canonical_name}</span>

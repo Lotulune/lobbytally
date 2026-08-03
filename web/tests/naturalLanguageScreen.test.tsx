@@ -46,6 +46,8 @@ describe("NaturalLanguageScreen", () => {
         self_hosting_willingness: null,
         platforms: [],
         hard_constraints: ["party_size", "session_minutes"],
+        applied_constraints: ["party_size", "session_minutes"],
+        unapplied_constraints: ["modes_preferred:public_world"],
         max_price_minor: null,
         currency: null,
       },
@@ -74,6 +76,9 @@ describe("NaturalLanguageScreen", () => {
 
     expect(host.textContent).toContain("4 人（硬性）");
     expect(host.textContent).toContain("最长 60 分钟（硬性）");
+    expect(host.textContent).toContain("已应用的条件");
+    expect(host.textContent).toContain("尚未应用");
+    expect(host.textContent).toContain("玩法偏好：public_world");
     expect(host.textContent).not.toContain("party_size");
     expect(host.textContent).not.toContain("session_minutes");
     expect(runtime.naturalLanguageRecommendations).toHaveBeenCalledTimes(1);

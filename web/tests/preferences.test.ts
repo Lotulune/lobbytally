@@ -27,6 +27,10 @@ describe("preference helpers", () => {
     setPreferenceOwnerResolver(null);
   });
 
+  it("treats untouched default preferences as unconfirmed", () => {
+    expect(defaultPreferences().preference_confidence).toBe(0);
+  });
+
   it("uses the normalized macOS platform identifier", () => {
     expect(PLATFORM_OPTIONS.find((option) => option.label === "macOS")?.id).toBe("macos");
   });
@@ -47,6 +51,11 @@ describe("preference helpers", () => {
   it("ignores version when comparing", () => {
     const base = defaultPreferences();
     expect(preferencesChanged(base, { ...base, version: base.version + 5 })).toBe(false);
+  });
+
+  it("detects when the player confirms previously uncertain preferences", () => {
+    const base = defaultPreferences();
+    expect(preferencesChanged(base, { ...base, preference_confidence: 1 })).toBe(true);
   });
 
   it("detects scalar and set changes", () => {

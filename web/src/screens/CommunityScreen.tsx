@@ -212,7 +212,12 @@ export function CommunityScreen({ onOpenGame }: { onOpenGame: (appId: number) =>
       <div className="community-list">
         {items.map((item) => (
           <article key={item.app_id} className="community-row">
-            <button type="button" className="community-main" onClick={() => onOpenGame(item.app_id)}>
+            <button
+              type="button"
+              className="community-main"
+              data-app-id={item.app_id}
+              onClick={() => onOpenGame(item.app_id)}
+            >
               <GameMedia coverUrl={item.cover_url} name={item.name} appId={item.app_id} compact />
               <span className="community-copy">
                 <strong className="community-name">{item.name}</strong>

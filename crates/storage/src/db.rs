@@ -250,6 +250,24 @@ const KEY_SCHEMA_PROBES: &[(&str, &str)] = &[
         "SELECT user_id, mode, encrypted_api_key, key_version
          FROM user_ai_credentials LIMIT 0",
     ),
+    (
+        "recommendation_runs",
+        "SELECT recommendation_run_id, context_hash, candidate_set_hash,
+                created_at_ms, expires_at_ms
+         FROM recommendation_runs LIMIT 0",
+    ),
+    (
+        "recommendation_items",
+        "SELECT recommendation_run_id, app_id, rank, score_components_json,
+                recorded_at_ms, expires_at_ms
+         FROM recommendation_items LIMIT 0",
+    ),
+    (
+        "recommendation_events",
+        "SELECT recommendation_event_id, recommendation_run_id, app_id,
+                idempotency_key, created_at_ms, expires_at_ms
+         FROM recommendation_events LIMIT 0",
+    ),
 ];
 
 const REQUIRED_PRIMARY_KEYS: &[(&str, &str)] = &[
@@ -262,6 +280,10 @@ const REQUIRED_PRIMARY_KEYS: &[(&str, &str)] = &[
     ("jobs", "job_id"),
     ("play_intent_state", "singleton"),
     ("user_ai_credentials", "user_id"),
+    ("recommendation_runs", "recommendation_run_id"),
+    ("recommendation_items", "recommendation_run_id"),
+    ("recommendation_items", "app_id"),
+    ("recommendation_events", "recommendation_event_id"),
 ];
 
 const REQUIRED_UNIQUE_KEYS: &[(&str, &[&str])] = &[
@@ -274,6 +296,11 @@ const REQUIRED_UNIQUE_KEYS: &[(&str, &[&str])] = &[
     ("account_sessions", &["refresh_token_hash"]),
     ("feedback_events", &["user_id", "idempotency_key"]),
     ("jobs", &["idempotency_key"]),
+    ("recommendation_items", &["recommendation_run_id", "rank"]),
+    (
+        "recommendation_events",
+        &["recommendation_run_id", "idempotency_key"],
+    ),
 ];
 
 fn validate_key_schema(conn: &Connection) -> StorageResult<()> {

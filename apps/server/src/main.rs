@@ -256,6 +256,91 @@ mod tests {
         })
     }
 
+    async fn public_evidence_items(
+        app: &axum::Router,
+        app_id: u32,
+        feature: &str,
+    ) -> Vec<serde_json::Value> {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/games/{app_id}/evidence?feature={feature}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    async fn public_recommendation_context(app: &axum::Router) -> (String, u32) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/feeds/classic_legacy?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (
+            json["recommendation_run_id"]
+                .as_str()
+                .expect("public feed must expose an attributable run id")
+                .to_owned(),
+            json["items"][0]["app_id"].as_u64().unwrap() as u32,
+        )
+    }
+
+    async fn post_public_recommendation_event(
+        app: &axum::Router,
+        run_id: &str,
+        app_id: u32,
+        event_type: &str,
+        idempotency_key: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/recommendation-events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", idempotency_key)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "recommendation_run_id": run_id,
+                            "app_id": app_id,
+                            "event_type": event_type,
+                            "client_created_at_ms": 1_700_000_000_000_i64,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
     #[test]
     fn m6_build_info_matches_compiled_release_metadata() {
         let info = build_info();
@@ -776,6 +861,23 @@ mod tests {
             .iter()
             .filter_map(|value| value.as_str())
             .collect();
+        assert_eq!(first["reason_evidence"], first["evidence_ids"]);
+        let freshness = first["feature_freshness"]
+            .as_object()
+            .expect("feed item must expose per-feature freshness");
+        for feature in ["multiplayer", "reviews", "activity", "price", "release"] {
+            let value = freshness
+                .get(feature)
+                .and_then(serde_json::Value::as_object)
+                .expect("freshness feature must be an object");
+            let status = value["status"].as_str().unwrap();
+            assert!(matches!(status, "fresh" | "unknown"));
+            if status == "fresh" {
+                assert!(value["observed_at_ms"].as_i64().is_some());
+            } else {
+                assert!(value["observed_at_ms"].is_null());
+            }
+        }
         let evidence_response = app
             .oneshot(
                 Request::builder()
@@ -800,6 +902,173 @@ mod tests {
                 .iter()
                 .all(|evidence_id| available_ids.contains(evidence_id)),
             "feed evidence IDs must resolve: {referenced_ids:?} vs {available_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_evidence_synthesizes_normalized_profile_fallbacks_without_duplicates() {
+        let (repo, app) = test_repo_and_app(RateLimitConfig::default());
+        repo.database()
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "UPDATE multiplayer_profiles
+                     SET dominant_mode = 'public_world'
+                     WHERE app_id = 1172470;
+                     UPDATE multiplayer_profiles
+                     SET service_status = 'shutdown'
+                     WHERE app_id = 548430;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        for (app_id, feature, expected) in [
+            (730, "matchmaking_core", serde_json::json!(true)),
+            (1172470, "public_world_dependency", serde_json::json!(true)),
+            (548430, "service_shutdown_risk", serde_json::json!(1.0)),
+        ] {
+            let items = public_evidence_items(&app, app_id, feature).await;
+            assert_eq!(items.len(), 1, "{feature} must have one canonical item");
+            assert_eq!(
+                items[0]["evidence_id"],
+                format!("feature:{feature}:{app_id}")
+            );
+            assert_eq!(items[0]["feature"], feature);
+            assert_eq!(items[0]["value"], expected);
+            assert_eq!(items[0]["source_type"], "computed_profile");
+        }
+
+        repo.database()
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO feature_evidence (
+                         app_id, feature_name, value_json, source_type, source_ref,
+                         confidence, observed_at_ms, is_active
+                     ) VALUES (
+                         730, 'matchmaking_core', 'true', 'integration_test', 'explicit fixture',
+                         0.99, 1, 1
+                     );",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let explicit = public_evidence_items(&app, 730, "matchmaking_core").await;
+        assert_eq!(
+            explicit.len(),
+            1,
+            "computed fallback must not duplicate evidence"
+        );
+        assert_eq!(explicit[0]["evidence_id"], "feature:matchmaking_core:730");
+        assert_eq!(explicit[0]["source_type"], "integration_test");
+        assert_eq!(explicit[0]["confidence"], 0.99);
+    }
+
+    #[tokio::test]
+    async fn public_recommendation_events_persist_allowlisted_safe_metadata() {
+        let app = test_app();
+        let (run_id, app_id) = public_recommendation_context(&app).await;
+        for (event_type, category) in [
+            ("exposure", "impression"),
+            ("detail_open", "engagement"),
+            ("steam_click", "outbound"),
+            ("play_intent", "intent"),
+        ] {
+            let (status, event) = post_public_recommendation_event(
+                &app,
+                &run_id,
+                app_id,
+                event_type,
+                &format!("event-success-{event_type}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{event_type}");
+            assert!(event["recommendation_event_id"].is_i64());
+            assert_eq!(event["recommendation_run_id"], run_id);
+            assert_eq!(event["app_id"], app_id);
+            assert_eq!(event["event_type"], event_type);
+            assert_eq!(event["client_created_at_ms"], 1_700_000_000_000_i64);
+            assert_eq!(event["metadata"]["schema_version"], 1);
+            assert_eq!(event["metadata"]["event_category"], category);
+            assert_eq!(
+                event["metadata"]["source"],
+                "public_recommendation_event_api"
+            );
+            assert!(event.get("idempotency_key").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn public_recommendation_event_duplicate_is_idempotent() {
+        let (repo, app) = test_repo_and_app(RateLimitConfig::default());
+        let (run_id, app_id) = public_recommendation_context(&app).await;
+        let first = post_public_recommendation_event(
+            &app,
+            &run_id,
+            app_id,
+            "detail_open",
+            "event-duplicate",
+        )
+        .await;
+        let retry = post_public_recommendation_event(
+            &app,
+            &run_id,
+            app_id,
+            "detail_open",
+            "event-duplicate",
+        )
+        .await;
+
+        assert_eq!(first.0, StatusCode::CREATED);
+        assert_eq!(retry.0, StatusCode::CREATED);
+        assert_eq!(first.1, retry.1);
+        let stored: i64 = repo
+            .database()
+            .with_conn(|conn| {
+                Ok(
+                    conn.query_row("SELECT COUNT(*) FROM recommendation_events", [], |row| {
+                        row.get(0)
+                    })?,
+                )
+            })
+            .unwrap();
+        assert_eq!(stored, 1);
+    }
+
+    #[tokio::test]
+    async fn public_recommendation_event_rejects_unknown_type() {
+        let app = test_app();
+        let (run_id, app_id) = public_recommendation_context(&app).await;
+        let (status, body) = post_public_recommendation_event(
+            &app,
+            &run_id,
+            app_id,
+            "arbitrary_text",
+            "event-invalid-type",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_argument");
+    }
+
+    #[tokio::test]
+    async fn public_recommendation_event_rejects_run_app_mismatch() {
+        let app = test_app();
+        let (run_id, _) = public_recommendation_context(&app).await;
+        let (status, body) = post_public_recommendation_event(
+            &app,
+            &run_id,
+            2_500_001,
+            "exposure",
+            "event-run-app-mismatch",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_argument");
+        assert_eq!(
+            body["error"]["message"],
+            "recommendation_run_id does not contain this app"
         );
     }
 
@@ -913,6 +1182,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(old_access.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn legacy_preference_put_preserves_existing_confirmation_confidence() {
+        let app = test_app();
+        let session = account_session_json(&app, "legacy_preferences_user").await;
+        let token = session["access_token"].as_str().unwrap();
+
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/preferences")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut confirmed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(initial.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        confirmed["preference_confidence"] = serde_json::json!(1.0);
+        let confirmed_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/preferences")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&confirmed).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirmed_response.status(), StatusCode::OK);
+        let mut legacy: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(confirmed_response.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("preference_confidence");
+        legacy["party_size"] = serde_json::json!(5);
+
+        let legacy_response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/v1/preferences")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&legacy).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_response.status(), StatusCode::OK);
+        let saved: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(legacy_response.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["party_size"], 5);
+        assert_eq!(saved["preference_confidence"], 1.0);
     }
 
     #[tokio::test]
@@ -1730,6 +2072,7 @@ mod tests {
             "/v1/games/{app_id}",
             "/v1/games/{app_id}/evidence",
             "/v1/games/{app_id}/play-intent",
+            "/v1/recommendation-events",
             "/v1/feedback",
             "/v1/feedback/{feedback_id}/undo",
         ] {
@@ -1742,6 +2085,7 @@ mod tests {
         );
         let preferences = &document["components"]["schemas"]["UserPreferences"]["properties"];
         for field in [
+            "preference_confidence",
             "party_size",
             "session_minutes_min",
             "budget_max_each_minor",
@@ -1753,6 +2097,18 @@ mod tests {
                 preferences.get(field).is_some(),
                 "missing preference {field}"
             );
+        }
+        let feed_item = &document["components"]["schemas"]["FeedItemSchema"]["properties"];
+        for field in [
+            "rank",
+            "recommendation_index",
+            "data_confidence",
+            "friend_fit",
+            "slot_reason",
+            "reason_evidence",
+            "feature_freshness",
+        ] {
+            assert!(feed_item.get(field).is_some(), "missing feed field {field}");
         }
         assert!(document["components"]["securitySchemes"]["bearer_auth"].is_object());
     }
@@ -2070,7 +2426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_algorithm_version_is_consistent_across_public_responses() {
+    async fn compiled_algorithm_and_active_config_versions_are_distinct() {
         let (repo, app) = test_repo_and_app(RateLimitConfig::default());
         repo.database()
             .with_conn(|conn| {
@@ -2105,7 +2461,8 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(json["algorithm_version"], "rules-0.1.0", "{uri}");
+            assert_eq!(json["algorithm_version"], "rules-0.3.0", "{uri}");
+            assert_eq!(json["config_version"], "rules-0.1.0", "{uri}");
         }
     }
 

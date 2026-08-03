@@ -23,7 +23,7 @@ function RankedFeedPanel({
   onOpenGame,
 }: {
   section: FeedSection;
-  onOpenGame: (appId: number) => void;
+  onOpenGame: (appId: number, recommendationRunId?: string | null) => void;
 }) {
   // Parent remounts this panel with key={section}, so sort/order always match
   // the active tab without a mid-render reset.
@@ -80,15 +80,17 @@ function RankedFeedPanel({
               {option.label}
             </Button>
           ))}
-          <Button
-            size="small"
-            variant="ghost"
-            onClick={toggleOrder}
-            title={order === "asc" ? "升序" : "降序"}
-            aria-label={order === "asc" ? "当前升序，点击切换为降序" : "当前降序，点击切换为升序"}
-          >
-            {order === "asc" ? "升序 ↑" : "降序 ↓"}
-          </Button>
+          {sort !== "recommended" && (
+            <Button
+              size="small"
+              variant="ghost"
+              onClick={toggleOrder}
+              title={order === "asc" ? "升序" : "降序"}
+              aria-label={order === "asc" ? "当前升序，点击切换为降序" : "当前降序，点击切换为升序"}
+            >
+              {order === "asc" ? "升序 ↑" : "降序 ↓"}
+            </Button>
+          )}
         </div>
       </header>
 
@@ -136,7 +138,12 @@ function RankedFeedPanel({
           />
           <div className="feed-grid">
             {feed.items.map((item) => (
-              <GameCard key={item.app_id} item={item} onOpen={onOpenGame} />
+              <GameCard
+                key={item.app_id}
+                item={item}
+                onOpen={onOpenGame}
+                recommendationRunId={feed.recommendationRunId}
+              />
             ))}
           </div>
           <Pagination
@@ -157,7 +164,7 @@ export function FeedScreen({
   onOpenGame,
 }: {
   section: FeedSection;
-  onOpenGame: (appId: number) => void;
+  onOpenGame: (appId: number, recommendationRunId?: string | null) => void;
 }) {
   return <RankedFeedPanel key={section} section={section} onOpenGame={onOpenGame} />;
 }

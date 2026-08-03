@@ -354,23 +354,38 @@ created_at_ms
 
 每用户一条当前偏好，并带 `version` 做乐观并发控制。枚举与数值范围由 API 和数据库共同验证。
 
+Migration `0019_preference_confidence` 追加 `preference_confidence REAL NOT NULL CHECK (0..1)`。它区分“领域默认值已经存在”与“玩家实际确认过这组偏好”：
+
+- 升级前已有行因迁移兼容默认值保留 `1.0`，避免升级后突然把真实历史偏好收缩为中性。
+- 新建用户由领域层显式写入 `0.0`；人数、模式、平台、开服、时长、预算和语言的持久化适配分均按该值向 `0.5` 收缩。
+- `rules-0.3` 客户端应显式携带并持久化 `preference_confidence`；数据库不会根据一次普通字段更新自动猜测玩家是否已确认。服务端兼容期会检测旧客户端 PUT 是否省略该字段，省略时从当前行恢复原值后再更新，因此不会把迁移后 `1.0` 意外降为未确认；显式提交仍按请求值更新。
+- 请求级显式硬条件通过独立的 `HardConstraints` 掩码生效，只把对应维度视为本次高置信条件，不修改该列。
+
+该迁移仅追加一列，没有自动回写玩家行为标签，也没有启用跨游戏偏好学习。
+
 #### `feedback_events`
 
 追加式事件表：`like`、`not_interested`、`played`、`too_competitive`、`party_size_mismatch`、`hosting_friction`。完整请求指纹用于幂等冲突校验；撤销使用唯一追加事件，不删除历史。
 
 #### `recommendation_runs`
 
-保存请求上下文哈希、算法/配置版本、特征快照、分区、AI 状态和生成时间。
+Migration `0018_recommendation_telemetry`。保存 run ID、可选的部署密钥 HMAC `subject_hash`、请求类型/分区、算法和配置版本、评分语义、结构化上下文 SHA-256、候选集 SHA-256、候选数及创建/过期时间。禁止保存自然语言查询原文；账号 ID 的裸 SHA 不可作为 `subject_hash`。
 
 #### `recommendation_items`
 
-保存每个候选的最终名次、基础分、个人分、AI 分、风险、分项 JSON 和证据 ID。高流量后可只保留抽样或聚合，MVP 保留有限周期用于调试。
+以 `(recommendation_run_id, app_id)` 为主键，保存 run 内唯一最终名次、内部相关性分、可空推荐指数、资料置信度、slot reason、受控分项 JSON 及记录/过期时间。
+
+#### `recommendation_events`
+
+只追加的曝光/交互归因事件，必须以复合外键指向真实的 recommendation item。公开接口仅准入 `exposure`、`detail_open`、`steam_click`、`play_intent`；归因反馈使用受控反馈类型。run 内幂等键防止重复；metadata 仅允许枚举、数值和受控标签，禁止查询原文、用户名、令牌和自由文本。迟到事件会把其关联 item/run 的过期时间延长到事件后的 90 天。Web 已采集这四类事件，但曝光仍以卡片挂载近似、Demo 无独立枚举，不能仅凭表和接口存在声称漏斗已完全覆盖。
 
 ### 7.7 算法配置
 
 #### `algorithm_configs`
 
 保存不可变版本化 JSON、Schema 版本、创建者、创建时间和状态。只有一个版本可标记为当前生产配置；当前配置会在读取时反序列化并校验，并驱动分区天数、CCU/Wilson/熟人适配门槛、候选上限和 MMR 参数。切换必须写审计事件。
+
+配置版本与推荐器代码版本是两个维度：API 的 `algorithm_version` 来自正在执行的代码（当前 `rules-0.3.0`），`config_version` 来自本表的活动行。升级旧数据库时允许继续加载经校验的 `rules-0.2.0` 配置，同时执行 `rules-0.3.0` 公式；不得把活动配置版本冒充代码版本。
 
 ## 8. SQLite 配置
 
@@ -397,6 +412,7 @@ PRAGMA trusted_schema = OFF;
 - 服务启动时只有 `migrate` 角色可执行迁移；其他角色检查版本并在不兼容时拒绝 ready。
 - 破坏性迁移采用“新增列/表 -> 双写/回填 -> 切读 -> 后续版本清理”。
 - 每个迁移在空库、上一版本副本和包含代表性数据的测试库上验证。
+- 当前最新版本为 `0019_preference_confidence`。正式数据库仍须由用户确认后运行 migrator；代码库中存在迁移文件不等于某个部署已经升级。
 
 ## 10. 保留策略
 
@@ -409,7 +425,7 @@ PRAGMA trusted_schema = OFF;
 | 评论/价格快照 | 每日长期；高频记录 180 天后降采样 |
 | 原始商店响应 | 30 天，必要证据片段长期 |
 | 原始评论文本 | 默认不长期保存，最长 30 天用于聚合 |
-| 推荐运行明细 | 90 天或按容量抽样 |
+| 推荐运行、条目与归因事件 | 90 天；迟到事件按其时间延长关联 run/item |
 | AI 在线请求缓存 | 7～30 天，取决于是否含用户偏好 |
 | 人工校正与审计 | 长期 |
 

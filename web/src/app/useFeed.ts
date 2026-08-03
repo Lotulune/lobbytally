@@ -24,6 +24,7 @@ export interface FeedState {
   dataUpdatedAtMs: number | null;
   fromOfflineCache: boolean;
   algorithmVersion: string | null;
+  recommendationRunId: string | null;
 }
 
 const INITIAL: FeedState = {
@@ -36,6 +37,7 @@ const INITIAL: FeedState = {
   dataUpdatedAtMs: null,
   fromOfflineCache: false,
   algorithmVersion: null,
+  recommendationRunId: null,
 };
 
 function toApiError(error: unknown): ApiError {
@@ -93,6 +95,7 @@ export function useFeed(
             dataUpdatedAtMs: data.data_updated_at_ms,
             fromOfflineCache: result.fromOfflineCache,
             algorithmVersion: data.algorithm_version,
+            recommendationRunId: data.recommendation_run_id ?? null,
           });
         })
         .catch((error: unknown) => {

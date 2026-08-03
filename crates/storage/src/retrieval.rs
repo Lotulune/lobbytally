@@ -3,6 +3,10 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+const MAX_FTS_HITS: u32 = 900;
+const MAX_HYBRID_RESULTS: u32 = 300;
+const HYBRID_SOURCE_OVERSAMPLE: u32 = 3;
+
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
@@ -89,6 +93,23 @@ pub struct RetrievalSyncStats {
     pub documents_unchanged: u32,
     pub embeddings_written: u32,
     pub embeddings_unchanged: u32,
+    /// Last catalog app processed by this batch.
+    pub last_app_id: Option<u32>,
+    /// Cursor to pass to the next batch. Zero means start a new full pass.
+    pub next_after_app_id: u32,
+    pub has_more: bool,
+    pub catalog_apps: u32,
+    pub apps_covered: u32,
+}
+
+impl RetrievalSyncStats {
+    pub fn coverage_ratio(self) -> f64 {
+        if self.catalog_apps == 0 {
+            1.0
+        } else {
+            (f64::from(self.apps_covered) / f64::from(self.catalog_apps)).clamp(0.0, 1.0)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,7 +219,10 @@ impl Repository {
     }
 
     pub fn search_game_fts(&self, query: &str, limit: u32) -> StorageResult<Vec<FtsHit>> {
-        let limit = limit.clamp(1, 100);
+        // Hybrid recall may need more raw document hits than final app IDs because
+        // one app can own several indexed documents. Keep the public repository
+        // method bounded while allowing a 3x source window for a 300-app pool.
+        let limit = limit.clamp(1, MAX_FTS_HITS);
         let q = query.trim();
         if q.is_empty() {
             return Ok(Vec::new());
@@ -399,7 +423,8 @@ impl Repository {
         write_embeddings: bool,
     ) -> StorageResult<RetrievalSyncStats> {
         let limit = limit.clamp(1, 50_000);
-        let rows: Vec<CatalogDocSource> = self.db.with_conn(|conn| {
+        let now_ms = self.db.now_ms();
+        let (mut rows, catalog_apps): (Vec<CatalogDocSource>, u32) = self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT a.app_id, a.canonical_name, a.app_type, a.release_state,
                         COALESCE(p.dominant_mode, ''),
@@ -408,7 +433,19 @@ impl Repository {
                         COALESCE(v.platforms_json, '[]'),
                         COALESCE(v.languages_json, '[]'),
                         COALESCE(loc.name, ''),
-                        COALESCE(loc.short_description, '')
+                        COALESCE(loc.short_description, ''),
+                        COALESCE((
+                            SELECT evidence.value_json
+                            FROM feature_evidence evidence
+                            WHERE evidence.app_id = a.app_id
+                              AND evidence.feature_name IN ('catalog_taxonomy', 'catalog_tags')
+                              AND evidence.is_active = 1
+                              AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms > ?3)
+                            ORDER BY CASE evidence.feature_name
+                                         WHEN 'catalog_taxonomy' THEN 0 ELSE 1 END,
+                                     evidence.observed_at_ms DESC, evidence.evidence_id DESC
+                            LIMIT 1
+                        ), '[]')
                  FROM apps a
                  LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
                  LEFT JOIN app_availability v ON v.app_id = a.app_id
@@ -426,33 +463,60 @@ impl Repository {
                  ORDER BY a.app_id ASC
                  LIMIT ?2",
             )?;
-            let mapped = stmt.query_map(params![after_app_id as i64, limit as i64], |row| {
-                Ok(CatalogDocSource {
-                    app_id: row.get::<_, i64>(0)? as u32,
-                    canonical_name: row.get(1)?,
-                    app_type: row.get(2)?,
-                    release_state: row.get(3)?,
-                    dominant_mode: row.get(4)?,
-                    private_session: row.get::<_, Option<i64>>(5)?.map(|v| v != 0),
-                    online_coop: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
-                    self_hosted_server: row.get::<_, Option<i64>>(7)?.map(|v| v != 0),
-                    recommended_min: row.get::<_, Option<i64>>(8)?.map(|v| v as u8),
-                    recommended_max: row.get::<_, Option<i64>>(9)?.map(|v| v as u8),
-                    platforms_json: row.get(10)?,
-                    languages_json: row.get(11)?,
-                    localized_name: row.get(12)?,
-                    short_description: row.get(13)?,
-                })
-            })?;
+            let mapped = stmt.query_map(
+                params![
+                    after_app_id as i64,
+                    i64::from(limit).saturating_add(1),
+                    now_ms
+                ],
+                |row| {
+                    Ok(CatalogDocSource {
+                        app_id: row.get::<_, i64>(0)? as u32,
+                        canonical_name: row.get(1)?,
+                        app_type: row.get(2)?,
+                        release_state: row.get(3)?,
+                        dominant_mode: row.get(4)?,
+                        private_session: row.get::<_, Option<i64>>(5)?.map(|v| v != 0),
+                        online_coop: row.get::<_, Option<i64>>(6)?.map(|v| v != 0),
+                        self_hosted_server: row.get::<_, Option<i64>>(7)?.map(|v| v != 0),
+                        recommended_min: row.get::<_, Option<i64>>(8)?.map(|v| v as u8),
+                        recommended_max: row.get::<_, Option<i64>>(9)?.map(|v| v as u8),
+                        platforms_json: row.get(10)?,
+                        languages_json: row.get(11)?,
+                        localized_name: row.get(12)?,
+                        short_description: row.get(13)?,
+                        catalog_taxonomy_json: row.get(14)?,
+                    })
+                },
+            )?;
             let mut out = Vec::new();
             for row in mapped {
                 out.push(row?);
             }
-            Ok(out)
+            let catalog_apps =
+                conn.query_row("SELECT COUNT(*) FROM apps", [], |row| row.get::<_, i64>(0))?;
+            Ok((out, u32::try_from(catalog_apps).unwrap_or(u32::MAX)))
         })?;
+
+        // Read one sentinel row to determine whether another page exists, but
+        // never perform more than `limit` apps of derived work in one call.
+        let has_more = rows.len() > limit as usize;
+        if has_more {
+            rows.truncate(limit as usize);
+        }
+        let last_app_id = rows.last().map(|row| row.app_id);
+        let next_after_app_id = if has_more {
+            last_app_id.unwrap_or(after_app_id)
+        } else {
+            0
+        };
 
         let mut stats = RetrievalSyncStats {
             apps_scanned: rows.len() as u32,
+            last_app_id,
+            next_after_app_id,
+            has_more,
+            catalog_apps,
             ..RetrievalSyncStats::default()
         };
 
@@ -505,6 +569,20 @@ impl Repository {
                 }
             }
         }
+        stats.apps_covered = self.db.with_conn(|conn| {
+            let count = conn.query_row(
+                "SELECT COUNT(*)
+                 FROM apps app
+                 WHERE EXISTS (
+                     SELECT 1 FROM game_documents document
+                     WHERE document.app_id = app.app_id
+                       AND document.document_id = 'app:' || app.app_id || ':identity'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        })?;
         Ok(stats)
     }
 
@@ -627,12 +705,15 @@ impl Repository {
         model: &str,
         limit: u32,
     ) -> StorageResult<Vec<HybridHit>> {
-        let limit = limit.clamp(1, 100);
+        let limit = limit.clamp(1, MAX_HYBRID_RESULTS);
+        let source_limit = limit
+            .saturating_mul(HYBRID_SOURCE_OVERSAMPLE)
+            .min(MAX_FTS_HITS);
         let fts_query = fts_match_query(query);
         let fts_hits = if fts_query.is_empty() {
             Vec::new()
         } else {
-            self.search_game_fts(&fts_query, limit.saturating_mul(3).max(limit))?
+            self.search_game_fts(&fts_query, source_limit)?
         };
 
         let mut fts_best: HashMap<u32, f64> = HashMap::new();
@@ -650,7 +731,7 @@ impl Repository {
             query_vector.to_vec()
         };
         let dims = qvec.len();
-        let vector_capacity = (limit as usize).saturating_mul(3).max(limit as usize);
+        let vector_capacity = source_limit as usize;
         let mut vector_best: HashMap<u32, f64> = HashMap::new();
         let mut vector_min_heap: BinaryHeap<Reverse<VectorRank>> = BinaryHeap::new();
         self.db.with_conn(|conn| {
@@ -791,6 +872,7 @@ struct CatalogDocSource {
     languages_json: String,
     localized_name: String,
     short_description: String,
+    catalog_taxonomy_json: String,
 }
 
 impl CatalogDocSource {
@@ -799,11 +881,12 @@ impl CatalogDocSource {
         let alias = self.localized_name.trim();
         let platforms = self.platforms_json.trim();
         let languages = self.languages_json.trim();
+        let catalog_tags = catalog_taxonomy_from_json(&self.catalog_taxonomy_json);
         let identity_body = format!(
-            "type={} release={} platforms={} languages={}",
-            self.app_type, self.release_state, platforms, languages
+            "type={} release={} platforms={} languages={} catalog_taxonomy={}",
+            self.app_type, self.release_state, platforms, languages, catalog_tags
         );
-        let identity_tags = format!("{} {}", self.app_type, self.release_state);
+        let identity_tags = format!("{} {} {}", self.app_type, self.release_state, catalog_tags);
         let identity_hash = content_hash(&[
             "identity",
             "und",
@@ -826,8 +909,9 @@ impl CatalogDocSource {
             visibility: "public".into(),
         });
 
+        let mp_tags = format!("{} {}", self.dominant_mode, catalog_tags);
         let mp_body = format!(
-            "mode={} private_session={} online_coop={} self_host={} party={}..{}",
+            "mode={} private_session={} online_coop={} self_host={} party={}..{} catalog_taxonomy={}",
             self.dominant_mode,
             fmt_opt_bool(self.private_session),
             fmt_opt_bool(self.online_coop),
@@ -838,6 +922,7 @@ impl CatalogDocSource {
             self.recommended_max
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "?".into()),
+            catalog_tags,
         );
         let mp_hash = content_hash(&[
             "multiplayer_profile",
@@ -845,7 +930,7 @@ impl CatalogDocSource {
             &self.canonical_name,
             &mp_body,
             alias,
-            &self.dominant_mode,
+            &mp_tags,
             "public",
         ]);
         docs.push(UpsertGameDocument {
@@ -857,7 +942,7 @@ impl CatalogDocSource {
             body: mp_body,
             content_hash: mp_hash,
             aliases: alias.to_owned(),
-            tags: self.dominant_mode.clone(),
+            tags: mp_tags,
             visibility: "public".into(),
         });
 
@@ -870,6 +955,7 @@ impl CatalogDocSource {
                 &self.canonical_name,
                 &body,
                 alias,
+                &catalog_tags,
                 "public",
             ]);
             docs.push(UpsertGameDocument {
@@ -881,12 +967,46 @@ impl CatalogDocSource {
                 body,
                 content_hash: store_hash,
                 aliases: alias.to_owned(),
-                tags: String::new(),
+                tags: catalog_tags.clone(),
                 visibility: "public".into(),
             });
         }
         docs
     }
+}
+
+fn catalog_taxonomy_from_json(value_json: &str) -> String {
+    fn collect(value: &serde_json::Value, tags: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(value) => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    tags.push(value.chars().take(160).collect());
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, tags);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    collect(value, tags);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(value_json) else {
+        return String::new();
+    };
+    let mut tags = Vec::new();
+    collect(&value, &mut tags);
+    tags.sort_unstable();
+    tags.dedup();
+    tags.truncate(64);
+    tags.join(" ")
 }
 
 fn fmt_opt_bool(value: Option<bool>) -> &'static str {
@@ -1204,6 +1324,11 @@ mod tests {
         let repo = repo();
         let stats = repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
         assert!(stats.apps_scanned > 0);
+        assert_eq!(stats.last_app_id.is_some(), stats.apps_scanned > 0);
+        assert!(!stats.has_more);
+        assert_eq!(stats.next_after_app_id, 0);
+        assert_eq!(stats.apps_covered, stats.catalog_apps);
+        assert_eq!(stats.coverage_ratio(), 1.0);
         assert!(stats.documents_written > 0);
         assert!(stats.embeddings_written > 0);
         assert!(repo.document_count().unwrap() > 0);
@@ -1234,6 +1359,169 @@ mod tests {
         // After sync with embeddings, current hashes should already be embedded.
         assert!(missing.is_empty());
         assert!(repo.embedding_count().unwrap() > 0);
+    }
+
+    #[test]
+    fn hybrid_search_returns_more_than_the_legacy_one_hundred_result_cap() {
+        let repo = repo();
+        let first_app_id = 4_100_000_000_u32;
+        let count = 125_u32;
+        repo.database()
+            .with_conn_mut(|conn| {
+                let tx = conn.transaction()?;
+                for offset in 0..count {
+                    let app_id = first_app_id + offset;
+                    tx.execute(
+                        "INSERT INTO apps (
+                             app_id, app_type, canonical_name, release_state,
+                             created_at_ms, updated_at_ms
+                         ) VALUES (?1, 'game', ?2, 'released', 1, 1)",
+                        params![app_id, format!("Recall game {offset}")],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        for offset in 0..count {
+            let app_id = first_app_id + offset;
+            let document_id = format!("wide-recall-{app_id}");
+            let content_hash = format!("wide-recall-hash-{app_id}");
+            repo.upsert_game_document(&UpsertGameDocument {
+                document_id: document_id.clone(),
+                app_id,
+                doc_type: "identity".into(),
+                language: "en".into(),
+                title: format!("Recall game {offset}"),
+                body: "massrecalltoken cooperative friends".into(),
+                content_hash: content_hash.clone(),
+                aliases: String::new(),
+                tags: "cooperative".into(),
+                visibility: "public".into(),
+            })
+            .unwrap();
+            repo.put_embedding(&PutEmbedding {
+                document_id,
+                provider: "wide-provider".into(),
+                model: "wide-model".into(),
+                dimensions: 2,
+                vector_blob: encode_f32_le(&[1.0, 0.0]),
+                is_l2_normalized: true,
+                content_hash,
+            })
+            .unwrap();
+        }
+
+        let hits = repo
+            .hybrid_search_with_vector(
+                "massrecalltoken",
+                &[1.0, 0.0],
+                "wide-provider",
+                "wide-model",
+                300,
+            )
+            .unwrap();
+        let distinct: HashSet<u32> = hits.iter().map(|hit| hit.app_id).collect();
+        assert_eq!(hits.len(), count as usize);
+        assert_eq!(distinct.len(), count as usize);
+    }
+
+    #[test]
+    fn catalog_sync_paginates_through_every_app_and_wraps() {
+        let repo = repo();
+        let catalog_apps = repo
+            .database()
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM apps", [], |row| row.get::<_, i64>(0))
+                    .map_err(StorageError::from)
+            })
+            .unwrap() as u32;
+        assert!(catalog_apps > 2);
+
+        let mut after_app_id = 0;
+        let mut previous_coverage = 0.0;
+        let mut batches = 0;
+        loop {
+            let stats = repo
+                .sync_retrieval_from_catalog(2, after_app_id, false)
+                .unwrap();
+            batches += 1;
+            assert!(stats.apps_scanned <= 2);
+            assert_eq!(stats.catalog_apps, catalog_apps);
+            assert!(stats.coverage_ratio() >= previous_coverage);
+
+            if !stats.has_more {
+                assert_eq!(stats.next_after_app_id, 0);
+                assert_eq!(stats.apps_covered, catalog_apps);
+                assert_eq!(stats.coverage_ratio(), 1.0);
+                break;
+            }
+
+            let last_app_id = stats.last_app_id.expect("non-final page has an app");
+            assert_eq!(stats.next_after_app_id, last_app_id);
+            assert!(last_app_id > after_app_id);
+            after_app_id = stats.next_after_app_id;
+            previous_coverage = stats.coverage_ratio();
+            assert!(batches <= catalog_apps, "cursor must always make progress");
+        }
+
+        assert_eq!(batches, catalog_apps.div_ceil(2));
+        let indexed_apps = repo
+            .database()
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(DISTINCT app_id) FROM game_documents",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(StorageError::from)
+            })
+            .unwrap() as u32;
+        assert_eq!(indexed_apps, catalog_apps);
+
+        let wrapped = repo.sync_retrieval_from_catalog(2, 0, false).unwrap();
+        assert_eq!(wrapped.apps_scanned, 2);
+        assert!(wrapped.has_more);
+    }
+
+    #[test]
+    fn catalog_taxonomy_evidence_is_searchable_and_invalid_json_is_harmless() {
+        let repo = repo();
+        let app_ids = repo
+            .database()
+            .with_conn(|conn| {
+                let mut statement =
+                    conn.prepare("SELECT app_id FROM apps ORDER BY app_id LIMIT 2")?;
+                let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StorageError::from)
+            })
+            .unwrap();
+        let tagged_app_id = app_ids[0] as u32;
+        let invalid_app_id = app_ids[1] as u32;
+        repo.database()
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    "INSERT INTO feature_evidence (
+                         app_id, feature_name, value_json, source_type, source_ref,
+                         confidence, observed_at_ms, is_active
+                     ) VALUES
+                         (?1, 'catalog_taxonomy', ?2, 'test', 'test', 1, 10, 1),
+                         (?3, 'catalog_tags', 'not-json', 'test', 'test', 1, 10, 1)",
+                    params![
+                        tagged_app_id as i64,
+                        r#"{"categories":["Co-op"],"genres":["Action Roguelike"],"developers":["Test Studio"],"publishers":["Test Publisher"]}"#,
+                        invalid_app_id as i64
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        repo.sync_retrieval_from_catalog(500, 0, false).unwrap();
+        let hits = repo.hybrid_search("roguelike", 10).unwrap();
+        assert!(hits.iter().any(|hit| hit.app_id == tagged_app_id));
     }
 
     #[test]

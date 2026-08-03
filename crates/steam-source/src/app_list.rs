@@ -99,6 +99,9 @@ pub struct AppListPage {
     pub page_last_appid: u32,
     pub page_max_last_modified: u32,
     pub content_hash: String,
+    /// Steam sometimes omits `name` on catalog rows. Those rows are skipped so a
+    /// single incomplete entry cannot stall the whole catalog cursor.
+    pub skipped_missing_name: u32,
 }
 
 impl AppListPage {
@@ -134,19 +137,23 @@ pub fn parse_app_list_page(raw: &RawResponse) -> Result<AppListPage, SourceError
     let mut proposals = Vec::with_capacity(body.apps.len());
     let mut page_max_last_modified = 0_u32;
     let mut max_appid = 0_u32;
+    let mut skipped_missing_name = 0_u32;
 
     for app in body.apps {
         if app.appid == 0 {
             return Err(SourceError::invalid_structure("appid must be non-zero"));
         }
+        // Advance past every appid on the page, including rows we skip, so a
+        // nameless entry cannot pin the durable cursor forever.
         max_appid = max_appid.max(app.appid);
         if let Some(modified) = app.last_modified {
             page_max_last_modified = page_max_last_modified.max(modified);
         }
 
-        let name = app.name.filter(|n| !n.trim().is_empty()).ok_or_else(|| {
-            SourceError::invalid_structure(format!("app {} missing name", app.appid))
-        })?;
+        let Some(name) = app.name.filter(|n| !n.trim().is_empty()) else {
+            skipped_missing_name = skipped_missing_name.saturating_add(1);
+            continue;
+        };
 
         proposals.push(AppCatalogProposal {
             app_id: app.appid,
@@ -167,7 +174,8 @@ pub fn parse_app_list_page(raw: &RawResponse) -> Result<AppListPage, SourceError
             "have_more_results requires last_appid",
         ));
     }
-    if !proposals.is_empty() && page_last_appid != max_appid {
+    // Compare against every appid seen on the page (including skipped rows).
+    if max_appid > 0 && page_last_appid != max_appid {
         return Err(SourceError::invalid_structure(format!(
             "response last_appid {page_last_appid} does not match page maximum appid {max_appid}"
         )));
@@ -179,6 +187,7 @@ pub fn parse_app_list_page(raw: &RawResponse) -> Result<AppListPage, SourceError
         page_last_appid,
         page_max_last_modified,
         content_hash: raw.content_hash.clone(),
+        skipped_missing_name,
     })
 }
 
@@ -313,6 +322,74 @@ mod tests {
         let err = parse_app_list_page(&raw).unwrap_err();
         assert!(matches!(err, SourceError::InvalidStructure { .. }));
         assert!(err.to_string().contains("page maximum appid 20"));
+    }
+
+    #[test]
+    fn skips_apps_missing_name_without_stalling_cursor() {
+        // Mirrors production stall: Steam returns a row without `name` mid-page.
+        let raw = RawResponse::validate(
+            200,
+            br#"{"response":{"apps":[
+                {"appid":383010,"name":"Named Game","last_modified":1700000100},
+                {"appid":396420,"last_modified":1700000200},
+                {"appid":396421,"name":"  ","last_modified":1700000300},
+                {"appid":400000,"name":"Later Game","last_modified":1700000400}
+            ],"have_more_results":true,"last_appid":400000}}"#
+                .to_vec(),
+            None,
+            1024,
+        )
+        .unwrap();
+        let page = parse_app_list_page(&raw).unwrap();
+        assert_eq!(page.proposals.len(), 2);
+        assert_eq!(page.proposals[0].app_id, 383010);
+        assert_eq!(page.proposals[1].app_id, 400000);
+        assert_eq!(page.skipped_missing_name, 2);
+        assert_eq!(page.page_last_appid, 400000);
+        assert!(page.have_more_results);
+
+        let mut cursor = AppListCursor::new_pass(0, ADAPTER_VERSION);
+        // Resume point just before the nameless row, as in production.
+        cursor.last_appid = 383010;
+        apply_page_to_cursor(&mut cursor, &page);
+        assert_eq!(cursor.last_appid, 400000);
+        assert!(cursor.have_more_results);
+    }
+
+    #[test]
+    fn page_of_only_nameless_apps_still_advances_cursor() {
+        let raw = RawResponse::validate(
+            200,
+            br#"{"response":{"apps":[
+                {"appid":396420,"last_modified":1700000200}
+            ],"have_more_results":true,"last_appid":396420}}"#
+                .to_vec(),
+            None,
+            1024,
+        )
+        .unwrap();
+        let page = parse_app_list_page(&raw).unwrap();
+        assert!(page.proposals.is_empty());
+        assert_eq!(page.skipped_missing_name, 1);
+        assert_eq!(page.page_last_appid, 396420);
+
+        let request = AppListRequest {
+            last_appid: 383010,
+            if_modified_since: 0,
+            max_results: 100,
+            include_games: true,
+            include_dlc: false,
+            include_software: false,
+            include_videos: false,
+            include_hardware: false,
+        };
+        // Empty proposal pages do not need request-cursor validation.
+        page.validate_for_request(&request).unwrap();
+
+        let mut cursor = AppListCursor::new_pass(0, ADAPTER_VERSION);
+        cursor.last_appid = 383010;
+        apply_page_to_cursor(&mut cursor, &page);
+        assert_eq!(cursor.last_appid, 396420);
     }
 
     #[test]

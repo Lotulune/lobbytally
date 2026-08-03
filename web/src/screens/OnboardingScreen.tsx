@@ -104,6 +104,7 @@ export function OnboardingScreen({ onDone }: { onDone: () => void }) {
     const session = SESSION_OPTIONS[sessionIdx] ?? SESSION_OPTIONS[1]!;
     const budget = BUDGET_CHOICES[budgetIdx] ?? BUDGET_CHOICES[2]!;
     const patch: PendingPreferencesPatch = {
+      preference_confidence: 1,
       party_size: party,
       coop_competitive: coopCompetitive,
       session_minutes_min: session.min,
@@ -134,6 +135,11 @@ export function OnboardingScreen({ onDone }: { onDone: () => void }) {
       setSaving(false);
       onDone();
     }
+  };
+
+  const skipPreferences = () => {
+    markOnboarded();
+    onDone();
   };
 
   if (step === 0) {
@@ -256,6 +262,9 @@ export function OnboardingScreen({ onDone }: { onDone: () => void }) {
       <div className="onboarding-actions">
         <Button variant="ghost" onClick={() => setStep(0)}>
           ← 换个主题
+        </Button>
+        <Button variant="ghost" disabled={saving} onClick={skipPreferences}>
+          稍后设置/不确定
         </Button>
         <Button
           ref={doneBtnRef}

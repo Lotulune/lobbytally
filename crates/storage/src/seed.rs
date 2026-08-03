@@ -237,9 +237,17 @@ pub fn seed_demo_catalog_if_empty(conn: &Connection, now_ms: i64) -> StorageResu
 
 pub fn seed_demo_catalog(conn: &Connection, now_ms: i64) -> StorageResult<usize> {
     for game in SEED {
-        let rolling_release_date = (game.section_hint == "rolling_recent_sample").then(|| {
-            crate::util::day_utc_from_ms(now_ms.saturating_sub(30_i64 * 24 * 60 * 60 * 1000))
-        });
+        let rolling_release_date = match game.section_hint {
+            "rolling_recent_sample" => Some(crate::util::day_utc_from_ms(
+                now_ms.saturating_sub(30_i64 * 24 * 60 * 60 * 1000),
+            )),
+            // Upcoming eligibility is intentionally limited to the next 30
+            // days, so keep the local demo seed valid relative to its clock.
+            "upcoming" => Some(crate::util::day_utc_from_ms(
+                now_ms.saturating_add(14_i64 * 24 * 60 * 60 * 1000),
+            )),
+            _ => None,
+        };
         let release_date = rolling_release_date.as_deref().or(game.release_date);
         upsert_app(
             conn,

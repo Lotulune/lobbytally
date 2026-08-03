@@ -117,7 +117,12 @@ export function SearchScreen({ onOpenGame }: { onOpenGame: (appId: number) => vo
         <ul className="search-results">
           {state.items.map((item) => (
             <li key={item.app_id}>
-              <button type="button" className="search-row" onClick={() => onOpenGame(item.app_id)}>
+              <button
+                type="button"
+                className="search-row"
+                data-app-id={item.app_id}
+                onClick={() => onOpenGame(item.app_id)}
+              >
                 <GameMedia coverUrl={null} name={item.name} appId={item.app_id} compact />
                 <span className="search-copy">
                   <span className="search-name">{item.name}</span>

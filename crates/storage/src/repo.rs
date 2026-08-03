@@ -978,7 +978,7 @@ impl Repository {
                 .list_candidates(section, &cutoff, &today, "CNY", config, limit)?
                 .into_iter()
                 .filter(|row| {
-                    let signals = row.to_ranking_signals();
+                    let signals = row.to_ranking_signals_at(&today);
                     crate::query::section_matches(section, row, &signals, &cutoff, &today, config)
                 })
                 .count() as i64;

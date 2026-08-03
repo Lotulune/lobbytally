@@ -65,4 +65,45 @@ describe("FeedScreen", () => {
       main.remove();
     }
   });
+
+  it("does not offer a meaningless direction toggle for recommended order", () => {
+    const main = document.createElement("main");
+    document.body.append(main);
+    const root = createRoot(main);
+    try {
+      act(() => root.render(<FeedScreen section="recent_release" onOpenGame={() => undefined} />));
+
+      expect(main.querySelector('[aria-label*="当前降序"]')).toBeNull();
+
+      const ccu = Array.from(main.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "在线人数",
+      );
+      act(() => ccu?.click());
+
+      expect(main.querySelector('[aria-label*="当前降序"]')).not.toBeNull();
+    } finally {
+      act(() => root.unmount());
+      main.remove();
+    }
+  });
+
+  it("offers a strict fit-index sort with an explicit direction", () => {
+    const main = document.createElement("main");
+    document.body.append(main);
+    const root = createRoot(main);
+    try {
+      act(() => root.render(<FeedScreen section="recent_release" onOpenGame={() => undefined} />));
+
+      const fit = Array.from(main.querySelectorAll("button")).find(
+        (button) => button.textContent?.trim() === "适配指数",
+      );
+      expect(fit).toBeTruthy();
+
+      act(() => fit?.click());
+      expect(main.querySelector('[aria-label*="当前降序"]')).not.toBeNull();
+    } finally {
+      act(() => root.unmount());
+      main.remove();
+    }
+  });
 });

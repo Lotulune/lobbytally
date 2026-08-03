@@ -143,32 +143,34 @@ pub fn resolve_user_id(
 
 pub fn get_preferences(conn: &Connection, user_id: &str) -> StorageResult<UserPreferences> {
     conn.query_row(
-        "SELECT version, party_size, coop_competitive, session_minutes_min, session_minutes_max,
+        "SELECT version, preference_confidence, party_size, coop_competitive,
+                session_minutes_min, session_minutes_max,
                 budget_currency, budget_max_each_minor, platforms_json, self_hosting_willingness,
                 languages_json, excluded_modes_json
          FROM user_preferences WHERE user_id = ?1",
         params![user_id],
         |row| {
-            let platforms_json: String = row.get(7)?;
-            let languages_json: String = row.get(9)?;
-            let excluded_json: String = row.get(10)?;
+            let platforms_json: String = row.get(8)?;
+            let languages_json: String = row.get(10)?;
+            let excluded_json: String = row.get(11)?;
             Ok(UserPreferences {
                 version: row.get(0)?,
-                party_size: row.get::<_, i64>(1)? as u8,
-                coop_competitive: row.get(2)?,
-                session_minutes_min: row.get::<_, i64>(3)? as u32,
-                session_minutes_max: row.get::<_, i64>(4)? as u32,
-                budget_currency: row.get(5)?,
-                budget_max_each_minor: row.get(6)?,
+                preference_confidence: row.get(1)?,
+                party_size: row.get::<_, i64>(2)? as u8,
+                coop_competitive: row.get(3)?,
+                session_minutes_min: row.get::<_, i64>(4)? as u32,
+                session_minutes_max: row.get::<_, i64>(5)? as u32,
+                budget_currency: row.get(6)?,
+                budget_max_each_minor: row.get(7)?,
                 platforms: serde_json::from_str(&platforms_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(7, Type::Text, Box::new(error))
+                    rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(error))
                 })?,
-                self_hosting_willingness: row.get(8)?,
+                self_hosting_willingness: row.get(9)?,
                 languages: serde_json::from_str(&languages_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(error))
+                    rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
                 })?,
                 excluded_modes: serde_json::from_str(&excluded_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
+                    rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(error))
                 })?,
             })
         },
@@ -209,12 +211,14 @@ fn upsert_preferences(
 ) -> StorageResult<()> {
     conn.execute(
         "INSERT INTO user_preferences (
-            user_id, version, party_size, coop_competitive, session_minutes_min, session_minutes_max,
+            user_id, version, preference_confidence, party_size, coop_competitive,
+            session_minutes_min, session_minutes_max,
             budget_currency, budget_max_each_minor, platforms_json, self_hosting_willingness,
             languages_json, excluded_modes_json, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(user_id) DO UPDATE SET
             version = excluded.version,
+            preference_confidence = excluded.preference_confidence,
             party_size = excluded.party_size,
             coop_competitive = excluded.coop_competitive,
             session_minutes_min = excluded.session_minutes_min,
@@ -229,6 +233,7 @@ fn upsert_preferences(
         params![
             user_id,
             prefs.version,
+            prefs.preference_confidence,
             prefs.party_size,
             prefs.coop_competitive,
             prefs.session_minutes_min,
@@ -270,7 +275,7 @@ pub fn ensure_algorithm_config(conn: &Connection, now_ms: i64) -> StorageResult<
     let config_json = serde_json::to_string(&RecommendationConfig::default())?;
     conn.execute(
         "INSERT INTO algorithm_configs (version, schema_version, config_json, status, created_by, created_at_ms)
-         VALUES ('rules-0.2.0', 1, ?1, 'active', 'system', ?2)",
+         VALUES ('rules-0.3.0', 1, ?1, 'active', 'system', ?2)",
         params![config_json, now_ms],
     )?;
     Ok(())
