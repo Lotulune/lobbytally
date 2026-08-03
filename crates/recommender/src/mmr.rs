@@ -258,11 +258,11 @@ fn compare_baseline(a: &RankedCandidate, b: &RankedCandidate, tie_seed: u64) -> 
         // currently materialized proxy for date certainty.
         .then_with(|| unit(b.score.freshness).total_cmp(&unit(a.score.freshness)))
         .then_with(|| {
-            (tie_seed != 0)
-                .then(|| {
-                    stable_tie_hash(tie_seed, a.app_id).cmp(&stable_tie_hash(tie_seed, b.app_id))
-                })
-                .unwrap_or(Ordering::Equal)
+            if tie_seed != 0 {
+                stable_tie_hash(tie_seed, a.app_id).cmp(&stable_tie_hash(tie_seed, b.app_id))
+            } else {
+                Ordering::Equal
+            }
         })
         .then_with(|| a.app_id.cmp(&b.app_id))
 }
@@ -296,23 +296,23 @@ fn similarity(a: &RankedCandidate, b: &RankedCandidate) -> f64 {
         weighted_sum += 0.45 * similarity;
         known_weight += 0.45;
     }
-    if let (Some(a_mode), Some(b_mode)) = (&a.dominant_mode, &b.dominant_mode) {
-        if let Some(similarity) = mode_capability_similarity(a_mode, b_mode) {
-            weighted_sum += 0.25 * similarity;
-            known_weight += 0.25;
-        }
+    if let (Some(a_mode), Some(b_mode)) = (&a.dominant_mode, &b.dominant_mode)
+        && let Some(similarity) = mode_capability_similarity(a_mode, b_mode)
+    {
+        weighted_sum += 0.25 * similarity;
+        known_weight += 0.25;
     }
-    if let (Some(a_publisher), Some(b_publisher)) = (&a.publisher, &b.publisher) {
-        if let Some(similarity) = exact_text_similarity(a_publisher, b_publisher) {
-            weighted_sum += 0.15 * similarity;
-            known_weight += 0.15;
-        }
+    if let (Some(a_publisher), Some(b_publisher)) = (&a.publisher, &b.publisher)
+        && let Some(similarity) = exact_text_similarity(a_publisher, b_publisher)
+    {
+        weighted_sum += 0.15 * similarity;
+        known_weight += 0.15;
     }
-    if let (Some(a_series), Some(b_series)) = (&a.series, &b.series) {
-        if let Some(similarity) = exact_text_similarity(a_series, b_series) {
-            weighted_sum += 0.15 * similarity;
-            known_weight += 0.15;
-        }
+    if let (Some(a_series), Some(b_series)) = (&a.series, &b.series)
+        && let Some(similarity) = exact_text_similarity(a_series, b_series)
+    {
+        weighted_sum += 0.15 * similarity;
+        known_weight += 0.15;
     }
 
     if known_weight == 0.0 {

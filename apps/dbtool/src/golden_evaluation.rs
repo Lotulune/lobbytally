@@ -528,13 +528,13 @@ fn train_pairwise(pairs: &[Pair], initial: [f64; FEATURE_COUNT]) -> [f64; FEATUR
         for pair in pairs {
             let margin = dot(weights, pair.difference);
             let coefficient = -sigmoid_negative_margin(margin) / pairs.len() as f64;
-            for index in 0..FEATURE_COUNT {
-                gradient[index] += coefficient * pair.difference[index];
+            for (gradient_slot, difference) in gradient.iter_mut().zip(pair.difference.iter()) {
+                *gradient_slot += coefficient * difference;
             }
         }
         let step = INITIAL_STEP / (1.0 + epoch as f64 / 50.0).sqrt();
-        for index in 0..FEATURE_COUNT {
-            weights[index] -= step * gradient[index];
+        for (weight, gradient_slot) in weights.iter_mut().zip(gradient.iter()) {
+            *weight -= step * gradient_slot;
         }
         project_weights(&mut weights);
     }

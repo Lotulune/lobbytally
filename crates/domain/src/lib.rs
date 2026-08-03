@@ -36,7 +36,7 @@ impl Signal<f64> {
 
 impl Signal<bool> {
     pub fn effective_probability_with(&self, cohort_prior: f64) -> f64 {
-        let observed = self.value.map_or(cohort_prior, |value| f64::from(value));
+        let observed = self.value.map_or(cohort_prior, f64::from);
         let confidence = unit_interval(self.confidence);
         confidence * observed + (1.0 - confidence) * unit_interval(cohort_prior)
     }
