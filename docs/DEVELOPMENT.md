@@ -89,7 +89,7 @@ cargo run -p mpgs-dbtool -- restore .\backups\mpgs.db .\data-restored\mpgs.db
 .\scripts\restore_db.ps1 -From .\backups\mpgs.db -To .\data-restored\mpgs.db
 ```
 
-`collect-steam-candidates` 使用 Steam 商店搜索的 `category2=1` 多人分类和 `Reviews_DESC` 排序。该接口没有稳定公开契约，因此实现位于独立易变适配器中：响应限制为 4 MiB，HTML 通过 DOM 解析器读取，失败最多退避重试 3 次，成功页间隔至少 1.1 秒；每页写入 `source_documents`、`feature_evidence`、`source_runs` 和 `source_cursors`。命令可安全续传，但它只建立低置信候选证据，不会推断合作、自建服或私人房间能力。
+`collect-steam-candidates` 使用 Steam 商店搜索的 `category2=1` 多人分类；自 `store-search-0.2` 起默认 `Released_DESC` 排序（新游优先；旧版 `Reviews_DESC` 会漏掉刚发售、评价少的联机作）。该接口没有稳定公开契约，因此实现位于独立易变适配器中：响应限制为 4 MiB，HTML 通过 DOM 解析器读取，失败最多退避重试 3 次，成功页间隔至少 1.1 秒；每页写入 `source_documents`、`feature_evidence`、`source_runs` 和 `source_cursors`。命令可安全续传，但它只建立低置信候选证据，不会推断合作、自建服或私人房间能力。
 
 `collect-steam-catalog` 使用官方 `IStoreService/GetAppList`。它只从服务端环境变量 `MPGS_STEAM_WEB_API_KEY` 读取密钥，默认拉取一页 1,000 条游戏目录；每页在单一事务中写入目录、官方 CDN 封面回退、来源文档和游标。`max-pages` 与 `page-size` 仅限制本次运行，下一次会从持久化游标继续；完成一次目录遍历后，下一次运行以 `if_modified_since` 进行增量同步。密钥不写入 SQLite、来源文档、命令行参数或普通错误输出。
 

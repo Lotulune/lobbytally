@@ -56,7 +56,8 @@ pub use store::{
 };
 pub use store_search::{
     ADAPTER_VERSION as STORE_SEARCH_ADAPTER_VERSION, SOURCE_NAME as STORE_SEARCH_SOURCE_NAME,
-    StoreSearchCandidate, StoreSearchPage, StoreSearchRequest, parse_store_search_page,
+    StoreSearchCandidate, StoreSearchPage, StoreSearchRequest, StoreSearchSort,
+    parse_store_search_page,
 };
 
 /// Recommended default User-Agent for MPGS server-side fetches.

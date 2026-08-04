@@ -26,7 +26,9 @@ use mpgs_storage::{
 };
 use serde::{Deserialize, Serialize};
 
-const STORE_SEARCH_CURSOR_KEY: &str = "steam_store_search:multiplayer:reviews_desc";
+// Cursor key is sort-specific so switching discovery ranking starts a fresh crawl
+// instead of resuming the old Reviews_DESC offset.
+const STORE_SEARCH_CURSOR_KEY: &str = "steam_store_search:multiplayer:released_desc";
 const ENRICH_CURSOR_KEY: &str = "steam_store_enrichment:dynamic:v2";
 const APP_LIST_CURSOR_KEY: &str = "steam_istore_getapplist:games:v1";
 const APP_LIST_PAGES_DEFAULT: u32 = 1;
@@ -458,7 +460,7 @@ fn run() -> Result<(), String> {
                     STORE_SEARCH_SOURCE_NAME,
                     "candidate_discovery",
                     STORE_SEARCH_ADAPTER_VERSION,
-                    Some("category2=1;sort=Reviews_DESC;cc=US;l=english"),
+                    Some("category2=1;sort=Released_DESC;cc=US;l=english"),
                 )
                 .map_err(err)?;
             match collect_steam_candidates(&repo, target) {
@@ -1067,7 +1069,7 @@ fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
             STORE_SEARCH_SOURCE_NAME,
             "candidate_discovery",
             STORE_SEARCH_ADAPTER_VERSION,
-            Some("worker=true;category2=1;sort=Reviews_DESC;cc=US;l=english"),
+            Some("worker=true;category2=1;sort=Released_DESC;cc=US;l=english"),
         )
         .map_err(worker_storage_error)?;
     match collect_steam_candidates(repo, STORE_SEARCH_TARGET_DEFAULT) {

@@ -781,21 +781,26 @@ pub fn ingest_store_search_page(
          ) VALUES (?1, 'search_page', ?2, 'application/json', ?3, NULL, ?4, ?5)",
         params![
             STORE_SEARCH_SOURCE_NAME,
-            format!("multiplayer:reviews_desc:{}", page.start),
+            format!(
+                "multiplayer:{}:{}",
+                page.sort.as_query_value().to_ascii_lowercase(),
+                page.start
+            ),
             page.content_hash,
             now_ms,
             STORE_SEARCH_ADAPTER_VERSION,
         ],
     )?;
     let document_id = conn.last_insert_rowid();
+    let sort = page.sort.as_query_value();
     let source_ref = format!(
-        "steam_store_search:category2=1;sort=Reviews_DESC;start={};sha256={}",
+        "steam_store_search:category2=1;sort={sort};start={};sha256={}",
         page.start, page.content_hash
     );
     let evidence_value = serde_json::json!({
         "category": "Multi-player",
         "filter": "category2=1",
-        "sort": "Reviews_DESC"
+        "sort": sort
     });
 
     for candidate in &page.candidates {

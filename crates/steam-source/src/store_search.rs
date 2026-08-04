@@ -13,31 +13,56 @@ use crate::error::SourceError;
 use crate::proposal::{AppCatalogProposal, AppTypeProposal, SourceStability};
 use crate::raw::RawResponse;
 
-pub const ADAPTER_VERSION: &str = "store-search-0.1.0";
+pub const ADAPTER_VERSION: &str = "store-search-0.2.0";
 pub const SOURCE_NAME: &str = "steam_store_search";
 pub const MULTIPLAYER_CATEGORY_HINT: &str = "Multi-player";
 pub const MAX_PAGE_SIZE: u32 = 100;
+
+/// Steam store search ranking. New multiplayer titles rarely have reviews, so
+/// discovery defaults to release date rather than popularity-by-reviews.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StoreSearchSort {
+    #[default]
+    ReleasedDesc,
+    ReviewsDesc,
+}
+
+impl StoreSearchSort {
+    pub fn as_query_value(self) -> &'static str {
+        match self {
+            Self::ReleasedDesc => "Released_DESC",
+            Self::ReviewsDesc => "Reviews_DESC",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreSearchRequest {
     pub start: u32,
     pub count: u32,
+    pub sort: StoreSearchSort,
 }
 
 impl StoreSearchRequest {
     pub fn new(start: u32, count: u32) -> Result<Self, SourceError> {
+        Self::with_sort(start, count, StoreSearchSort::default())
+    }
+
+    pub fn with_sort(start: u32, count: u32, sort: StoreSearchSort) -> Result<Self, SourceError> {
         if !(1..=MAX_PAGE_SIZE).contains(&count) {
             return Err(SourceError::Config {
                 message: format!("store search count must be between 1 and {MAX_PAGE_SIZE}"),
             });
         }
-        Ok(Self { start, count })
+        Ok(Self { start, count, sort })
     }
 
     pub fn path_and_query(&self) -> String {
         format!(
-            "/search/results/?query&start={}&count={}&sort_by=Reviews_DESC&category1=998&category2=1&infinite=1&cc=US&l=english&json=1",
-            self.start, self.count
+            "/search/results/?query&start={}&count={}&sort_by={}&category1=998&category2=1&infinite=1&cc=US&l=english&json=1",
+            self.start,
+            self.count,
+            self.sort.as_query_value()
         )
     }
 }
@@ -70,6 +95,7 @@ pub struct StoreSearchPage {
     pub result_count: u32,
     pub total_count: u32,
     pub content_hash: String,
+    pub sort: StoreSearchSort,
 }
 
 impl StoreSearchPage {
@@ -161,6 +187,7 @@ pub fn parse_store_search_page(
         result_count,
         total_count: envelope.total_count,
         content_hash: raw.content_hash.clone(),
+        sort: request.sort,
     })
 }
 
@@ -221,6 +248,11 @@ mod tests {
         let path = StoreSearchRequest::new(200, 100).unwrap().path_and_query();
         assert!(path.contains("start=200"));
         assert!(path.contains("category2=1"));
-        assert!(path.contains("sort_by=Reviews_DESC"));
+        // New multiplayer titles lack reviews; discovery ranks by release date.
+        assert!(path.contains("sort_by=Released_DESC"));
+        let reviews = StoreSearchRequest::with_sort(0, 50, StoreSearchSort::ReviewsDesc)
+            .unwrap()
+            .path_and_query();
+        assert!(reviews.contains("sort_by=Reviews_DESC"));
     }
 }

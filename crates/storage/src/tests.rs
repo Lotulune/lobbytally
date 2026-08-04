@@ -4,8 +4,9 @@ use mpgs_domain::FeedbackType;
 use mpgs_steam_source::{
     APP_LIST_SOURCE_NAME, AppCatalogProposal, AppListRequest, AppTypeProposal, CcuProposal,
     CcuRequest, RawResponse, ReviewSummaryProposal, ReviewSummaryRequest, SourceStability,
-    StoreDetailsRequest, StoreSearchCandidate, StoreSearchPage, parse_app_list_page, parse_ccu,
-    parse_popular_reviews, parse_review_summary, parse_store_details,
+    StoreDetailsRequest, StoreSearchCandidate, StoreSearchPage, StoreSearchSort,
+    parse_app_list_page, parse_ccu, parse_popular_reviews, parse_review_summary,
+    parse_store_details,
 };
 
 use crate::clock::FakeClock;
@@ -1173,6 +1174,7 @@ fn store_search_candidates_are_auditable_without_fabricated_profiles() {
         result_count: 2,
         total_count: 2,
         content_hash: "fixture-hash".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     };
 
     assert_eq!(repo.ingest_store_search_page(&page).unwrap(), 2);
@@ -1237,6 +1239,7 @@ fn store_categories_materialize_conservative_multiplayer_profiles() {
         result_count: 1,
         total_count: 1,
         content_hash: "profile-materialization".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     };
     repo.ingest_store_search_page(&page).unwrap();
     repo.database()
@@ -1278,6 +1281,7 @@ fn store_categories_mark_mixed_when_coop_and_pvp_present() {
         result_count: 1,
         total_count: 1,
         content_hash: "mixed-mode".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     })
     .unwrap();
     repo.database()
@@ -1313,6 +1317,7 @@ fn store_search_multiplayer_only_is_not_unknown() {
         result_count: 1,
         total_count: 1,
         content_hash: "mp-only".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     })
     .unwrap();
     // Search page materializes with Multi-player hint via store_search_category.
@@ -1353,6 +1358,7 @@ fn store_search_category_materializes_only_a_safe_minimum_party_size() {
         result_count: 1,
         total_count: 1,
         content_hash: "search-profile-materialization".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     })
     .unwrap();
 
@@ -1378,6 +1384,7 @@ fn m7_coverage_requires_consecutive_focus_snapshot_days() {
         result_count: 1,
         total_count: 1,
         content_hash: "m7-coverage-fixture".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     };
     assert_eq!(repo.ingest_store_search_page(&page).unwrap(), 1);
     repo.ingest_multiplayer_bool(42, "online_coop", true, "verified_test", "fixture", 0.8)
@@ -1474,6 +1481,7 @@ fn golden_profile_import_raises_recommendation_ready_coverage() {
         result_count: 1,
         total_count: 1,
         content_hash: "fixture-hash".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     };
     assert_eq!(repo.ingest_store_search_page(&page).unwrap(), 1);
     assert_eq!(
@@ -1527,6 +1535,7 @@ fn enrichment_targets_refresh_dynamic_dimensions_by_age() {
         result_count: 1,
         total_count: 1,
         content_hash: "fixture-hash".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     };
     repo.ingest_store_search_page(&page).unwrap();
 
@@ -1706,6 +1715,7 @@ fn enrichment_targets_prioritize_apps_missing_the_most_dynamic_dimensions() {
         result_count: 2,
         total_count: 2,
         content_hash: "priority-fixture".into(),
+        sort: StoreSearchSort::ReleasedDesc,
     })
     .unwrap();
 
