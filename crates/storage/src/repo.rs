@@ -1211,9 +1211,7 @@ impl Repository {
 
         let now_ms = self.db.now_ms();
         let today = crate::util::day_utc_from_ms(now_ms);
-        let since = crate::util::day_utc_from_ms(
-            now_ms.saturating_sub(14 * 24 * 60 * 60 * 1_000),
-        );
+        let since = crate::util::day_utc_from_ms(now_ms.saturating_sub(14 * 24 * 60 * 60 * 1_000));
         self.db.with_conn(|conn| {
             let apps_total: i64 =
                 conn.query_row("SELECT COUNT(*) FROM apps", [], |row| row.get(0))?;

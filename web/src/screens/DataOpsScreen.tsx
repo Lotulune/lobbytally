@@ -139,19 +139,20 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
       } else {
         const search = await apiClient.search(raw, 8);
         const items = search.items ?? [];
-        if (items.length === 0) {
+        const first = items[0];
+        if (!first) {
           setLookupError(`公开搜索无结果：「${raw}」。很可能未入库或未 enrich。`);
           return;
         }
         setPresence({
-          app_id: items[0].app_id,
+          app_id: first.app_id,
           in_apps: true,
           has_multiplayer_profile: null,
           app: {
-            app_id: items[0].app_id,
-            canonical_name: items[0].name,
-            release_date: items[0].release_date,
-            release_state: items[0].release_state,
+            app_id: first.app_id,
+            canonical_name: first.name,
+            release_date: first.release_date,
+            release_state: first.release_state,
             app_type: null,
           },
           search_hits: items.map((it) => ({
