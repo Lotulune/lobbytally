@@ -712,7 +712,25 @@ export class ApiClient {
       });
     }
     if (!response.ok) throw await this.parseError(response);
-    return (await response.json()) as T;
+    const text = await response.text();
+    const trimmed = text.trimStart();
+    if (trimmed.startsWith("<!") || trimmed.startsWith("<html")) {
+      throw new ApiError({
+        code: "internal",
+        status: response.status,
+        message:
+          "admin API returned HTML instead of JSON — reverse proxy is not routing /admin/ to the server",
+      });
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new ApiError({
+        code: "internal",
+        status: response.status,
+        message: "admin API returned non-JSON response",
+      });
+    }
   }
 
   async naturalLanguageRecommendations(
