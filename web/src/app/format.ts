@@ -4,7 +4,7 @@
 import type { FeedSection } from "../api/types";
 
 export const SECTION_META: Record<FeedSection, { label: string; hint: string }> = {
-  recent_release: { label: "近期正式发售", hint: "按最早已知发售日，近 180 天内的正式发售" },
+  recent_release: { label: "近期正式发售", hint: "按商店当前发售日，近 180 天内的正式发售" },
   upcoming: { label: "即将发售 / Demo", hint: "Steam 发售日历 · 未来 30 天" },
   popular_legacy: { label: "人气老游", hint: "仍活跃且口碑达标的老游" },
   classic_legacy: { label: "老牌联机", hint: "热门之外、发售超过 180 天的多人游戏" },

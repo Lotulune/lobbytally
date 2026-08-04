@@ -52,7 +52,8 @@ function toApiError(error: unknown): ApiError {
 
 export function defaultOrderForSort(sort: FeedSort, section: FeedSection): FeedSortOrder {
   if (sort === "release_date") {
-    return section === "upcoming" || section === "recent_release" ? "asc" : "desc";
+    // Upcoming: soonest first. Recent release: newest store day first.
+    return section === "upcoming" ? "asc" : "desc";
   }
   return "desc";
 }

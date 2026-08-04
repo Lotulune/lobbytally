@@ -1826,15 +1826,43 @@ fn starting_a_new_source_run_finalizes_an_interrupted_predecessor() {
 }
 
 #[test]
-fn feed_sections_use_earliest_known_release_date() {
-    // 2026-07-18 UTC — after Palworld's 1.0 store date, within a 180-day recent window.
-    let now_ms = 1_784_342_400_000i64;
+fn feed_sections_use_current_store_release_date() {
+    // 2026-08-04 UTC — "today" for recent-window checks.
+    let now_ms = 1_785_830_400_000i64;
     let (repo, _) = repo_with_clock(now_ms);
     assert!(repo.seed_demo_if_empty().unwrap() > 0);
 
-    // Simulate a later store refresh that overwrote apps.release_date with the 1.0 day.
+    // Historical earliest dates (EA / prior listings) must not hide a current
+    // store release day from recent_release, and presentation uses store day.
     repo.database()
         .with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO apps (
+                     app_id, app_type, canonical_name, release_state, release_date,
+                     release_date_raw, release_date_precision, created_at_ms, updated_at_ms
+                 ) VALUES (
+                     4945580, 'game', 'Unemployed Nightmare Together', 'released', '2026-08-03',
+                     '2026 年 8 月 3 日', 'day', ?1, ?1
+                 )",
+                [now_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO multiplayer_profiles (app_id, computed_at_ms, online_coop, recommended_min_players)
+                 VALUES (4945580, ?1, 1, 2)",
+                [now_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO release_events (
+                     app_id, old_release_date, new_release_date, old_precision, new_precision,
+                     old_release_state, new_release_state, source, observed_at_ms
+                 ) VALUES (
+                     4945580, '2026-07-27', '2026-08-03', 'day', 'day',
+                     'coming_soon', 'released', 'steam_store_appdetails', ?1
+                 )",
+                [now_ms],
+            )?;
+            // Long-shipped title whose store date was rewritten to a recent day:
+            // still classified by the *current* store day (product: calendar day).
             conn.execute(
                 "UPDATE apps
                  SET release_date = '2026-07-09',
@@ -1873,10 +1901,20 @@ fn feed_sections_use_earliest_known_release_date() {
             10_000,
         )
         .unwrap();
+    let nightmare = recent
+        .iter()
+        .find(|row| row.app_id == 4945580)
+        .expect("current store release day must place the title in recent_release");
+    assert_eq!(nightmare.release_date.as_deref(), Some("2026-08-03"));
     assert!(
-        recent.iter().all(|row| row.app_id != 1623730),
-        "1.0 store date must not place long-shipped titles in recent_release"
+        recent.iter().any(|row| row.app_id == 1623730),
+        "current store release day (not earliest event) drives recent_release membership"
     );
+    let palworld_recent = recent
+        .iter()
+        .find(|row| row.app_id == 1623730)
+        .expect("palworld recent row");
+    assert_eq!(palworld_recent.release_date.as_deref(), Some("2026-07-09"));
 
     let classic = repo
         .list_candidates(
@@ -1898,21 +1936,13 @@ fn feed_sections_use_earliest_known_release_date() {
             10_000,
         )
         .unwrap();
-    let in_legacy = classic
-        .iter()
-        .chain(popular.iter())
-        .any(|row| row.app_id == 1623730);
     assert!(
-        in_legacy,
-        "first known release date should keep Palworld in legacy sections"
+        classic
+            .iter()
+            .chain(popular.iter())
+            .all(|row| row.app_id != 1623730 && row.app_id != 4945580),
+        "titles with current store dates inside the recent window must not also list as legacy"
     );
-
-    let palworld = classic
-        .iter()
-        .chain(popular.iter())
-        .find(|row| row.app_id == 1623730)
-        .expect("palworld row");
-    assert_eq!(palworld.release_date.as_deref(), Some("2024-01-19"));
 
     // Residual classic must not re-list popular legacy titles.
     let classic_ids: std::collections::HashSet<u32> = classic

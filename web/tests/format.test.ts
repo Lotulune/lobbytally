@@ -50,7 +50,7 @@ describe("format helpers", () => {
     expect(dominantModeLabel("multiplayer")).toBe("联机");
     expect(SECTION_META.recent_release).toEqual({
       label: "近期正式发售",
-      hint: "按最早已知发售日，近 180 天内的正式发售",
+      hint: "按商店当前发售日，近 180 天内的正式发售",
     });
     expect(positiveRate(100, 90)).toBe("90% 好评");
   });

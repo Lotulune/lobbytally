@@ -467,22 +467,11 @@ pub fn list_candidates(
     // only when the deployment's supported currency has one unambiguous store
     // country; otherwise leave price unknown and avoid a false budget filter.
     let budget_country = default_country_for_currency(budget_currency).unwrap_or("");
+    // Section windows and feed presentation use the current store `apps.release_date`
+    // (not the earliest historical date from release_events). "近期正式发售" is ordered
+    // and filtered by that store day so 1.0 / re-dated launches surface by calendar day.
     let mut stmt = conn.prepare(
-        "WITH release_date_values AS (
-             SELECT app_id, release_date AS value
-             FROM apps WHERE release_date IS NOT NULL
-             UNION ALL
-             SELECT app_id, old_release_date
-             FROM release_events WHERE old_release_date IS NOT NULL
-             UNION ALL
-             SELECT app_id, new_release_date
-             FROM release_events WHERE new_release_date IS NOT NULL
-         ), classification_dates AS (
-             SELECT app_id, MIN(value) AS first_release_date
-             FROM release_date_values
-             WHERE value GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
-             GROUP BY app_id
-         ), ranked_reviews AS (
+        "WITH ranked_reviews AS (
              SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms,
                     ROW_NUMBER() OVER (
                         PARTITION BY app_id ORDER BY captured_at_ms DESC, language_scope ASC
@@ -536,8 +525,7 @@ pub fn list_candidates(
              FROM daily_activity
          )
          SELECT a.app_id, a.canonical_name, a.app_type, a.release_state,
-                CASE WHEN :section = 'upcoming' THEN a.release_date
-                     ELSE COALESCE(cd.first_release_date, a.release_date) END,
+                a.release_date,
                 p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
                 p.recommended_min_players, p.recommended_max_players, p.profile_confidence,
                 r.total_reviews, r.total_positive, lp.player_count, r.wilson_lower,
@@ -621,7 +609,6 @@ pub fn list_candidates(
                  ),
                  a.updated_at_ms
          FROM apps a
-         LEFT JOIN classification_dates cd ON cd.app_id = a.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
              AND p.computed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
          LEFT JOIN app_availability v ON v.app_id = a.app_id
@@ -639,10 +626,12 @@ pub fn list_candidates(
                    OR a.app_type IN ('demo', 'playtest')
                ))
                OR (:section = 'recent_release' AND a.release_state = 'released'
-                   AND COALESCE(cd.first_release_date, a.release_date) >= :cutoff
-                   AND COALESCE(cd.first_release_date, a.release_date) <= :today)
+                   AND a.release_date IS NOT NULL
+                   AND a.release_date >= :cutoff
+                   AND a.release_date <= :today)
                OR (:section IN ('popular_legacy', 'classic_legacy') AND a.release_state = 'released'
-                   AND COALESCE(cd.first_release_date, a.release_date) < :cutoff)
+                   AND a.release_date IS NOT NULL
+                   AND a.release_date < :cutoff)
            )
            AND (
                :section <> 'popular_legacy'
@@ -659,7 +648,7 @@ pub fn list_candidates(
              CASE WHEN :section = 'popular_legacy' THEN COALESCE(d.typical_ccu, lp.player_count, 0) END DESC,
              CASE WHEN :section = 'classic_legacy' THEN COALESCE(r.total_reviews, 0) END DESC,
              CASE WHEN :section IN ('recent_release', 'upcoming')
-                  THEN COALESCE(cd.first_release_date, a.release_date) END DESC,
+                  THEN a.release_date END DESC,
              a.updated_at_ms DESC
          LIMIT :limit",
     )?;
