@@ -38,8 +38,8 @@ import { getClientStorage } from "./storage";
 
 const SESSION_KEY = "mpgs.session.v1";
 const DEVICE_KEY = "mpgs.device.v1";
-// Bump when cached feed/detail payload shape changes (covers, stats, pagination).
-const CACHE_PREFIX = "mpgs.cache.v2:";
+// Bump when cached feed/detail payload shape or ranking semantics change.
+const CACHE_PREFIX = "mpgs.cache.v3:";
 
 export type ApiErrorCode =
   | "account_conflict"
@@ -605,7 +605,7 @@ export class ApiClient {
     if (!isFirstPage) {
       return this.uncachedGet<FeedResponse>(path, this.hasSession());
     }
-    const cacheKey = `feed:v5:${section}:${query.limit ?? "d"}:${query.partySize ?? "p"}:${
+    const cacheKey = `feed:v6:${section}:${query.limit ?? "d"}:${query.partySize ?? "p"}:${
       query.demoOnly ? 1 : 0
     }:${query.sort ?? "recommended"}:${query.order ?? "auto"}:${this.session?.user_id ?? "anon"}`;
     return this.cachedGet<FeedResponse>(cacheKey, path, this.hasSession());

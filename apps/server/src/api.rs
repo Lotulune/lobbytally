@@ -3118,10 +3118,11 @@ async fn get_feed_inner(
         }
     };
     let cache_identity = user_id.as_deref().unwrap_or("public");
-    // v5: cursor and validators include every query dimension that can change
-    // membership or ordering.
+    // v6: include build revision so query/ranking semantics changes invalidate
+    // client ETags even when data_updated_at_ms is unchanged.
     let etag = weak_etag(&format!(
-        "feed:v5:{}:{snapshot_ms}:{result_context}:{offset}:{limit}:{}:pi{}:user{cache_identity}:sort{}:order{}:demo{demo_only}",
+        "feed:v6:{}:{}:{snapshot_ms}:{result_context}:{offset}:{limit}:{}:pi{}:user{cache_identity}:sort{}:order{}:demo{demo_only}",
+        build_git_sha(),
         section.as_str(),
         active_config.version,
         play_intent.epoch.revision,
@@ -6804,7 +6805,8 @@ async fn get_calendar(
         Err(error) => return map_storage_error(error, None),
     };
     let etag = weak_etag(&format!(
-        "calendar:v3:{calendar_state}:{from}:{to}:{data_updated_at_ms}"
+        "calendar:v4:{calendar_state}:{from}:{to}:{data_updated_at_ms}:{}",
+        build_git_sha()
     ));
     if let Some(response) = if_none_match_ok(&headers, &etag) {
         return response;

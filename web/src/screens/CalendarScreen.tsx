@@ -79,7 +79,11 @@ function CalendarRow({
           {confidenceLabel(item.current_data_confidence)}
         </Chip>
         <span className="cal-source">
-          来源更新于 {formatAgo(item.source_modified_at_ms ?? item.updated_at_ms)}
+          资料刷新于 {formatAgo(item.updated_at_ms)}
+          {item.source_modified_at_ms != null &&
+            item.source_modified_at_ms !== item.updated_at_ms && (
+              <> · 来源观测 {formatAgo(item.source_modified_at_ms)}</>
+            )}
         </span>
       </span>
     </button>
