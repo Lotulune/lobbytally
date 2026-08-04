@@ -1206,6 +1206,100 @@ impl Repository {
         self.db.with_conn(crate::source_state::data_refresh_status)
     }
 
+    pub fn pipeline_inventory(&self) -> StorageResult<crate::models::PipelineInventory> {
+        use rusqlite::OptionalExtension;
+
+        let now_ms = self.db.now_ms();
+        let today = crate::util::day_utc_from_ms(now_ms);
+        let since = crate::util::day_utc_from_ms(
+            now_ms.saturating_sub(14 * 24 * 60 * 60 * 1_000),
+        );
+        self.db.with_conn(|conn| {
+            let apps_total: i64 =
+                conn.query_row("SELECT COUNT(*) FROM apps", [], |row| row.get(0))?;
+            let multiplayer_profiles: i64 =
+                conn.query_row("SELECT COUNT(*) FROM multiplayer_profiles", [], |row| {
+                    row.get(0)
+                })?;
+            let released_with_date: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM apps
+                 WHERE release_state = 'released' AND release_date IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            let released_last_14_days: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM apps
+                 WHERE release_state = 'released'
+                   AND release_date IS NOT NULL
+                   AND release_date >= ?1
+                   AND release_date <= ?2",
+                rusqlite::params![since, today],
+                |row| row.get(0),
+            )?;
+            let coming_soon_total: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM apps
+                 WHERE release_state IN ('coming_soon', 'upcoming')",
+                [],
+                |row| row.get(0),
+            )?;
+            let coming_soon_dated: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM apps
+                 WHERE release_state IN ('coming_soon', 'upcoming')
+                   AND release_date IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            let unknown_named_stubs: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM apps
+                 WHERE release_state = 'unknown'
+                   AND canonical_name IS NOT NULL
+                   AND length(trim(canonical_name)) > 0",
+                [],
+                |row| row.get(0),
+            )?;
+            let max_row: Option<(String, i64, String)> = conn
+                .query_row(
+                    "SELECT release_date, app_id, canonical_name FROM apps
+                     WHERE release_date IS NOT NULL
+                     ORDER BY release_date DESC, app_id DESC
+                     LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let jobs_pending: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )?;
+            let jobs_leased: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'leased'",
+                [],
+                |row| row.get(0),
+            )?;
+            let jobs_dead: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'dead'",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(crate::models::PipelineInventory {
+                apps_total,
+                multiplayer_profiles,
+                released_with_date,
+                released_last_14_days,
+                coming_soon_total,
+                coming_soon_dated,
+                unknown_named_stubs,
+                max_release_date: max_row.as_ref().map(|(d, _, _)| d.clone()),
+                max_release_date_app_id: max_row.as_ref().map(|(_, id, _)| *id as u32),
+                max_release_date_name: max_row.map(|(_, _, name)| name),
+                jobs_pending,
+                jobs_leased,
+                jobs_dead,
+            })
+        })
+    }
+
     pub fn create_anonymous_session(&self) -> StorageResult<crate::users::SessionTokens> {
         let now = self.db.now_ms();
         self.db

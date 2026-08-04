@@ -1826,6 +1826,16 @@ fn starting_a_new_source_run_finalizes_an_interrupted_predecessor() {
 }
 
 #[test]
+fn pipeline_inventory_counts_basic_rows() {
+    let (repo, _) = repo_with_clock(1_785_830_400_000);
+    assert!(repo.seed_demo_if_empty().unwrap() > 0);
+    let inv = repo.pipeline_inventory().unwrap();
+    assert!(inv.apps_total > 0);
+    assert!(inv.multiplayer_profiles >= 0);
+    assert!(inv.jobs_pending >= 0);
+}
+
+#[test]
 fn feed_sections_use_current_store_release_date() {
     // 2026-08-04 UTC — "today" for recent-window checks.
     let now_ms = 1_785_830_400_000i64;

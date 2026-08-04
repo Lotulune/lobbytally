@@ -289,3 +289,21 @@ pub struct DataRefreshStatus {
     pub coverage_ratio: Option<f64>,
     pub updated_at_ms: i64,
 }
+
+/// Operator-facing inventory snapshot for the data pipeline dashboard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PipelineInventory {
+    pub apps_total: i64,
+    pub multiplayer_profiles: i64,
+    pub released_with_date: i64,
+    pub released_last_14_days: i64,
+    pub coming_soon_total: i64,
+    pub coming_soon_dated: i64,
+    pub unknown_named_stubs: i64,
+    pub max_release_date: Option<String>,
+    pub max_release_date_app_id: Option<u32>,
+    pub max_release_date_name: Option<String>,
+    pub jobs_pending: i64,
+    pub jobs_leased: i64,
+    pub jobs_dead: i64,
+}

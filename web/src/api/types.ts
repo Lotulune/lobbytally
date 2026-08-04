@@ -16,6 +16,83 @@ export const FEED_SECTIONS: FeedSection[] = [
 
 /** Feed list sort after recommendation scoring. */
 export type FeedSort = "recommended" | "fit_index" | "ccu" | "reviews" | "release_date";
+
+/** Admin data-pipeline dashboard payload (`GET /admin/v1/data-status`). */
+export interface PipelineInventory {
+  apps_total: number;
+  multiplayer_profiles: number;
+  released_with_date: number;
+  released_last_14_days: number;
+  coming_soon_total: number;
+  coming_soon_dated: number;
+  unknown_named_stubs: number;
+  max_release_date: string | null;
+  max_release_date_app_id: number | null;
+  max_release_date_name: string | null;
+  jobs_pending: number;
+  jobs_leased: number;
+  jobs_dead: number;
+}
+
+export interface DataRefreshTaskStatus {
+  task_name: string;
+  last_success_at_ms: number | null;
+  next_run_at_ms: number | null;
+  last_error_category: string | null;
+  cursor_value: string | null;
+  coverage_ratio: number | null;
+  updated_at_ms: number;
+}
+
+export interface DataStatusResponse {
+  tasks: DataRefreshTaskStatus[];
+  coverage: {
+    normalized_multiplayer_candidates: number;
+    category_evidence_candidates: number;
+    recommendation_ready_profiles: number;
+    trusted_familiar_profiles: number;
+    with_platforms: number;
+    with_languages: number;
+    with_typical_session: number;
+    with_price: number;
+    with_reviews: number;
+    with_ccu: number;
+  };
+  m7_coverage: {
+    normalized_multiplayer_candidates: number;
+    trusted_friend_multiplayer_profiles: number;
+    candidates_with_date: number;
+    candidates_with_cover: number;
+    upcoming_candidates: number;
+    recent_release_candidates: number;
+    popular_legacy_candidates: number;
+    classic_legacy_candidates: number;
+    trusted_profiles_with_seven_day_reviews: number;
+    trusted_profiles_with_seven_day_ccu: number;
+  };
+  inventory?: PipelineInventory;
+  generated_at_ms?: number;
+  build_git_sha?: string;
+}
+
+export interface PipelineAppPresence {
+  app_id: number;
+  in_apps: boolean;
+  has_multiplayer_profile: boolean | null;
+  app?: {
+    app_id: number;
+    canonical_name: string;
+    release_date: string | null;
+    release_state: string | null;
+    app_type: string | null;
+  } | null;
+  search_hits?: Array<{
+    app_id: number;
+    name: string;
+    release_date: string | null;
+  }>;
+  note?: string;
+}
 export type FeedSortOrder = "asc" | "desc";
 
 export type RecommendationFitBand =

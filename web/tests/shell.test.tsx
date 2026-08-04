@@ -105,6 +105,9 @@ vi.mock("../src/screens/CalendarScreen", () => ({
 vi.mock("../src/screens/SettingsScreen", () => ({
   SettingsScreen: () => <div>settings</div>,
 }));
+vi.mock("../src/screens/DataOpsScreen", () => ({
+  DataOpsScreen: () => <div>data-ops</div>,
+}));
 vi.mock("../src/screens/NaturalLanguageScreen", () => ({
   NaturalLanguageScreen: ({
     onOpenGame,

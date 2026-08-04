@@ -16,6 +16,7 @@ import type {
   CommunityResponse,
   CommunityFilters,
   CommunitySort,
+  DataStatusResponse,
   ErrorEnvelope,
   EvidenceResponse,
   FeedbackRecord,
@@ -27,6 +28,7 @@ import type {
   GameDetail,
   MetaResponse,
   NaturalLanguageRecommendationResponse,
+  PipelineAppPresence,
   PlayIntentResult,
   RecommendationEventType,
   SearchResponse,
@@ -636,6 +638,81 @@ export class ApiClient {
   async search(q: string, limit = 20): Promise<SearchResponse> {
     const params = new URLSearchParams({ q, limit: String(limit) });
     return this.rawJson<SearchResponse>("GET", `/v1/search?${params}`, { auth: false });
+  }
+
+  /** Operator dashboard: inventory + refresh tasks + section coverage. */
+  async adminDataStatus(adminToken: string): Promise<DataStatusResponse> {
+    return this.adminJson<DataStatusResponse>("GET", "/admin/v1/data-status", adminToken);
+  }
+
+  /** Operator lookup: is this Steam app in the catalog / multiplayer pool? */
+  async adminAppPresence(adminToken: string, appId: number): Promise<PipelineAppPresence> {
+    try {
+      const debug = await this.adminJson<{
+        app: {
+          app_id: number;
+          canonical_name: string;
+          release_date: string | null;
+          release_state: string | null;
+          app_type: string | null;
+        } | null;
+        multiplayer_profile: { app_id: number } | null;
+      }>("GET", `/admin/v1/games/${appId}/debug`, adminToken);
+      return {
+        app_id: appId,
+        in_apps: debug.app != null,
+        has_multiplayer_profile: debug.multiplayer_profile != null,
+        app: debug.app,
+        note:
+          debug.app == null
+            ? "不在 apps 表：发现阶段没扫到（AppList/商店搜索），不是 Feed 排序藏起来的。"
+            : debug.multiplayer_profile == null
+              ? "在 apps 里，但不在联机池：还没被当成 multiplayer 候选或 profile 未写出。"
+              : "已在联机池；若列表仍看不到，检查发售日/分区资格/排序。",
+      };
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "not_found") {
+        return {
+          app_id: appId,
+          in_apps: false,
+          has_multiplayer_profile: false,
+          app: null,
+          note: "服务端返回 not_found。",
+        };
+      }
+      throw error;
+    }
+  }
+
+  private async adminJson<T>(
+    method: string,
+    path: string,
+    adminToken: string,
+    body?: unknown,
+  ): Promise<T> {
+    const headers: Record<string, string> = {
+      "x-device-id": this.deviceId(),
+      authorization: `Bearer ${adminToken}`,
+    };
+    if (body !== undefined) headers["content-type"] = "application/json";
+    let response: Response;
+    try {
+      response = await this.fetchFn(`${this.baseUrl}${path}`, {
+        method,
+        headers,
+        body: body === undefined ? null : JSON.stringify(body),
+        redirect: "manual",
+      });
+    } catch (cause) {
+      throw new ApiError({
+        code: "network",
+        status: 0,
+        message: cause instanceof Error ? cause.message : "network request failed",
+        offline: true,
+      });
+    }
+    if (!response.ok) throw await this.parseError(response);
+    return (await response.json()) as T;
   }
 
   async naturalLanguageRecommendations(

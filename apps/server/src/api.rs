@@ -7758,12 +7758,19 @@ async fn data_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         Ok(coverage) => coverage,
         Err(error) => return map_storage_error(error, None),
     };
+    let inventory = match storage_result(repo, |repo| repo.pipeline_inventory()).await {
+        Ok(inventory) => inventory,
+        Err(error) => return map_storage_error(error, None),
+    };
     (
         StatusCode::OK,
         Json(json!({
             "tasks": tasks,
             "coverage": coverage,
             "m7_coverage": m7_coverage,
+            "inventory": inventory,
+            "generated_at_ms": repo.database().now_ms(),
+            "build_git_sha": build_git_sha(),
         })),
     )
         .into_response()

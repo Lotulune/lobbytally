@@ -14,6 +14,7 @@ import { GameDetailScreen } from "./GameDetailScreen";
 import { SearchScreen } from "./SearchScreen";
 import { CalendarScreen } from "./CalendarScreen";
 import { SettingsScreen } from "./SettingsScreen";
+import { DataOpsScreen } from "./DataOpsScreen";
 import { NaturalLanguageScreen } from "./NaturalLanguageScreen";
 import { AiSettingsScreen } from "./AiSettingsScreen";
 import { AuthDialog } from "./AuthDialog";
@@ -219,6 +220,9 @@ export function Shell() {
             <CalendarScreen onOpenGame={openGame} />
           )}
           {visibleListView.kind === "settings" && <SettingsScreen />}
+          {visibleListView.kind === "data-ops" && (
+            <DataOpsScreen onOpenGame={openGame} />
+          )}
           {visibleListView.kind === "profile" && profile && (
             <ProfileScreen profile={profile} onUpdated={setProfile} onDeleted={leaveAccountArea} />
           )}
