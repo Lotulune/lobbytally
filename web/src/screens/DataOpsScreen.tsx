@@ -1,6 +1,4 @@
-// Operator data-pipeline dashboard. Requires the server admin token.
-// Surfaces inventory, M7 section coverage, refresh tasks, and app-id lookup
-// so ingestion health is not a black box.
+// 数据监测：库存、完整度、任务进度、查一款游戏卡在哪。
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError } from "../api/client";
@@ -8,7 +6,6 @@ import type { DataStatusResponse, PipelineAppPresence } from "../api/types";
 import { formatAgo } from "../app/format";
 import { apiClient } from "../app/runtime";
 import { Button } from "../components/Button";
-import { Chip } from "../components/Chip";
 import { Panel } from "../components/Panel";
 import { Skeleton } from "../components/Skeleton";
 
@@ -27,37 +24,105 @@ function writeToken(token: string) {
     if (token) localStorage.setItem(ADMIN_TOKEN_KEY, token);
     else localStorage.removeItem(ADMIN_TOKEN_KEY);
   } catch {
-    // ignore quota / private mode
+    /* ignore */
   }
 }
 
-function msLabel(ms: number | null | undefined): string {
-  if (ms == null) return "从未";
+function pct(n: number, d: number): number {
+  if (d <= 0) return 0;
+  return Math.max(0, Math.min(100, (n / d) * 100));
+}
+
+function toneForPct(p: number): "ok" | "warn" | "bad" {
+  if (p >= 85) return "ok";
+  if (p >= 40) return "warn";
+  return "bad";
+}
+
+function ago(ms: number | null | undefined): string {
+  if (ms == null) return "还没成功跑过";
   return formatAgo(ms);
 }
 
-function ratioLabel(ratio: number | null | undefined): string {
-  if (ratio == null || Number.isNaN(ratio)) return "—";
-  return `${Math.round(ratio * 1000) / 10}%`;
-}
-
-function taskPlainName(name: string): string {
+function taskLabel(name: string): string {
   switch (name) {
     case "catalog_sync":
-      return "目录同步 (AppList)";
+      return "扫全库名单";
     case "candidate_collection":
-      return "联机候选收集 (商店搜索)";
+      return "找联机游戏";
     case "enrichment":
-      return "详情 enrich";
+      return "补发售日与详情";
     case "quality_check":
-      return "质量检查";
+      return "质量自检";
     case "retrieval_sync":
-      return "检索索引";
+      return "更新搜索索引";
     case "recommendation_telemetry_retention":
-      return "推荐遥测清理";
+      return "清理旧日志";
     default:
       return name;
   }
+}
+
+/** Prefer plain status over raw engine names. */
+function taskStatusLine(task: {
+  last_success_at_ms: number | null;
+  next_run_at_ms: number | null;
+  last_error_category: string | null;
+}): string {
+  if (task.last_error_category) return `上次失败：${task.last_error_category}`;
+  return `上次成功 ${ago(task.last_success_at_ms)}`;
+}
+
+function Bar({
+  name,
+  value,
+  max,
+  suffix,
+  tone,
+}: {
+  name: string;
+  value: number;
+  max: number;
+  suffix?: string;
+  tone?: "ok" | "warn" | "bad";
+}) {
+  const p = pct(value, max);
+  const t = tone ?? toneForPct(p);
+  return (
+    <div className="bar-row">
+      <div className="bar-meta">
+        <span className="name">{name}</span>
+        <span className="nums">
+          {value.toLocaleString()}
+          {suffix ?? (max > 0 ? ` / ${max.toLocaleString()}` : "")}
+          {max > 0 ? ` · ${Math.round(p)}%` : ""}
+        </span>
+      </div>
+      <div className="bar-track" aria-hidden="true">
+        <div className="bar-fill" data-tone={t} style={{ width: `${p}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  hint,
+  tone,
+}: {
+  label: string;
+  value: string | number;
+  hint?: string;
+  tone?: "ok" | "warn" | "bad";
+}) {
+  return (
+    <div className="data-ops-stat" data-tone={tone}>
+      <span className="label">{label}</span>
+      <span className="value">{typeof value === "number" ? value.toLocaleString() : value}</span>
+      {hint ? <span className="hint">{hint}</span> : null}
+    </div>
+  );
 }
 
 export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => void }) {
@@ -78,21 +143,16 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
 
   const load = useCallback(async () => {
     if (!token) {
-      setError("请先填写并保存 Admin Token（与服务器 MPGS_ADMIN_TOKEN 相同）。");
+      setError("请先保存管理密钥。");
       setStatus(null);
       return;
     }
     setLoading(true);
     setError(null);
     try {
-      const data = await apiClient.adminDataStatus(token);
-      setStatus(data);
+      setStatus(await apiClient.adminDataStatus(token));
     } catch (e) {
-      const msg =
-        e instanceof ApiError
-          ? `${e.message}${e.status ? ` (HTTP ${e.status})` : ""}`
-          : String(e);
-      setError(msg);
+      setError(e instanceof ApiError ? e.message : String(e));
       setStatus(null);
     } finally {
       setLoading(false);
@@ -103,279 +163,296 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
     void load();
   }, [load]);
 
-  const inventory = status?.inventory;
+  const inv = status?.inventory;
   const m7 = status?.m7_coverage;
-  const coverage = status?.coverage;
+  const cov = status?.coverage;
   const tasks = status?.tasks ?? [];
+  const pool = inv?.multiplayer_profiles ?? 0;
 
-  const pipelineHint = useMemo(() => {
-    if (!inventory || !m7) return null;
-    if (m7.upcoming_candidates <= 1) {
-      return "即将发售有日期的联机候选极少：商店搜索主要按评价排序，新游/评价少的派对作很难进池。";
-    }
-    if (inventory.released_last_14_days < 30) {
-      return "近 14 天有日期的已发售联机作偏少：多半是候选发现偏「高评价老盘」而不是「新发售」。";
-    }
-    return "覆盖看起来健康；若某款游戏仍缺失，用下方 AppID 查询看它卡在哪一层。";
-  }, [inventory, m7]);
+  const sectionBars = useMemo(() => {
+    if (!m7) return [];
+    const total =
+      m7.recent_release_candidates +
+      m7.upcoming_candidates +
+      m7.popular_legacy_candidates +
+      m7.classic_legacy_candidates;
+    return [
+      { name: "最近正式发售", value: m7.recent_release_candidates, max: Math.max(total, 1) },
+      {
+        name: "即将发售（有日期）",
+        value: m7.upcoming_candidates,
+        max: Math.max(total, 1),
+        tone: m7.upcoming_candidates <= 2 ? ("bad" as const) : undefined,
+      },
+      { name: "人气老游戏", value: m7.popular_legacy_candidates, max: Math.max(total, 1) },
+      { name: "经典联机", value: m7.classic_legacy_candidates, max: Math.max(total, 1) },
+    ];
+  }, [m7]);
 
   const runLookup = async () => {
     setLookupError(null);
     setPresence(null);
     const raw = lookup.trim();
     if (!raw) {
-      setLookupError("输入 Steam AppID 或游戏名关键词。");
+      setLookupError("输入游戏编号或名称");
       return;
     }
     if (!token) {
-      setLookupError("需要 Admin Token。");
+      setLookupError("需要管理密钥");
       return;
     }
     try {
       if (/^\d+$/.test(raw)) {
-        const appId = Number(raw);
-        const result = await apiClient.adminAppPresence(token, appId);
-        setPresence(result);
-      } else {
-        const search = await apiClient.search(raw, 8);
-        const items = search.items ?? [];
-        const first = items[0];
-        if (!first) {
-          setLookupError(`公开搜索无结果：「${raw}」。很可能未入库或未 enrich。`);
-          return;
-        }
-        setPresence({
-          app_id: first.app_id,
-          in_apps: true,
-          has_multiplayer_profile: null,
-          app: {
-            app_id: first.app_id,
-            canonical_name: first.name,
-            release_date: first.release_date,
-            release_state: first.release_state,
-            app_type: null,
-          },
-          search_hits: items.map((it) => ({
-            app_id: it.app_id,
-            name: it.name,
-            release_date: it.release_date,
-          })),
-          note: "按名称搜索的是公开索引；精确是否在联机池请点 AppID 再查。",
-        });
+        setPresence(await apiClient.adminAppPresence(token, Number(raw)));
+        return;
       }
+      const search = await apiClient.search(raw, 8);
+      const items = search.items ?? [];
+      const first = items[0];
+      if (!first) {
+        setLookupError("搜不到。多半还没入库。");
+        return;
+      }
+      setPresence({
+        app_id: first.app_id,
+        in_apps: true,
+        has_multiplayer_profile: null,
+        app: {
+          app_id: first.app_id,
+          canonical_name: first.name,
+          release_date: first.release_date,
+          release_state: first.release_state,
+          app_type: null,
+        },
+        search_hits: items.map((it) => ({
+          app_id: it.app_id,
+          name: it.name,
+          release_date: it.release_date,
+        })),
+        note: "点下面的编号可查是否进了联机推荐池。",
+      });
     } catch (e) {
       setLookupError(e instanceof ApiError ? e.message : String(e));
     }
   };
 
   return (
-    <section className="settings-screen" aria-label="数据管道">
-      <header className="screen-head">
-        <div>
-          <h2>数据管道</h2>
-          <p>查看入库库存、刷新任务与 App 是否进池。需要管理员令牌。</p>
-        </div>
-        <div className="statusline">
-          {status?.build_git_sha && <Chip>build {status.build_git_sha.slice(0, 8)}</Chip>}
-          {status?.generated_at_ms != null && (
-            <Chip>快照 {formatAgo(status.generated_at_ms)}</Chip>
-          )}
-          <Button size="small" onClick={() => void load()} disabled={loading}>
-            {loading ? "刷新中…" : "刷新"}
-          </Button>
-        </div>
-      </header>
-
-      <Panel title="管理员令牌">
-        <p className="muted">
-          与服务器 <code>MPGS_ADMIN_TOKEN</code> 一致。仅保存在本机浏览器，不会提交到仓库。
-        </p>
-        <div className="pref-row" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+    <section className="data-ops settings-screen" aria-label="数据监测">
+      <header className="data-ops-head">
+        <h2>数据监测</h2>
+        <div className="data-ops-token">
           <input
             type="password"
             value={tokenDraft}
             onChange={(e) => setTokenDraft(e.target.value)}
-            placeholder="MPGS_ADMIN_TOKEN"
-            style={{ flex: "1 1 240px", minWidth: 200 }}
+            placeholder="管理密钥"
             autoComplete="off"
           />
-          <Button onClick={saveToken}>保存</Button>
+          <Button size="small" onClick={saveToken}>
+            保存
+          </Button>
+          <Button size="small" onClick={() => void load()} disabled={loading}>
+            {loading ? "…" : "刷新"}
+          </Button>
         </div>
-      </Panel>
+      </header>
 
-      {error && (
-        <Panel title="加载失败">
-          <p role="alert">{error}</p>
-        </Panel>
-      )}
+      {error ? (
+        <p className="data-ops-alert" role="alert">
+          {error}
+        </p>
+      ) : null}
 
-      {loading && !status && (
-        <div className="feed-grid" aria-busy="true">
+      {loading && !status ? (
+        <div className="data-ops-grid" aria-busy="true">
           {Array.from({ length: 4 }, (_, i) => (
             <Skeleton key={i} />
           ))}
         </div>
-      )}
+      ) : null}
 
-      {status && inventory && (
+      {status && inv ? (
         <>
-          <Panel title="人话结论">
-            <p>{pipelineHint}</p>
-            <ul className="muted">
-              <li>
-                联机池约 <strong>{inventory.multiplayer_profiles}</strong> 个；近 14 天有日期的已发售{" "}
-                <strong>{inventory.released_last_14_days}</strong> 个。
-              </li>
-              <li>
-                即将发售总数 {inventory.coming_soon_total}，其中有明确日期{" "}
-                {inventory.coming_soon_dated}（日历「有日期」几乎只靠这个）。
-              </li>
-              <li>
-                库内最大发售日 {inventory.max_release_date ?? "—"}
-                {inventory.max_release_date_name
-                  ? ` · ${inventory.max_release_date_name}`
-                  : ""}
-                {inventory.max_release_date_app_id != null
-                  ? ` (#${inventory.max_release_date_app_id})`
-                  : ""}
-              </li>
-              <li>
-                任务队列 pending {inventory.jobs_pending} / leased {inventory.jobs_leased} / dead{" "}
-                {inventory.jobs_dead}
-              </li>
-            </ul>
-          </Panel>
+          <div className="data-ops-grid">
+            <Stat label="联机游戏池" value={inv.multiplayer_profiles} hint="能参与推荐的" />
+            <Stat
+              label="近两周新发售"
+              value={inv.released_last_14_days}
+              hint="有明确发售日"
+              tone={inv.released_last_14_days < 20 ? "warn" : "ok"}
+            />
+            <Stat
+              label="即将发售·有日期"
+              value={inv.coming_soon_dated}
+              hint={`共 ${inv.coming_soon_total} 个即将发售`}
+              tone={inv.coming_soon_dated <= 1 ? "bad" : "warn"}
+            />
+            <Stat
+              label="名单里最新发售日"
+              value={inv.max_release_date ?? "—"}
+              hint={inv.max_release_date_name ?? undefined}
+            />
+            <Stat label="库内游戏总数" value={inv.apps_total} hint="含未整理壳数据" />
+            <Stat
+              label="排队任务"
+              value={inv.jobs_pending + inv.jobs_leased}
+              hint={inv.jobs_dead > 0 ? `失败堆积 ${inv.jobs_dead}` : "待处理 + 进行中"}
+              tone={inv.jobs_dead > 500 ? "warn" : undefined}
+            />
+          </div>
 
-          <Panel title="库存">
-            <div className="seg" style={{ flexWrap: "wrap", gap: 8 }}>
-              <Chip>apps {inventory.apps_total}</Chip>
-              <Chip>联机池 {inventory.multiplayer_profiles}</Chip>
-              <Chip>已发售有日 {inventory.released_with_date}</Chip>
-              <Chip>近14天发售 {inventory.released_last_14_days}</Chip>
-              <Chip>即将发售 {inventory.coming_soon_total}</Chip>
-              <Chip>即将发售有日 {inventory.coming_soon_dated}</Chip>
-              <Chip>unknown 壳 {inventory.unknown_named_stubs}</Chip>
+          <Panel title="资料完整度">
+            <div className="bar-list">
+              <Bar name="有玩家评价" value={cov?.with_reviews ?? 0} max={pool} />
+              <Bar name="有在线人数" value={cov?.with_ccu ?? 0} max={pool} />
+              <Bar name="有价格" value={cov?.with_price ?? 0} max={pool} />
+              <Bar name="有平台信息" value={cov?.with_platforms ?? 0} max={pool} />
+              <Bar name="有语言信息" value={cov?.with_languages ?? 0} max={pool} />
+              <Bar
+                name="可以正常推荐"
+                value={cov?.recommendation_ready_profiles ?? 0}
+                max={pool}
+              />
+              <Bar
+                name="有发售日"
+                value={m7?.candidates_with_date ?? 0}
+                max={pool}
+              />
+              <Bar name="有封面图" value={m7?.candidates_with_cover ?? 0} max={pool} />
             </div>
           </Panel>
 
-          {m7 && (
-            <Panel title="分区候选（与公开 Feed 同一套资格）">
-              <div className="seg" style={{ flexWrap: "wrap", gap: 8 }}>
-                <Chip>近期正式发售 {m7.recent_release_candidates}</Chip>
-                <Chip>即将发售 {m7.upcoming_candidates}</Chip>
-                <Chip>人气老游 {m7.popular_legacy_candidates}</Chip>
-                <Chip>老牌联机 {m7.classic_legacy_candidates}</Chip>
-                <Chip>有封面 {m7.candidates_with_cover}</Chip>
-                <Chip>有日期 {m7.candidates_with_date}</Chip>
+          {sectionBars.length > 0 ? (
+            <Panel title="首页各列表体量">
+              <div className="bar-list">
+                {sectionBars.map((row) => (
+                  <Bar
+                    key={row.name}
+                    name={row.name}
+                    value={row.value}
+                    max={row.max}
+                    suffix={` 款`}
+                    tone={row.tone}
+                  />
+                ))}
               </div>
             </Panel>
-          )}
+          ) : null}
 
-          {coverage && (
-            <Panel title="联机资料完整度">
-              <div className="seg" style={{ flexWrap: "wrap", gap: 8 }}>
-                <Chip>评测 {coverage.with_reviews}</Chip>
-                <Chip>CCU {coverage.with_ccu}</Chip>
-                <Chip>价格 {coverage.with_price}</Chip>
-                <Chip>平台 {coverage.with_platforms}</Chip>
-                <Chip>语言 {coverage.with_languages}</Chip>
-                <Chip>推荐就绪 {coverage.recommendation_ready_profiles}</Chip>
-              </div>
-            </Panel>
-          )}
-
-          <Panel title="刷新任务">
-            <div style={{ display: "grid", gap: 10 }}>
-              {tasks.map((task) => (
-                <div key={task.task_name} className="pref-row">
-                  <strong>{taskPlainName(task.task_name)}</strong>
-                  <div className="muted" style={{ fontSize: 13 }}>
-                    上次成功：{msLabel(task.last_success_at_ms)} · 下次：
-                    {msLabel(task.next_run_at_ms)} · 覆盖 {ratioLabel(task.coverage_ratio)}
-                    {task.last_error_category ? ` · 错误 ${task.last_error_category}` : ""}
+          <Panel title="后台任务">
+            <div className="task-list">
+              {tasks.map((task) => {
+                const p =
+                  task.coverage_ratio == null
+                    ? 0
+                    : Math.max(0, Math.min(100, task.coverage_ratio * 100));
+                const tone = task.last_error_category
+                  ? "bad"
+                  : toneForPct(p || (task.last_success_at_ms ? 100 : 0));
+                return (
+                  <div className="task-card" key={task.task_name}>
+                    <div className="task-top">
+                      <span className="title">{taskLabel(task.task_name)}</span>
+                      <span className="when">{taskStatusLine(task)}</span>
+                    </div>
+                    <div className="bar-track" aria-hidden="true">
+                      <div
+                        className="bar-fill"
+                        data-tone={tone}
+                        style={{
+                          width: `${task.coverage_ratio == null ? (task.last_success_at_ms ? 100 : 8) : p}%`,
+                        }}
+                      />
+                    </div>
                   </div>
-                  {task.cursor_value && (
-                    <code style={{ fontSize: 11, wordBreak: "break-all" }}>{task.cursor_value}</code>
-                  )}
-                </div>
-              ))}
+                );
+              })}
             </div>
           </Panel>
         </>
-      )}
+      ) : null}
 
-      <Panel title="App 进池查询">
-        <p className="muted">
-          例：机械狂欢 Steam 页是 app/4108000。若显示「不在 apps 表」，就是发现阶段没扫到，不是排序把它藏了。
-        </p>
-        <div className="pref-row" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+      <Panel title="查一款游戏">
+        <div className="lookup-row">
           <input
             value={lookup}
             onChange={(e) => setLookup(e.target.value)}
-            placeholder="AppID 如 4108000 或 名称"
-            style={{ flex: "1 1 240px", minWidth: 200 }}
+            placeholder="Steam 编号或名称，如 4108000"
             onKeyDown={(e) => {
               if (e.key === "Enter") void runLookup();
             }}
           />
           <Button onClick={() => void runLookup()}>查询</Button>
         </div>
-        {lookupError && <p role="alert">{lookupError}</p>}
-        {presence && (
-          <div style={{ marginTop: 12 }}>
-            <div className="seg" style={{ flexWrap: "wrap", gap: 8 }}>
-              <Chip>app {presence.app_id}</Chip>
-              <Chip tone={presence.in_apps ? undefined : "danger"}>
-                {presence.in_apps ? "已在 apps" : "不在 apps"}
-              </Chip>
-              {presence.has_multiplayer_profile != null && (
-                <Chip tone={presence.has_multiplayer_profile ? undefined : "warn"}>
-                  {presence.has_multiplayer_profile ? "在联机池" : "不在联机池"}
-                </Chip>
-              )}
+        {lookupError ? (
+          <p className="data-ops-alert" role="alert">
+            {lookupError}
+          </p>
+        ) : null}
+        {presence ? (
+          <div className="presence">
+            <div className="presence-steps">
+              <div className="step" data-ok={presence.in_apps ? "true" : "false"}>
+                <span className="step-dot" />
+                {presence.in_apps ? "已进入游戏库" : "还没进游戏库（发现阶段漏了）"}
+              </div>
+              <div
+                className="step"
+                data-ok={
+                  presence.has_multiplayer_profile == null
+                    ? "unknown"
+                    : presence.has_multiplayer_profile
+                      ? "true"
+                      : "false"
+                }
+              >
+                <span className="step-dot" />
+                {presence.has_multiplayer_profile == null
+                  ? "是否进联机推荐池：点编号再查"
+                  : presence.has_multiplayer_profile
+                    ? "已在联机推荐池"
+                    : "在库里，但还没进联机推荐池"}
+              </div>
             </div>
-            {presence.app && (
-              <p>
-                {presence.app.canonical_name}
+            {presence.app ? (
+              <div>
+                <strong>{presence.app.canonical_name}</strong>
                 {presence.app.release_date ? ` · 发售 ${presence.app.release_date}` : ""}
-                {presence.app.release_state ? ` · ${presence.app.release_state}` : ""}
-              </p>
-            )}
-            {presence.note && <p className="muted">{presence.note}</p>}
-            {presence.search_hits && presence.search_hits.length > 0 && (
-              <ul>
+              </div>
+            ) : null}
+            {presence.note ? <div className="hint">{presence.note}</div> : null}
+            {presence.search_hits && presence.search_hits.length > 0 ? (
+              <div className="hits">
                 {presence.search_hits.map((hit) => (
-                  <li key={hit.app_id}>
-                    <Button
-                      size="small"
-                      variant="ghost"
-                      onClick={() => {
-                        setLookup(String(hit.app_id));
-                        void (async () => {
-                          if (!token) return;
-                          try {
-                            const result = await apiClient.adminAppPresence(token, hit.app_id);
-                            setPresence(result);
-                          } catch (e) {
-                            setLookupError(e instanceof ApiError ? e.message : String(e));
-                          }
-                        })();
-                      }}
-                    >
-                      #{hit.app_id} {hit.name}
-                      {hit.release_date ? ` (${hit.release_date})` : ""}
-                    </Button>
-                  </li>
+                  <Button
+                    key={hit.app_id}
+                    size="small"
+                    variant="ghost"
+                    onClick={() => {
+                      setLookup(String(hit.app_id));
+                      void (async () => {
+                        if (!token) return;
+                        try {
+                          setPresence(await apiClient.adminAppPresence(token, hit.app_id));
+                        } catch (e) {
+                          setLookupError(e instanceof ApiError ? e.message : String(e));
+                        }
+                      })();
+                    }}
+                  >
+                    {hit.name}
+                    {hit.release_date ? ` ${hit.release_date}` : ""}
+                  </Button>
                 ))}
-              </ul>
-            )}
-            {onOpenGame && presence.in_apps && (
+              </div>
+            ) : null}
+            {onOpenGame && presence.in_apps ? (
               <Button size="small" onClick={() => onOpenGame(presence.app_id)}>
                 打开详情
               </Button>
-            )}
+            ) : null}
           </div>
-        )}
+        ) : null}
       </Panel>
     </section>
   );

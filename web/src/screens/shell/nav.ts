@@ -30,6 +30,6 @@ export const AUX_TABS: AuxTab[] = [
   { view: { kind: "natural-language" }, label: "描述推荐", glyph: "✦" },
   { view: { kind: "search" }, label: "搜索", glyph: "⌕" },
   { view: { kind: "calendar" }, label: "日历", glyph: "▦" },
-  { view: { kind: "data-ops" }, label: "数据", glyph: "▣" },
+  { view: { kind: "data-ops" }, label: "监测", glyph: "▣" },
   { view: { kind: "settings" }, label: "设置", glyph: "⚙" },
 ];

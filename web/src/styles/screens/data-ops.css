@@ -1,0 +1,245 @@
+/* Data pipeline monitor — scoped under .data-ops */
+
+.data-ops {
+  display: grid;
+  gap: 14px;
+  padding-bottom: 24px;
+}
+
+.data-ops .data-ops-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.data-ops .data-ops-head h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.data-ops .data-ops-token {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.data-ops .data-ops-token input {
+  flex: 1 1 220px;
+  min-width: 180px;
+  padding: 8px 10px;
+  border: var(--bw) solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.data-ops .data-ops-alert {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--warn, #c9a227) 50%, var(--border));
+  background: color-mix(in srgb, var(--warn, #c9a227) 12%, var(--surface));
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.data-ops .data-ops-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  gap: 10px;
+}
+
+.data-ops .data-ops-stat {
+  padding: 12px 14px;
+  border: var(--bw) solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  display: grid;
+  gap: 4px;
+}
+
+.data-ops .data-ops-stat .label {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.data-ops .data-ops-stat .value {
+  font-size: 1.45rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-ops .data-ops-stat .hint {
+  font-size: 11px;
+  color: var(--ink-muted);
+  line-height: 1.35;
+}
+
+.data-ops .data-ops-stat[data-tone="warn"] {
+  border-color: color-mix(in srgb, var(--warn, #c9a227) 55%, var(--border));
+}
+
+.data-ops .data-ops-stat[data-tone="bad"] {
+  border-color: color-mix(in srgb, var(--danger, #d35454) 55%, var(--border));
+}
+
+.data-ops .data-ops-stat[data-tone="ok"] {
+  border-color: color-mix(in srgb, var(--ok, #3d9a6a) 45%, var(--border));
+}
+
+.data-ops .bar-list {
+  display: grid;
+  gap: 12px;
+}
+
+.data-ops .bar-row {
+  display: grid;
+  gap: 5px;
+}
+
+.data-ops .bar-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 13px;
+}
+
+.data-ops .bar-meta .name {
+  color: var(--ink);
+  font-weight: 550;
+}
+
+.data-ops .bar-meta .nums {
+  color: var(--ink-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.data-ops .bar-track {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--surface-2, color-mix(in srgb, var(--surface) 70%, var(--border)));
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+}
+
+.data-ops .bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--accent, #5b8def) 78%, #fff),
+    var(--accent, #5b8def)
+  );
+  min-width: 0;
+  transition: width 0.35s ease;
+}
+
+.data-ops .bar-fill[data-tone="warn"] {
+  background: linear-gradient(90deg, #d4b04a, #c9a227);
+}
+
+.data-ops .bar-fill[data-tone="bad"] {
+  background: linear-gradient(90deg, #e07a7a, #d35454);
+}
+
+.data-ops .bar-fill[data-tone="ok"] {
+  background: linear-gradient(90deg, #5cb88a, #3d9a6a);
+}
+
+.data-ops .task-list {
+  display: grid;
+  gap: 12px;
+}
+
+.data-ops .task-card {
+  padding: 12px 14px;
+  border: var(--bw) solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  display: grid;
+  gap: 8px;
+}
+
+.data-ops .task-top {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
+.data-ops .task-top .title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.data-ops .task-top .when {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.data-ops .lookup-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.data-ops .lookup-row input {
+  flex: 1 1 200px;
+  min-width: 160px;
+  padding: 8px 10px;
+  border: var(--bw) solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.data-ops .presence {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.data-ops .presence-steps {
+  display: grid;
+  gap: 6px;
+}
+
+.data-ops .step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.data-ops .step-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--ink-muted);
+}
+
+.data-ops .step[data-ok="true"] .step-dot {
+  background: var(--ok, #3d9a6a);
+}
+
+.data-ops .step[data-ok="false"] .step-dot {
+  background: var(--danger, #d35454);
+}
+
+.data-ops .step[data-ok="unknown"] .step-dot {
+  background: var(--warn, #c9a227);
+}
+
+.data-ops .hits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}

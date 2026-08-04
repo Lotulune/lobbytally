@@ -8,6 +8,7 @@ import "./styles/screens/nl.css";
 import "./styles/screens/community.css";
 import "./styles/screens/calendar-search.css";
 import "./styles/screens/settings.css";
+import "./styles/screens/data-ops.css";
 
 const container = document.getElementById("root");
 if (!container) {
