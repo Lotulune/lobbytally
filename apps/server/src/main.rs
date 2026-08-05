@@ -1908,7 +1908,7 @@ mod tests {
 
     #[tokio::test]
     async fn calendar_can_switch_between_recent_and_upcoming() {
-        let app = test_app();
+        let (repo, app) = test_repo_and_app(RateLimitConfig::default());
         let recent = app
             .clone()
             .oneshot(
@@ -1932,6 +1932,30 @@ mod tests {
                 .all(|item| item["release_state"] == "released" && item["early_data"].is_boolean())
         );
 
+        let outside_default_window = mpgs_storage::util::day_utc_from_ms(
+            repo.database()
+                .now_ms()
+                .saturating_add(61_i64 * 24 * 60 * 60 * 1000),
+        );
+        repo.database()
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    "INSERT INTO apps (
+                         app_id, app_type, canonical_name, release_state, release_date,
+                         release_date_precision, created_at_ms, updated_at_ms
+                     ) VALUES (9999999, 'game', 'outside-window', 'coming_soon', ?1, 'day', 1, 1)",
+                    [&outside_default_window],
+                )?;
+                conn.execute(
+                    "INSERT INTO multiplayer_profiles (
+                         app_id, dominant_mode, profile_confidence, computed_at_ms
+                     ) VALUES (9999999, 'generic_multiplayer', 0.3, 1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
         let upcoming = app
             .oneshot(
                 Request::builder()
@@ -1942,6 +1966,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(upcoming.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(upcoming.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["dated_items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["app_id"] != 9_999_999)
+        );
     }
 
     #[tokio::test]
@@ -2461,7 +2496,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(json["algorithm_version"], "rules-0.3.0", "{uri}");
+            assert_eq!(json["algorithm_version"], "rules-0.3.1", "{uri}");
             assert_eq!(json["config_version"], "rules-0.1.0", "{uri}");
         }
     }

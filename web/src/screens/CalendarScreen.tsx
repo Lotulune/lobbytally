@@ -103,7 +103,7 @@ export function CalendarScreen({ onOpenGame }: { onOpenGame: (appId: number) => 
   useEffect(() => {
     let cancelled = false;
     const { from, to } =
-      period === "upcoming" ? defaultWindow(Date.now(), 6) : recentWindow(Date.now(), 6);
+      period === "upcoming" ? defaultWindow(Date.now()) : recentWindow(Date.now(), 6);
     setState((prev) => ({ ...prev, loading: true, error: null }));
     apiClient
       .calendar(from, to, period)
@@ -148,7 +148,7 @@ export function CalendarScreen({ onOpenGame }: { onOpenGame: (appId: number) => 
       <header className="screen-head calendar-head">
         <div className="calendar-head-title">
           <h2>发售日历</h2>
-          <p>{period === "upcoming" ? "未来 6 个月已知的发售窗口" : "近 6 个月已发售的条目"}</p>
+          <p>{period === "upcoming" ? "未来 60 天已知的发售窗口" : "近 6 个月已发售的条目"}</p>
         </div>
         <div className="calendar-head-meta">
           {state.data && (

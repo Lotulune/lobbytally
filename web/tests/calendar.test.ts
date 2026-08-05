@@ -74,14 +74,14 @@ describe("calendar helpers", () => {
     expect(earlyDataLabel(false, 42)).toBeNull();
   });
 
-  it("builds a UTC day window clamped to one year", () => {
+  it("builds a 60-day upcoming window in UTC", () => {
     const now = Date.UTC(2026, 6, 15); // 2026-07-15
     expect(toDayString(new Date(now))).toBe("2026-07-15");
-    const w = defaultWindow(now, 6);
+    const w = defaultWindow(now);
     expect(w.from).toBe("2026-07-15");
-    expect(w.to).toBe("2027-01-15");
-    const clamped = defaultWindow(now, 48);
-    expect(clamped.to).toBe("2027-07-15"); // clamped to +12 months
+    expect(w.to).toBe("2026-09-13");
+    const clamped = defaultWindow(now, 999);
+    expect(clamped.to).toBe("2027-07-16"); // clamped to +366 days
     expect(recentWindow(now, 6)).toEqual({ from: "2026-01-15", to: "2026-07-15" });
   });
 });

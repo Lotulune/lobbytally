@@ -6731,6 +6731,8 @@ struct CalendarQuery {
     state: Option<String>,
 }
 
+const UPCOMING_CALENDAR_DAYS: i64 = 60;
+
 #[utoipa::path(
     get,
     path = "/v1/calendar",
@@ -6768,7 +6770,7 @@ async fn get_calendar(
     let default_to_ms = if calendar_state == "recent" {
         now_ms
     } else {
-        now_ms.saturating_add(365_i64 * 24 * 60 * 60 * 1000)
+        now_ms.saturating_add(UPCOMING_CALENDAR_DAYS * 24 * 60 * 60 * 1000)
     };
     let from = query
         .from
@@ -6813,18 +6815,16 @@ async fn get_calendar(
     }
     match storage_result(repo, move |repo| {
         let (dated, undated) = repo.list_calendar(&from, &to, &calendar_state)?;
-        let attach_review_state = |items: Vec<mpgs_storage::AppRecord>| {
-            items
+        Ok((
+            dated
                 .into_iter()
-                .map(|item| {
-                    let detail = repo.game_detail(item.app_id)?;
-                    let review_total = detail.as_ref().and_then(|row| row.total_reviews);
-                    let cover_url = detail.and_then(|row| row.cover_url);
-                    Ok(calendar_item_json(item, review_total, cover_url))
-                })
-                .collect::<Result<Vec<_>, StorageError>>()
-        };
-        Ok((attach_review_state(dated)?, attach_review_state(undated)?))
+                .map(calendar_item_json)
+                .collect::<Vec<_>>(),
+            undated
+                .into_iter()
+                .map(calendar_item_json)
+                .collect::<Vec<_>>(),
+        ))
     })
     .await
     {
@@ -6840,16 +6840,14 @@ async fn get_calendar(
     }
 }
 
-fn calendar_item_json(
-    item: mpgs_storage::AppRecord,
-    review_total: Option<u32>,
-    cover_url: Option<String>,
-) -> serde_json::Value {
+fn calendar_item_json(row: mpgs_storage::query::CalendarItemRow) -> serde_json::Value {
+    let item = row.app;
+    let review_total = row.review_total;
     json!({
         "app_id": item.app_id,
         "app_type": item.app_type,
         "canonical_name": item.canonical_name,
-        "cover_url": cover_url.or_else(|| resolve_feed_cover_url(item.app_id, None)),
+        "cover_url": row.cover_url.or_else(|| resolve_feed_cover_url(item.app_id, None)),
         "release_state": item.release_state,
         "release_date": item.release_date,
         "release_date_raw": item.release_date_raw,
@@ -6966,20 +6964,25 @@ async fn get_game(
         Ok(value) => value,
         Err(error) => return map_storage_error(error, None),
     };
+    let media_assets = match storage_result(repo, move |repo| repo.game_media_assets(app_id)).await
+    {
+        Ok(value) => value,
+        Err(error) => return map_storage_error(error, None),
+    };
+    let media_updated_at_ms = media_assets
+        .iter()
+        .map(|asset| asset.updated_at_ms)
+        .max()
+        .unwrap_or(0);
     let cache_identity = user_id.as_deref().unwrap_or("public");
     let etag = weak_etag(&format!(
-        "game:v3:{app_id}:{data_updated_at_ms}:{}:pi{}:{}:{}:user{cache_identity}",
+        "game:v4:{app_id}:{data_updated_at_ms}:media{media_updated_at_ms}:{}:pi{}:{}:{}:user{cache_identity}",
         active_config.version, play_intent.0.revision, play_intent.1, play_intent.2,
     ));
     if let Some(response) = if_none_match_ok(&headers, &etag) {
         return response;
     }
     let popular_reviews = match storage_result(repo, move |repo| repo.popular_reviews(app_id)).await
-    {
-        Ok(value) => value,
-        Err(error) => return map_storage_error(error, None),
-    };
-    let media_assets = match storage_result(repo, move |repo| repo.game_media_assets(app_id)).await
     {
         Ok(value) => value,
         Err(error) => return map_storage_error(error, None),

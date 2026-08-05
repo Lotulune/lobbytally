@@ -13,6 +13,9 @@ use crate::personalize::{
 };
 use crate::score;
 
+const FRESH_RELEASE_DAYS: f64 = 14.0;
+const FRESH_RELEASE_MIN_FRESHNESS: f64 = 1.0 - FRESH_RELEASE_DAYS / 365.0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankingInput {
     pub app_id: SteamAppId,
@@ -255,10 +258,130 @@ fn rank_feed_inner(
         });
     }
 
-    let items = mmr_rerank_with_tie_seed(scored, mmr_lambda, 2, tie_seed);
+    let mut items = mmr_rerank_with_tie_seed(scored, mmr_lambda, 2, tie_seed);
+    if section == FeedSection::RecentRelease {
+        ensure_fresh_release_quota(&mut items, 10, 2);
+        ensure_fresh_release_quota(&mut items, 20, 4);
+    }
     RankedFeed {
         section,
         algorithm_version: algorithm_version.to_owned(),
         items,
+    }
+}
+
+fn ensure_fresh_release_quota(items: &mut [RankedCandidate], window: usize, quota: usize) {
+    let window = window.min(items.len());
+    if window == 0 {
+        return;
+    }
+    let current = items[..window]
+        .iter()
+        .filter(|item| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
+        .count();
+    let missing = quota.min(window).saturating_sub(current);
+    let destinations = items[..window]
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, item)| item.score.freshness < FRESH_RELEASE_MIN_FRESHNESS)
+        .map(|(index, _)| index)
+        .take(missing)
+        .collect::<Vec<_>>();
+    let sources = items[window..]
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
+        .map(|(index, _)| index + window)
+        .take(missing)
+        .collect::<Vec<_>>();
+
+    for (destination, source) in destinations.into_iter().zip(sources) {
+        items.swap(destination, source);
+        items[destination].slot_reason = SlotReason::Explore;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FRESH_RELEASE_MIN_FRESHNESS, RankedCandidate, SlotReason, ensure_fresh_release_quota,
+    };
+    use crate::{Explanation, ScoreBreakdown};
+
+    fn ranked(app_id: u32, freshness: f64) -> RankedCandidate {
+        RankedCandidate {
+            app_id,
+            name: format!("game-{app_id}"),
+            dominant_mode: Some("generic_multiplayer".into()),
+            taxonomy_tags: Vec::new(),
+            publisher: None,
+            series: None,
+            recommended_min: Some(2),
+            recommended_max: None,
+            data_confidence: 0.3,
+            score: ScoreBreakdown {
+                friend_fit: 0.5,
+                section_score: 0.5,
+                personalized_score: 0.5,
+                group_fit: 0.5,
+                mode_fit: 0.5,
+                access_fit: 0.5,
+                hosting_fit: 0.5,
+                session_fit: 0.5,
+                quality: 0.5,
+                activity: 0.5,
+                freshness,
+                risk: 0.0,
+                relevance_score: 1.0 - f64::from(app_id) / 100.0,
+                final_score: 1.0 - f64::from(app_id) / 100.0,
+            },
+            explanation: Explanation {
+                reasons: Vec::new(),
+                cautions: Vec::new(),
+                evidence_ids: Vec::new(),
+            },
+            slot_reason: SlotReason::Base,
+            algorithm_version: "test".into(),
+        }
+    }
+
+    #[test]
+    fn fresh_release_quota_promotes_low_signal_launches_into_visible_windows() {
+        let mut items = (0..30)
+            .map(|app_id| {
+                let freshness = if app_id >= 25 {
+                    FRESH_RELEASE_MIN_FRESHNESS
+                } else {
+                    0.5
+                };
+                ranked(app_id, freshness)
+            })
+            .collect::<Vec<_>>();
+
+        ensure_fresh_release_quota(&mut items, 10, 2);
+        ensure_fresh_release_quota(&mut items, 20, 4);
+
+        assert_eq!(
+            items[..10]
+                .iter()
+                .filter(|item| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
+                .count(),
+            2
+        );
+        assert_eq!(
+            items[..20]
+                .iter()
+                .filter(|item| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
+                .count(),
+            4
+        );
+        assert_eq!(items.len(), 30);
+        assert!(
+            items[..20]
+                .iter()
+                .filter(|item| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
+                .all(|item| item.slot_reason == SlotReason::Explore)
+        );
     }
 }

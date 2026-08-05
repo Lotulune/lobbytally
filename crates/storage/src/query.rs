@@ -1156,12 +1156,19 @@ pub struct EvidenceRow {
     pub observed_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalendarItemRow {
+    pub app: AppRecord,
+    pub review_total: Option<u32>,
+    pub cover_url: Option<String>,
+}
+
 pub fn list_calendar(
     conn: &Connection,
     from_date: &str,
     to_date: &str,
     state: &str,
-) -> StorageResult<(Vec<AppRecord>, Vec<AppRecord>)> {
+) -> StorageResult<(Vec<CalendarItemRow>, Vec<CalendarItemRow>)> {
     if !crate::util::is_iso_day(from_date) || !crate::util::is_iso_day(to_date) {
         return Err(StorageError::validation(
             "calendar dates must use valid YYYY-MM-DD values",
@@ -1186,43 +1193,84 @@ pub fn list_calendar(
     }
     let mut dated = Vec::new();
     let mut undated = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT app_id, app_type, canonical_name, release_state, release_date,
-                release_date_raw, release_date_precision, is_early_access,
-                current_data_confidence, source_modified_at_ms, created_at_ms, updated_at_ms
-         FROM apps
-         WHERE (
-               (?3 = 'upcoming' AND release_state IN ('upcoming', 'coming_soon')
-                   AND (release_date IS NULL OR (release_date >= ?1 AND release_date <= ?2)))
-               OR
-               (?3 = 'recent' AND release_state = 'released'
-                   AND release_date >= ?1 AND release_date <= ?2)
-         )
-         ORDER BY release_date IS NULL, release_date, canonical_name",
-    )?;
-    let rows = stmt.query_map(params![from_date, to_date, state], |row| {
-        Ok(AppRecord {
-            app_id: row.get::<_, i64>(0)? as u32,
-            app_type: row.get(1)?,
-            canonical_name: row.get(2)?,
-            release_state: row.get(3)?,
-            release_date: row.get(4)?,
-            release_date_raw: row.get(5)?,
-            release_date_precision: row.get(6)?,
-            is_early_access: sql_to_opt_bool(row.get(7)?),
-            current_data_confidence: row.get(8)?,
-            source_modified_at_ms: row.get(9)?,
-            created_at_ms: row.get(10)?,
-            updated_at_ms: row.get(11)?,
+    // Select a fixed predicate after validating `state`. Keeping both branches
+    // behind a bound parameter makes SQLite build a slower MULTI-INDEX OR plan.
+    let state_predicate = if state == "upcoming" {
+        "a.release_state IN ('upcoming', 'coming_soon')
+         AND (a.release_date IS NULL OR (a.release_date >= ?1 AND a.release_date <= ?2))"
+    } else {
+        "a.release_state = 'released'
+         AND a.release_date >= ?1 AND a.release_date <= ?2"
+    };
+    let sql = format!(
+        "SELECT a.app_id, a.app_type, a.canonical_name, a.release_state, a.release_date,
+                a.release_date_raw, a.release_date_precision, a.is_early_access,
+                a.current_data_confidence, a.source_modified_at_ms,
+                a.created_at_ms, a.updated_at_ms,
+                (
+                    SELECT review.total_reviews
+                    FROM review_snapshots review
+                    WHERE review.app_id = a.app_id
+                    ORDER BY review.captured_at_ms DESC, review.language_scope ASC
+                    LIMIT 1
+                ),
+                media.capsule_url
+         FROM apps a
+         LEFT JOIN app_media media ON media.app_id = a.app_id
+         WHERE {state_predicate}
+           AND a.app_type IN ('game', 'demo', 'playtest')
+           AND (
+               EXISTS (
+                   SELECT 1 FROM feature_evidence evidence
+                   WHERE evidence.app_id = a.app_id
+                     AND evidence.feature_name = 'category_hint'
+                     AND evidence.is_active = 1
+                     AND evidence.confidence >= 0.3
+               )
+               OR EXISTS (
+                   SELECT 1 FROM multiplayer_profiles profile
+                   WHERE profile.app_id = a.app_id
+                     AND (
+                         profile.dominant_mode IS NOT NULL
+                         OR profile.private_session IS NOT NULL
+                         OR profile.online_coop IS NOT NULL
+                         OR profile.self_hosted_server IS NOT NULL
+                         OR profile.drop_in_out IS NOT NULL
+                         OR profile.crossplay IS NOT NULL
+                         OR profile.recommended_max_players IS NOT NULL
+                     )
+               )
+           )
+         ORDER BY a.release_date IS NULL, a.release_date, a.canonical_name"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![from_date, to_date], |row| {
+        Ok(CalendarItemRow {
+            app: AppRecord {
+                app_id: row.get::<_, i64>(0)? as u32,
+                app_type: row.get(1)?,
+                canonical_name: row.get(2)?,
+                release_state: row.get(3)?,
+                release_date: row.get(4)?,
+                release_date_raw: row.get(5)?,
+                release_date_precision: row.get(6)?,
+                is_early_access: sql_to_opt_bool(row.get(7)?),
+                current_data_confidence: row.get(8)?,
+                source_modified_at_ms: row.get(9)?,
+                created_at_ms: row.get(10)?,
+                updated_at_ms: row.get(11)?,
+            },
+            review_total: row.get(12)?,
+            cover_url: row.get(13)?,
         })
     })?;
     for row in rows {
-        let app = row?;
-        match &app.release_date {
+        let item = row?;
+        match &item.app.release_date {
             Some(d) if d.as_str() >= from_date && d.as_str() <= to_date => {
-                dated.push(app);
+                dated.push(item);
             }
-            Some(_) | None => undated.push(app),
+            Some(_) | None => undated.push(item),
         }
     }
     Ok((dated, undated))
@@ -1424,21 +1472,15 @@ pub fn data_updated_at_ms(conn: &Connection) -> StorageResult<i64> {
     let value = conn.query_row(
         "SELECT COALESCE(MAX(updated_at_ms), 0)
          FROM (
-             SELECT MAX(updated_at_ms) AS updated_at_ms FROM apps
-             UNION ALL SELECT MAX(computed_at_ms) FROM multiplayer_profiles
-             UNION ALL SELECT MAX(updated_at_ms) FROM app_availability
-             UNION ALL SELECT MAX(captured_at_ms) FROM price_snapshots
-             UNION ALL SELECT MAX(captured_at_ms) FROM review_snapshots
-              UNION ALL SELECT MAX(captured_at_ms) FROM popular_reviews
-              UNION ALL SELECT MAX(captured_at_ms) FROM popular_review_refresh_state
-              UNION ALL SELECT MAX(captured_at_ms) FROM store_detail_refresh_state
-             UNION ALL SELECT MAX(captured_at_ms) FROM player_snapshots
-             UNION ALL SELECT MAX(observed_at_ms) FROM feature_evidence
+             -- Collection commands bracket writes with a source run, and the
+             -- worker records completion in data_refresh_state. Reading those
+             -- durable watermarks avoids full scans of every snapshot table.
+             SELECT MAX(updated_at_ms) AS updated_at_ms FROM data_refresh_state
+             UNION ALL SELECT MAX(updated_at_ms) FROM apps
+             UNION ALL SELECT MAX(started_at_ms, COALESCE(finished_at_ms, 0))
+                 FROM source_runs
+                 WHERE run_id = (SELECT MAX(run_id) FROM source_runs)
              UNION ALL SELECT MAX(MAX(created_at_ms, COALESCE(revoked_at_ms, 0))) FROM curation_overrides
-              UNION ALL SELECT MAX(observed_at_ms) FROM release_events
-              UNION ALL SELECT MAX(updated_at_ms) FROM app_media
-              UNION ALL SELECT MAX(updated_at_ms) FROM app_media_assets
-              UNION ALL SELECT MAX(updated_at_ms) FROM app_localizations
           )",
         [],
         |row| row.get(0),
@@ -1449,7 +1491,8 @@ pub fn data_updated_at_ms(conn: &Connection) -> StorageResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GameCandidateRow, list_candidates, resolve_display_dominant_mode, section_matches,
+        GameCandidateRow, list_calendar, list_candidates, resolve_display_dominant_mode,
+        section_matches,
     };
     use crate::Database;
     use mpgs_domain::{
@@ -1842,6 +1885,62 @@ mod tests {
             TODAY,
             &config,
         ));
+    }
+
+    #[test]
+    fn calendar_only_returns_multiplayer_games_and_batches_cover_data() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn(|conn| {
+            for (app_id, app_type, name, date) in [
+                (101, "game", "multiplayer-game", Some("2026-08-10")),
+                (102, "dlc", "multiplayer-dlc", Some("2026-08-11")),
+                (103, "game", "single-player", Some("2026-08-12")),
+                (104, "demo", "undated-demo", None),
+            ] {
+                crate::catalog::upsert_app(
+                    conn,
+                    app_id,
+                    app_type,
+                    name,
+                    "coming_soon",
+                    date,
+                    date.map(|_| "day"),
+                    None,
+                    1,
+                )?;
+            }
+            for app_id in [101, 102, 104] {
+                conn.execute(
+                    "INSERT INTO multiplayer_profiles (
+                         app_id, dominant_mode, recommended_min_players,
+                         profile_confidence, computed_at_ms
+                     ) VALUES (?1, 'generic_multiplayer', 2, 0.3, 1)",
+                    [app_id],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO app_media(app_id, capsule_url, source, updated_at_ms)
+                 VALUES (101, 'https://example.test/101.jpg', 'test', 1)",
+                [],
+            )?;
+
+            let (dated, undated) = list_calendar(conn, "2026-08-01", "2026-08-31", "upcoming")?;
+            assert_eq!(
+                dated.iter().map(|row| row.app.app_id).collect::<Vec<_>>(),
+                vec![101]
+            );
+            assert_eq!(
+                dated[0].cover_url.as_deref(),
+                Some("https://example.test/101.jpg")
+            );
+            assert_eq!(
+                undated.iter().map(|row| row.app.app_id).collect::<Vec<_>>(),
+                vec![104]
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

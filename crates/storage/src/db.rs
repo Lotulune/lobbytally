@@ -95,12 +95,11 @@ impl Database {
         &self,
         compute: impl FnOnce() -> StorageResult<i64>,
     ) -> StorageResult<i64> {
-        if let Ok(guard) = self.data_updated_cache.lock() {
-            if let Some((at, value)) = *guard {
-                if at.elapsed() < DATA_UPDATED_CACHE_TTL {
-                    return Ok(value);
-                }
-            }
+        if let Ok(guard) = self.data_updated_cache.lock()
+            && let Some((at, value)) = *guard
+            && at.elapsed() < DATA_UPDATED_CACHE_TTL
+        {
+            return Ok(value);
         }
         let value = compute()?;
         if let Ok(mut guard) = self.data_updated_cache.lock() {
@@ -224,8 +223,16 @@ pub fn apply_pragmas(conn: &Connection) -> StorageResult<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000i32)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
-    // journal_mode returns the mode string; verify WAL when on a real file.
-    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    // Reasserting WAL on every short-lived worker process can require an
+    // exclusive lock even when the database is already in WAL mode.
+    let current_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    let mode = if current_mode.eq_ignore_ascii_case("wal")
+        || current_mode.eq_ignore_ascii_case("memory")
+    {
+        current_mode
+    } else {
+        conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?
+    };
     if mode.eq_ignore_ascii_case("wal") || mode.eq_ignore_ascii_case("memory") {
         // memory databases may not use WAL; accept both.
     } else {
@@ -416,6 +423,21 @@ fn validate_foreign_keys(conn: &Connection) -> StorageResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_an_existing_wal_database_does_not_contend_with_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-open.db");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let second = Database::open(&path);
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        assert!(second.is_ok());
+    }
 
     #[test]
     fn readiness_rejects_missing_key_schema() {

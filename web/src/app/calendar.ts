@@ -90,12 +90,17 @@ export function toDayString(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-/** Default calendar window: today through +months, clamped to the API's 1-year max. */
-export function defaultWindow(now: number, months = 6): { from: string; to: string } {
+export const UPCOMING_WINDOW_DAYS = 60;
+
+/** Default upcoming calendar window: today through +60 days. */
+export function defaultWindow(
+  now: number,
+  days = UPCOMING_WINDOW_DAYS,
+): { from: string; to: string } {
   const start = new Date(now);
   const end = new Date(now);
-  const clamped = Math.min(Math.max(months, 1), 12);
-  end.setUTCMonth(end.getUTCMonth() + clamped);
+  const clamped = Math.min(Math.max(days, 1), 366);
+  end.setUTCDate(end.getUTCDate() + clamped);
   return { from: toDayString(start), to: toDayString(end) };
 }
 

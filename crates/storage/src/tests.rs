@@ -1270,6 +1270,52 @@ fn store_categories_materialize_conservative_multiplayer_profiles() {
 }
 
 #[test]
+fn store_search_profile_materialization_is_scoped_to_the_ingested_page() {
+    let (repo, _) = repo_with_clock(5_000);
+    let page = StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 101,
+                name: "first".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 202,
+                name: "second".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "targeted-profile-materialization".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    };
+    repo.ingest_store_search_page(&page).unwrap();
+    repo.materialize_store_category_profiles_for_apps(&[101])
+        .unwrap();
+    let evidence_count = |app_id| {
+        repo.database()
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM feature_evidence
+                     WHERE app_id = ?1 AND source_type = 'steam_store_profile_derived'",
+                    [app_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap()
+    };
+    let first_count = evidence_count(101);
+
+    repo.materialize_store_category_profiles_for_apps(&[202])
+        .unwrap();
+
+    assert_eq!(evidence_count(101), first_count);
+    assert!(repo.get_profile(101).unwrap().is_some());
+    assert!(repo.get_profile(202).unwrap().is_some());
+}
+
+#[test]
 fn store_categories_mark_mixed_when_coop_and_pvp_present() {
     let (repo, _) = repo_with_clock(5_000);
     repo.ingest_store_search_page(&StoreSearchPage {

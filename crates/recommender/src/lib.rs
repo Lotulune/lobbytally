@@ -21,7 +21,7 @@ pub use pipeline::{
     rank_feed_with_constraints,
 };
 
-pub const ALGORITHM_VERSION: &str = "rules-0.3.0";
+pub const ALGORITHM_VERSION: &str = "rules-0.3.1";
 const PERSONAL_WEIGHT: f64 = 0.45;
 const AI_WEIGHT: f64 = 0.15;
 

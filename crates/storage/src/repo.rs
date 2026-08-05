@@ -61,11 +61,10 @@ impl Repository {
                     "exactly one active algorithm config is required",
                 ));
             }
-            let has_apps: i64 = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM apps LIMIT 1)",
-                [],
-                |row| row.get(0),
-            )?;
+            let has_apps: i64 =
+                conn.query_row("SELECT EXISTS(SELECT 1 FROM apps LIMIT 1)", [], |row| {
+                    row.get(0)
+                })?;
             if has_apps == 0 {
                 return Err(crate::StorageError::migration(
                     "catalog has no app snapshot yet",
@@ -183,6 +182,19 @@ impl Repository {
         self.db.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
             let applied = ingest::materialize_store_category_profiles(&tx, now)?;
+            tx.commit()?;
+            Ok(applied)
+        })
+    }
+
+    pub fn materialize_store_category_profiles_for_apps(
+        &self,
+        app_ids: &[u32],
+    ) -> StorageResult<usize> {
+        let now = self.db.now_ms();
+        self.db.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            let applied = ingest::materialize_store_category_profiles_for_apps(&tx, app_ids, now)?;
             tx.commit()?;
             Ok(applied)
         })
@@ -1607,7 +1619,10 @@ impl Repository {
         from: &str,
         to: &str,
         state: &str,
-    ) -> StorageResult<(Vec<AppRecord>, Vec<AppRecord>)> {
+    ) -> StorageResult<(
+        Vec<crate::query::CalendarItemRow>,
+        Vec<crate::query::CalendarItemRow>,
+    )> {
         self.db
             .with_conn(|conn| crate::query::list_calendar(conn, from, to, state))
     }

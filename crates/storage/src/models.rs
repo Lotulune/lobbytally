@@ -232,6 +232,17 @@ pub struct MediaCoverageStats {
 }
 
 impl EnrichmentTarget {
+    pub fn filtered(mut self, filter: EnrichmentNeedFilter) -> Self {
+        self.needs_store_details &= filter.store;
+        self.needs_reviews &= filter.reviews;
+        self.needs_review_excerpts &= filter.review_excerpts;
+        self.needs_ccu &= filter.ccu;
+        self.needs_price &= filter.price;
+        self.needs_media_backfill &= filter.media_backfill;
+        self.needs_english_name &= filter.english_name;
+        self
+    }
+
     pub fn needs_any(self) -> bool {
         self.needs_store_details
             || self.needs_reviews
