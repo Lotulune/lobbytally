@@ -13,7 +13,7 @@ use crate::error::SourceError;
 use crate::proposal::{AppCatalogProposal, AppTypeProposal, SourceStability};
 use crate::raw::RawResponse;
 
-pub const ADAPTER_VERSION: &str = "store-search-0.2.0";
+pub const ADAPTER_VERSION: &str = "store-search-0.3.0";
 pub const SOURCE_NAME: &str = "steam_store_search";
 pub const MULTIPLAYER_CATEGORY_HINT: &str = "Multi-player";
 pub const MAX_PAGE_SIZE: u32 = 100;
@@ -24,6 +24,8 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 pub enum StoreSearchSort {
     #[default]
     ReleasedDesc,
+    /// Upcoming multiplayer releases, paired with Steam's `comingsoon` filter.
+    ReleasedAsc,
     ReviewsDesc,
 }
 
@@ -31,7 +33,15 @@ impl StoreSearchSort {
     pub fn as_query_value(self) -> &'static str {
         match self {
             Self::ReleasedDesc => "Released_DESC",
+            Self::ReleasedAsc => "Released_ASC",
             Self::ReviewsDesc => "Reviews_DESC",
+        }
+    }
+
+    pub fn filter(self) -> Option<&'static str> {
+        match self {
+            Self::ReleasedAsc => Some("comingsoon"),
+            Self::ReleasedDesc | Self::ReviewsDesc => None,
         }
     }
 }
@@ -58,11 +68,16 @@ impl StoreSearchRequest {
     }
 
     pub fn path_and_query(&self) -> String {
+        let filter = self
+            .sort
+            .filter()
+            .map_or(String::new(), |value| format!("&filter={value}"));
         format!(
-            "/search/results/?query&start={}&count={}&sort_by={}&category1=998&category2=1&infinite=1&cc=US&l=english&json=1",
+            "/search/results/?query&start={}&count={}&sort_by={}{}&category1=998&category2=1&infinite=1&cc=CN&l=schinese&json=1",
             self.start,
             self.count,
-            self.sort.as_query_value()
+            self.sort.as_query_value(),
+            filter,
         )
     }
 }
@@ -254,5 +269,12 @@ mod tests {
             .unwrap()
             .path_and_query();
         assert!(reviews.contains("sort_by=Reviews_DESC"));
+        assert!(reviews.contains("cc=CN&l=schinese"));
+
+        let upcoming = StoreSearchRequest::with_sort(0, 50, StoreSearchSort::ReleasedAsc)
+            .unwrap()
+            .path_and_query();
+        assert!(upcoming.contains("sort_by=Released_ASC"));
+        assert!(upcoming.contains("filter=comingsoon"));
     }
 }

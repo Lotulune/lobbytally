@@ -769,6 +769,49 @@ pub fn materialize_store_category_profiles(conn: &Connection, now_ms: i64) -> St
     Ok(applied)
 }
 
+pub fn materialize_store_category_profiles_for_apps(
+    conn: &Connection,
+    app_ids: &[u32],
+    now_ms: i64,
+) -> StorageResult<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT value_json, source_type FROM feature_evidence
+         WHERE app_id = ?1
+           AND feature_name = 'category_hint'
+           AND source_type IN ('store_category', 'store_search_category')
+           AND is_active = 1
+         ORDER BY evidence_id",
+    )?;
+    let mut applied = 0_usize;
+    for app_id in app_ids {
+        let rows = stmt.query_map(params![app_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut hints = Vec::new();
+        for row in rows {
+            let (value_json, source_type) = row?;
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&value_json) {
+                match value {
+                    serde_json::Value::String(label) => hints.push(label),
+                    serde_json::Value::Array(labels) => hints.extend(
+                        labels
+                            .into_iter()
+                            .filter_map(|label| label.as_str().map(str::to_owned)),
+                    ),
+                    _ if source_type == "store_search_category" => {
+                        hints.push("Multi-player".into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if materialize_store_category_profile(conn, *app_id, &hints, now_ms)? {
+            applied += 1;
+        }
+    }
+    Ok(applied)
+}
+
 pub fn ingest_store_search_page(
     conn: &Connection,
     page: &StoreSearchPage,

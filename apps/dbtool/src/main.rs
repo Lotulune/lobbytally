@@ -17,7 +17,7 @@ use mpgs_steam_source::{
     GoldenSet, RawResponse, ReviewSummaryRequest, STEAM_STORE_HOST, STEAM_WEB_API_HOST,
     STORE_ADAPTER_VERSION, STORE_SEARCH_ADAPTER_VERSION, STORE_SEARCH_SOURCE_NAME,
     STORE_SOURCE_NAME, SourceError, StoreDetailsRequest, StoreSearchPage, StoreSearchRequest,
-    apply_page_to_cursor, http_not_found_proposal, parse_app_list_page, parse_ccu,
+    StoreSearchSort, apply_page_to_cursor, http_not_found_proposal, parse_app_list_page, parse_ccu,
     parse_popular_reviews, parse_review_summary, parse_store_details, parse_store_search_page,
 };
 use mpgs_storage::{
@@ -29,6 +29,9 @@ use serde::{Deserialize, Serialize};
 // Cursor key is sort-specific so switching discovery ranking starts a fresh crawl
 // instead of resuming the old Reviews_DESC offset.
 const STORE_SEARCH_CURSOR_KEY: &str = "steam_store_search:multiplayer:released_desc";
+const STORE_SEARCH_UPCOMING_CURSOR_KEY: &str =
+    "steam_store_search:multiplayer:comingsoon_released_asc";
+const STORE_SEARCH_STATUS_CURSOR_KEY: &str = "steam_store_search:multiplayer:combined:v1";
 const ENRICH_CURSOR_KEY: &str = "steam_store_enrichment:dynamic:v2";
 const APP_LIST_CURSOR_KEY: &str = "steam_istore_getapplist:games:v1";
 const APP_LIST_PAGES_DEFAULT: u32 = 1;
@@ -41,6 +44,10 @@ const WORKER_LEASE_MS: i64 = 30 * 60 * 1_000;
 const WORKER_RETRY_BASE_MS: i64 = 60 * 1_000;
 const STORE_SEARCH_TARGET_DEFAULT: u32 = 2_000;
 const STORE_SEARCH_TARGET_MAX: u32 = 10_000;
+const CANDIDATE_WORKER_PAGES_DEFAULT: u32 = 10;
+const CANDIDATE_WORKER_PAGES_MAX: u32 = 100;
+const _: () = assert!(CANDIDATE_WORKER_PAGES_DEFAULT > 1);
+const _: () = assert!(CANDIDATE_WORKER_PAGES_DEFAULT <= CANDIDATE_WORKER_PAGES_MAX);
 const STORE_SEARCH_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const ENRICH_LIMIT_DEFAULT: u32 = 100;
 const ENRICH_LIMIT_MAX: u32 = 5_000;
@@ -114,6 +121,46 @@ fn catalog_worker_pages() -> u32 {
         .filter(|value| (1..=APP_LIST_PAGES_MAX).contains(value))
         .unwrap_or(APP_LIST_PAGES_DEFAULT)
 }
+
+fn configured_enrichment_need_filter(media_enabled: bool) -> EnrichmentNeedFilter {
+    let store_only = env_flag("MPGS_ENRICH_STORE_ONLY");
+    let skip_reviews = store_only || env_flag("MPGS_ENRICH_SKIP_REVIEWS");
+    let skip_ccu = store_only || env_flag("MPGS_ENRICH_SKIP_CCU");
+    let skip_store = env_flag("MPGS_ENRICH_SKIP_STORE");
+    EnrichmentNeedFilter {
+        store: !skip_store,
+        reviews: !skip_reviews,
+        review_excerpts: !skip_reviews,
+        ccu: !skip_ccu,
+        price: !skip_store,
+        media_backfill: !skip_store && media_enabled,
+        english_name: !skip_store,
+    }
+}
+
+fn store_first_filter(filter: EnrichmentNeedFilter) -> EnrichmentNeedFilter {
+    EnrichmentNeedFilter {
+        store: filter.store,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: filter.price,
+        // Media and dual-name backfills must not hold reviews/CCU behind a large
+        // optional backlog. The first phase is only for release/calendar facts.
+        media_backfill: false,
+        english_name: false,
+    }
+}
+
+/// Continuation pages consumed per scheduled candidate-discovery channel.
+/// Page zero is refreshed separately and does not consume this budget.
+fn candidate_worker_pages() -> u32 {
+    env::var("MPGS_CANDIDATE_WORKER_PAGES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| (1..=CANDIDATE_WORKER_PAGES_MAX).contains(value))
+        .unwrap_or(CANDIDATE_WORKER_PAGES_DEFAULT)
+}
 const M7_MIN_CANDIDATES: i64 = 2_000;
 const M7_MIN_TRUSTED_FRIEND_PROFILES: i64 = 300;
 const M7_MIN_SECTION_CANDIDATES: i64 = 20;
@@ -154,6 +201,18 @@ fn candidate_collection_plan(
     }
 }
 
+fn candidate_collection_satisfied(
+    refresh_mode: bool,
+    candidate_count: i64,
+    target: u32,
+    continuation_pages: u32,
+    page_budget: u32,
+    page_complete: bool,
+) -> bool {
+    candidate_count >= i64::from(target)
+        && (!refresh_mode || continuation_pages >= page_budget || page_complete)
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct EnrichmentCursor {
     after_app_id: u32,
@@ -163,6 +222,13 @@ struct EnrichmentCursor {
 struct CollectionStats {
     request_count: i64,
     success_count: i64,
+}
+
+impl CollectionStats {
+    fn merge(&mut self, other: Self) {
+        self.request_count = self.request_count.saturating_add(other.request_count);
+        self.success_count = self.success_count.saturating_add(other.success_count);
+    }
 }
 
 #[derive(Debug)]
@@ -213,12 +279,13 @@ fn run() -> Result<(), String> {
         "integrity" => {
             let db_path = required_path(args.next(), "--db path")?;
             let db = Database::open(&db_path).map_err(err)?;
-            let check = db.integrity_check().map_err(err)?;
             let version = db.schema_version().map_err(err)?;
+            // `assert_ready` already runs the full integrity check. Running it
+            // separately first doubled large production backup validation time.
+            db.assert_ready().map_err(err)?;
             println!("path={}", db_path.display());
             println!("schema_version={version}");
-            println!("integrity_check={check:?}");
-            db.assert_ready().map_err(err)?;
+            println!("integrity_check=[\"ok\"]");
             println!("ready=ok");
             Ok(())
         }
@@ -460,7 +527,9 @@ fn run() -> Result<(), String> {
                     STORE_SEARCH_SOURCE_NAME,
                     "candidate_discovery",
                     STORE_SEARCH_ADAPTER_VERSION,
-                    Some("category2=1;sort=Released_DESC;cc=US;l=english"),
+                    Some(
+                        "channels=released_desc,comingsoon_released_asc;category2=1;cc=CN;l=schinese",
+                    ),
                 )
                 .map_err(err)?;
             match collect_steam_candidates(&repo, target) {
@@ -510,6 +579,89 @@ fn run() -> Result<(), String> {
                 }
             }
         }
+        "enrich-steam-app" => {
+            let db_path = required_path(args.next(), "--db path")?;
+            let app_id = required_app_id(args.next())?;
+            if args.next().is_some() {
+                return Err("enrich-steam-app accepts only db-path and app-id".into());
+            }
+            let db = Database::open(&db_path).map_err(err)?;
+            db.migrate().map_err(err)?;
+            let repo = Repository::new(db);
+            repo.ensure_runtime_defaults().map_err(err)?;
+            let (country_code, language) = configured_store_locale()?;
+            let run_id = repo
+                .start_source_run(
+                    STORE_SOURCE_NAME,
+                    "operator_forced_app_enrichment",
+                    STORE_ADAPTER_VERSION,
+                    Some(&format!(
+                        "app_id={app_id};country={country_code};language={language}"
+                    )),
+                )
+                .map_err(err)?;
+            let target = mpgs_storage::EnrichmentTarget {
+                app_id,
+                needs_store_details: true,
+                needs_reviews: false,
+                needs_review_excerpts: false,
+                needs_ccu: false,
+                needs_price: true,
+                needs_media_backfill: false,
+                needs_english_name: false,
+            };
+            match enrich_steam_candidates(&repo, &[target], &country_code, &language) {
+                Ok(stats) => {
+                    let not_found = stats.store_ok == 0 && stats.store_not_found > 0;
+                    let failed = not_found || stats.error_count > 0 || stats.store_ok == 0;
+                    repo.finish_source_run(
+                        run_id,
+                        if failed { "failed" } else { "succeeded" },
+                        stats.request_count,
+                        stats.success_count,
+                        if not_found {
+                            Some("not_found")
+                        } else if failed {
+                            Some("partial_errors")
+                        } else {
+                            None
+                        },
+                        Some(&format!(
+                            "app_id={app_id} store={} store_not_found={} errors={}",
+                            stats.store_ok, stats.store_not_found, stats.error_count
+                        )),
+                    )
+                    .map_err(err)?;
+                    if not_found {
+                        return Err(format!("Steam app {app_id} was not found"));
+                    }
+                    if stats.error_count > 0 || stats.store_ok == 0 {
+                        return Err(format!(
+                            "Steam app {app_id} enrichment failed with {} error(s)",
+                            stats.error_count
+                        ));
+                    }
+                    println!("path={}", db_path.display());
+                    println!("app_id={app_id}");
+                    println!("steam_app_enrichment=ok");
+                    Ok(())
+                }
+                Err(failure) => {
+                    let _ = repo.finish_source_run(
+                        run_id,
+                        "failed",
+                        failure.stats.request_count,
+                        failure.stats.success_count,
+                        Some(failure.category),
+                        Some(&failure.message),
+                    );
+                    Err(format!(
+                        "Steam app {app_id} enrichment {}: {}",
+                        failure.category, failure.message
+                    ))
+                }
+            }
+        }
         "enrich-steam-candidates" => {
             let db_path = required_path(args.next(), "--db path")?;
             let limit = optional_enrich_limit(args.next())?;
@@ -529,20 +681,8 @@ fn run() -> Result<(), String> {
                 .transpose()
                 .map_err(|error| format!("invalid enrichment cursor: {error}"))?
                 .unwrap_or_default();
-            let store_only = env_flag("MPGS_ENRICH_STORE_ONLY");
-            let skip_reviews = store_only || env_flag("MPGS_ENRICH_SKIP_REVIEWS");
-            let skip_ccu = store_only || env_flag("MPGS_ENRICH_SKIP_CCU");
-            let skip_store = env_flag("MPGS_ENRICH_SKIP_STORE");
             let media_policy = configured_media_backfill_policy();
-            let need_filter = EnrichmentNeedFilter {
-                store: !skip_store,
-                reviews: !skip_reviews,
-                review_excerpts: !store_only,
-                ccu: !skip_ccu,
-                price: !skip_store,
-                media_backfill: !skip_store && media_policy.enabled,
-                english_name: !skip_store,
-            };
+            let need_filter = configured_enrichment_need_filter(media_policy.enabled);
             let mut targets = repo
                 .list_enrichment_targets_after_filtered_with_media(
                     limit,
@@ -553,7 +693,11 @@ fn run() -> Result<(), String> {
                     media_policy,
                 )
                 .map_err(err)?;
-            targets.retain(|target| target.matches_filter(need_filter));
+            targets = targets
+                .into_iter()
+                .map(|target| target.filtered(need_filter))
+                .filter(|target| target.needs_any())
+                .collect();
             if targets.is_empty() {
                 println!("path={}", db_path.display());
                 print_coverage(&before);
@@ -887,7 +1031,7 @@ fn current_coverage_ratio(repo: &Repository) -> Result<Option<f64>, String> {
 fn worker_task_status(task_type: &str) -> Option<(&'static str, &'static str)> {
     match task_type {
         "sync_catalog" => Some(("catalog_sync", APP_LIST_CURSOR_KEY)),
-        "collect_candidates" => Some(("candidate_collection", STORE_SEARCH_CURSOR_KEY)),
+        "collect_candidates" => Some(("candidate_collection", STORE_SEARCH_STATUS_CURSOR_KEY)),
         "enrich_catalog" => Some(("enrichment", ENRICH_CURSOR_KEY)),
         _ => None,
     }
@@ -1069,7 +1213,9 @@ fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
             STORE_SEARCH_SOURCE_NAME,
             "candidate_discovery",
             STORE_SEARCH_ADAPTER_VERSION,
-            Some("worker=true;category2=1;sort=Released_DESC;cc=US;l=english"),
+            Some(
+                "worker=true;channels=released_desc,comingsoon_released_asc;category2=1;cc=CN;l=schinese",
+            ),
         )
         .map_err(worker_storage_error)?;
     match collect_steam_candidates(repo, STORE_SEARCH_TARGET_DEFAULT) {
@@ -1113,25 +1259,43 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
         .map_err(|_| worker_task_error("invalid_payload", "invalid stored enrichment cursor"))?
         .unwrap_or_default();
     let media_policy = configured_media_backfill_policy();
-    let need_filter = EnrichmentNeedFilter {
-        store: true,
-        reviews: true,
-        review_excerpts: true,
-        ccu: true,
-        price: true,
-        media_backfill: media_policy.enabled,
-        english_name: true,
-    };
-    let targets = repo
-        .list_enrichment_targets_after_filtered_with_media(
+    let need_filter = configured_enrichment_need_filter(media_policy.enabled);
+    let store_filter = store_first_filter(need_filter);
+    let mut phase = "all";
+    let mut selected_filter = need_filter;
+    let mut targets = if store_filter.any() {
+        repo.list_enrichment_targets_after_filtered_with_media(
             limit,
             Some(cursor.after_app_id),
             &country_code,
             &language,
-            need_filter,
-            media_policy,
+            store_filter,
+            mpgs_storage::MediaBackfillPolicy::DISABLED,
         )
-        .map_err(worker_storage_error)?;
+        .map_err(worker_storage_error)?
+    } else {
+        Vec::new()
+    };
+    if !targets.is_empty() {
+        phase = "store_first";
+        selected_filter = store_filter;
+    } else {
+        targets = repo
+            .list_enrichment_targets_after_filtered_with_media(
+                limit,
+                Some(cursor.after_app_id),
+                &country_code,
+                &language,
+                need_filter,
+                media_policy,
+            )
+            .map_err(worker_storage_error)?;
+    }
+    targets = targets
+        .into_iter()
+        .map(|target| target.filtered(selected_filter))
+        .filter(|target| target.needs_any())
+        .collect();
     let coverage = repo.media_coverage_stats().map_err(worker_storage_error)?;
     let run_id = repo
         .start_source_run(
@@ -1139,7 +1303,7 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
             "candidate_enrichment",
             STORE_ADAPTER_VERSION,
             Some(&format!(
-                "worker=true;limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{}",
+                "worker=true;phase={phase};limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{}",
                 targets.len(),
                 cursor.after_app_id,
                 coverage.coverage_ratio,
@@ -1634,6 +1798,31 @@ fn collect_steam_candidates(
     repo: &Repository,
     target: u32,
 ) -> Result<CollectionStats, CollectionError> {
+    let page_budget = candidate_worker_pages();
+    let mut stats = collect_released_steam_candidates(repo, target, page_budget)?;
+    match collect_upcoming_steam_candidates(repo, page_budget) {
+        Ok(upcoming) => stats.merge(upcoming),
+        Err(mut failure) => {
+            failure.stats.merge(stats);
+            return Err(failure);
+        }
+    }
+    save_candidate_status_cursor(repo, stats)?;
+    Ok(stats)
+}
+
+fn required_app_id(arg: Option<String>) -> Result<u32, String> {
+    let value = arg.ok_or_else(|| "missing Steam app-id".to_owned())?;
+    let app_id = value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid Steam app-id: {value}"))?;
+    if app_id == 0 {
+        return Err("Steam app-id must be greater than zero".into());
+    }
+    Ok(app_id)
+}
+
+fn store_search_client() -> Result<reqwest::blocking::Client, CollectionError> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(DEFAULT_USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
@@ -1645,6 +1834,15 @@ fn collect_steam_candidates(
             message: error.to_string(),
             stats: CollectionStats::default(),
         })?;
+    Ok(client)
+}
+
+fn collect_released_steam_candidates(
+    repo: &Repository,
+    target: u32,
+    page_budget: u32,
+) -> Result<CollectionStats, CollectionError> {
+    let client = store_search_client()?;
     let mut stats = CollectionStats::default();
     let coverage = repo
         .m3_catalog_coverage()
@@ -1676,10 +1874,11 @@ fn collect_steam_candidates(
     );
     let refresh_mode = plan.refresh_mode;
     let mut start = plan.continuation_start;
+    let mut continuation_pages = 0_u32;
 
     // Refresh the volatile top-ranked page every scheduled pass while retaining
     // the durable continuation cursor. This catches newly popular games quickly
-    // and still advances one deeper page per bounded refresh run.
+    // and still advances a bounded continuation batch each run.
     if plan.refresh_top {
         let request = StoreSearchRequest::new(0, 100).map_err(|error| CollectionError {
             category: source_error_category(&error),
@@ -1743,7 +1942,15 @@ fn collect_steam_candidates(
             "progress candidates={} target={} page_start={} rows={}",
             current, target, page.start, page.result_count
         );
-        if refresh_mode || current >= i64::from(target) {
+        continuation_pages = continuation_pages.saturating_add(1);
+        if candidate_collection_satisfied(
+            refresh_mode,
+            current,
+            target,
+            continuation_pages,
+            page_budget,
+            page.is_complete(),
+        ) {
             return Ok(stats);
         }
         if page.is_complete() {
@@ -1761,6 +1968,132 @@ fn collect_steam_candidates(
     }
 }
 
+fn collect_upcoming_steam_candidates(
+    repo: &Repository,
+    page_budget: u32,
+) -> Result<CollectionStats, CollectionError> {
+    let client = store_search_client()?;
+    let mut stats = CollectionStats::default();
+    let stored_cursor = repo
+        .source_cursor(STORE_SEARCH_UPCOMING_CURSOR_KEY)
+        .map_err(|error| CollectionError {
+            category: "storage",
+            message: error.to_string(),
+            stats,
+        })?
+        .map(|value| serde_json::from_str::<StoreSearchCursor>(&value))
+        .transpose()
+        .map_err(|error| CollectionError {
+            category: "invalid_payload",
+            message: format!("invalid stored upcoming cursor: {error}"),
+            stats,
+        })?;
+    let mut start = stored_cursor
+        .as_ref()
+        .filter(|cursor| !cursor.complete)
+        .map_or(0, |cursor| cursor.next_start);
+
+    // A complete window is intentionally restarted so changed dates and newly
+    // listed upcoming games are refreshed without waiting for a manual script.
+    if start > 0 {
+        let request = StoreSearchRequest::with_sort(0, 100, StoreSearchSort::ReleasedAsc).map_err(
+            |error| CollectionError {
+                category: source_error_category(&error),
+                message: error.to_string(),
+                stats,
+            },
+        )?;
+        let page = fetch_store_search_page_with_retry(&client, &request, &mut stats)?;
+        let current = ingest_candidate_page(repo, &page, &mut stats)?;
+        println!(
+            "progress candidates={current} channel=upcoming page_start={} rows={} refresh=top",
+            page.start, page.result_count
+        );
+        thread::sleep(Duration::from_millis(1_100));
+    }
+
+    for page_index in 0..page_budget.max(1) {
+        let request = StoreSearchRequest::with_sort(start, 100, StoreSearchSort::ReleasedAsc)
+            .map_err(|error| CollectionError {
+                category: source_error_category(&error),
+                message: error.to_string(),
+                stats,
+            })?;
+        let page = fetch_store_search_page_with_retry(&client, &request, &mut stats)?;
+        let current = ingest_candidate_page(repo, &page, &mut stats)?;
+        let cursor = StoreSearchCursor {
+            next_start: page.next_start(),
+            total_count: Some(page.total_count),
+            target: page.total_count,
+            complete: page.is_complete(),
+        };
+        repo.save_source_cursor(
+            STORE_SEARCH_UPCOMING_CURSOR_KEY,
+            STORE_SEARCH_SOURCE_NAME,
+            &serde_json::to_value(&cursor).map_err(|error| CollectionError {
+                category: "invalid_payload",
+                message: error.to_string(),
+                stats,
+            })?,
+        )
+        .map_err(|error| CollectionError {
+            category: "storage",
+            message: error.to_string(),
+            stats,
+        })?;
+        println!(
+            "progress candidates={current} channel=upcoming page_start={} rows={} page={}",
+            page.start,
+            page.result_count,
+            page_index + 1
+        );
+        if page.is_complete() {
+            break;
+        }
+        start = page.next_start();
+        if page_index + 1 < page_budget {
+            thread::sleep(Duration::from_millis(1_100));
+        }
+    }
+    Ok(stats)
+}
+
+fn save_candidate_status_cursor(
+    repo: &Repository,
+    stats: CollectionStats,
+) -> Result<(), CollectionError> {
+    let load = |key: &str| -> Result<serde_json::Value, CollectionError> {
+        repo.source_cursor(key)
+            .map_err(|error| CollectionError {
+                category: "storage",
+                message: error.to_string(),
+                stats,
+            })?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(|error| CollectionError {
+                category: "invalid_payload",
+                message: format!("invalid candidate channel cursor: {error}"),
+                stats,
+            })
+            .map(|value| value.unwrap_or(serde_json::Value::Null))
+    };
+    let combined = serde_json::json!({
+        "released": load(STORE_SEARCH_CURSOR_KEY)?,
+        "upcoming": load(STORE_SEARCH_UPCOMING_CURSOR_KEY)?,
+    });
+    repo.save_source_cursor(
+        STORE_SEARCH_STATUS_CURSOR_KEY,
+        STORE_SEARCH_SOURCE_NAME,
+        &combined,
+    )
+    .map_err(|error| CollectionError {
+        category: "storage",
+        message: error.to_string(),
+        stats,
+    })
+}
+
 fn ingest_candidate_page(
     repo: &Repository,
     page: &StoreSearchPage,
@@ -1773,10 +2106,13 @@ fn ingest_candidate_page(
             message: error.to_string(),
             stats: *stats,
         })?;
-    // Refresh multiplayer dominant_mode from the Multi-player search hint
-    // (and any co-op / PvP category_hint evidence already stored).
+    let app_ids = page
+        .candidates
+        .iter()
+        .map(|candidate| candidate.app_id)
+        .collect::<Vec<_>>();
     let _ = repo
-        .materialize_store_category_profiles()
+        .materialize_store_category_profiles_for_apps(&app_ids)
         .map_err(|error| CollectionError {
             category: "storage",
             message: error.to_string(),
@@ -2012,7 +2348,7 @@ fn enrich_steam_candidates(
             thread::sleep(Duration::from_millis(inter_request_ms));
         }
 
-        if target.needs_review_excerpts && !store_only {
+        if target.needs_review_excerpts && !skip_reviews {
             match enrich_popular_reviews(&client, repo, target.app_id, &mut stats) {
                 Ok(()) => {
                     stats.popular_reviews_ok = stats.popular_reviews_ok.saturating_add(1);
@@ -2502,6 +2838,7 @@ fn usage() -> &'static str {
        embed-documents <db-path> [limit=200] [batch=16]\n\
        collect-steam-catalog <db-path> [max-pages=1] [page-size=1000]\n\
        collect-steam-candidates <db-path> [target, default 2000]\n\
+       enrich-steam-app <db-path> <app-id>\n\
        enrich-steam-candidates <db-path> [limit, default 100]\n\
        run-steam-worker-once <db-path> [job-limit=1] [enrich-limit=100]\n\
        import-golden-profiles <db-path>\n\
@@ -2632,7 +2969,33 @@ mod tests {
     }
 
     #[test]
+    fn candidate_worker_uses_a_bounded_multi_page_backlog_batch() {
+        assert_eq!(candidate_worker_pages(), CANDIDATE_WORKER_PAGES_DEFAULT);
+        assert!(!candidate_collection_satisfied(
+            true, 5_487, 2_000, 1, 10, false,
+        ));
+        assert!(candidate_collection_satisfied(
+            true, 5_487, 2_000, 1, 10, true,
+        ));
+    }
+
+    #[test]
+    fn store_first_phase_does_not_starve_on_optional_media_backfill() {
+        let filter = store_first_filter(EnrichmentNeedFilter::ALL);
+        assert!(filter.store);
+        assert!(filter.price);
+        assert!(!filter.reviews);
+        assert!(!filter.review_excerpts);
+        assert!(!filter.ccu);
+        assert!(!filter.media_backfill);
+        assert!(!filter.english_name);
+    }
+
+    #[test]
     fn catalog_arguments_stay_within_safe_bounds() {
+        assert_eq!(required_app_id(Some("4108000".into())).unwrap(), 4_108_000);
+        assert!(required_app_id(Some("0".into())).is_err());
+        assert!(required_app_id(Some("not-an-app".into())).is_err());
         assert_eq!(
             optional_catalog_page_count(None).unwrap(),
             APP_LIST_PAGES_DEFAULT

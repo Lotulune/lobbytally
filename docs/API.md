@@ -130,7 +130,7 @@ AI 失败通常不返回 5xx，而是以成功响应中的 `ai_status=fallback` 
 {
   "api_version": "v1",
   "service_version": "0.1.0",
-  "algorithm_version": "rules-0.3.0",
+  "algorithm_version": "rules-0.3.1",
   "config_version": "rules-0.2.0",
   "schema_version": 19,
   "build_git_sha": "unknown",
@@ -255,11 +255,11 @@ order=asc|desc
     "relevance_score": 0.91,
     "final_score": 0.91
   },
-  "algorithm_version": "rules-0.3.0"
+  "algorithm_version": "rules-0.3.1"
 }
 ```
 
-`algorithm_version` 表示当前执行的代码/公式版本，`config_version` 表示数据库活动阈值与参数版本。升级旧数据库时 `algorithm_version="rules-0.3.0"` 与 `config_version="rules-0.2.0"` 可以同时出现，这是兼容行为，不表示仍在执行旧算法。新部署默认配置版本为 `rules-0.3.0`。
+`algorithm_version` 表示当前执行的代码/公式版本，`config_version` 表示数据库活动阈值与参数版本。升级旧数据库时 `algorithm_version="rules-0.3.1"` 与 `config_version="rules-0.2.0"` 可以同时出现，这是兼容行为，不表示仍在执行旧算法。新部署默认配置版本为 `rules-0.3.0`。
 
 字段语义：
 
@@ -286,7 +286,7 @@ order=asc|desc
 ?state=upcoming&from=2026-07-01&to=2026-12-31
 ```
 
-`state` 必须是 `recent` 或 `upcoming`，省略时默认为 `upcoming`。`from/to` 最大跨度一年。日期不精确的条目进入 `undated_items`，不能伪造具体日期。每个条目包含 `release_date_precision`、`source_modified_at_ms`、`review_total` 和布尔型 `early_data`；`early_data` 由评论数量判断，不使用来源置信度代替评论成熟度。
+`state` 必须是 `recent` 或 `upcoming`，省略时默认为 `upcoming`。未传 `from/to` 时，`upcoming` 默认查询今天至未来 60 天，`recent` 默认查询过去 180 天至今天；显式传入的日期最大跨度一年。日期不精确的条目进入 `undated_items`，不能伪造具体日期。每个条目包含 `release_date_precision`、`source_modified_at_ms`、`review_total` 和布尔型 `early_data`；`early_data` 由评论数量判断，不使用来源置信度代替评论成熟度。
 
 ```json
 {
@@ -363,7 +363,7 @@ Embedding 或 AI 意图解析不可用时回退到 FTS 和当前偏好。
   "items": [],
   "ai_status": "fallback",
   "fallback_reason": "AI provider is not configured; deterministic intent parsing was used",
-  "algorithm_version": "rules-0.3.0",
+  "algorithm_version": "rules-0.3.1",
   "config_version": "rules-0.2.0",
   "recommendation_run_id": "rr_...",
   "score_semantics": "context_percentile_v1",

@@ -385,7 +385,7 @@ Migration `0018_recommendation_telemetry`。保存 run ID、可选的部署密�
 
 保存不可变版本化 JSON、Schema 版本、创建者、创建时间和状态。只有一个版本可标记为当前生产配置；当前配置会在读取时反序列化并校验，并驱动分区天数、CCU/Wilson/熟人适配门槛、候选上限和 MMR 参数。切换必须写审计事件。
 
-配置版本与推荐器代码版本是两个维度：API 的 `algorithm_version` 来自正在执行的代码（当前 `rules-0.3.0`），`config_version` 来自本表的活动行。升级旧数据库时允许继续加载经校验的 `rules-0.2.0` 配置，同时执行 `rules-0.3.0` 公式；不得把活动配置版本冒充代码版本。
+配置版本与推荐器代码版本是两个维度：API 的 `algorithm_version` 来自正在执行的代码（当前 `rules-0.3.1`），`config_version` 来自本表的活动行。升级旧数据库时允许继续加载经校验的 `rules-0.2.0` 或 `rules-0.3.0` 配置，同时执行 `rules-0.3.1` 公式；不得把活动配置版本冒充代码版本。
 
 ## 8. SQLite 配置
 
