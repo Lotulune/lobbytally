@@ -471,10 +471,16 @@ pub fn list_candidates(
     // (not the earliest historical date from release_events). "近期正式发售" is ordered
     // and filtered by that store day so 1.0 / re-dated launches surface by calendar day.
     // `section` is a trusted enum. Give SQLite one concrete predicate and sort
-    // shape instead of a bound-parameter OR across every feed section; the
-    // latter prevents release indexes from being selected on large catalogs.
-    let (section_predicate, section_order) = match section {
+    // shape, then materialize that app scope before ranking snapshot history.
+    // This preserves the full candidate limit without scanning unrelated
+    // review, player, and daily rows for every feed request.
+    let (scope_predicate, section_predicate, section_order) = match section {
         FeedSection::Upcoming => (
+            "((a.release_state IN ('upcoming', 'coming_soon')
+                 AND a.release_date IS NOT NULL
+                 AND a.release_date >= :today
+                 AND a.release_date <= date(:today, '+30 days'))
+               OR a.app_type IN ('demo', 'playtest'))",
             "((a.release_state IN ('upcoming', 'coming_soon')
                  AND a.release_date IS NOT NULL
                  AND a.release_date >= :today
@@ -487,9 +493,16 @@ pub fn list_candidates(
              AND a.release_date IS NOT NULL
              AND a.release_date >= :cutoff
              AND a.release_date <= :today",
+            "a.release_state = 'released'
+             AND a.release_date IS NOT NULL
+             AND a.release_date >= :cutoff
+             AND a.release_date <= :today",
             "a.release_date DESC",
         ),
         FeedSection::PopularLegacy => (
+            "a.release_state = 'released'
+             AND a.release_date IS NOT NULL
+             AND a.release_date < :cutoff",
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
              AND a.release_date < :cutoff
@@ -505,34 +518,49 @@ pub fn list_candidates(
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
              AND a.release_date < :cutoff",
+            "a.release_state = 'released'
+             AND a.release_date IS NOT NULL
+             AND a.release_date < :cutoff",
             "COALESCE(r.total_reviews, 0) DESC",
         ),
     };
     let sql = format!(
-        "WITH ranked_reviews AS (
-             SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms,
+        "WITH candidate_scope AS MATERIALIZED (
+             SELECT a.app_id
+             FROM apps a
+             WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
+               AND ({scope_predicate})
+         ), ranked_reviews AS (
+             SELECT review.app_id, review.total_reviews, review.total_positive,
+                    review.wilson_lower, review.captured_at_ms,
                     ROW_NUMBER() OVER (
-                        PARTITION BY app_id ORDER BY captured_at_ms DESC, language_scope ASC
+                        PARTITION BY review.app_id
+                        ORDER BY review.captured_at_ms DESC, review.language_scope ASC
                     ) AS row_num
-             FROM review_snapshots
-             WHERE captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
+             FROM review_snapshots review
+             JOIN candidate_scope scope ON scope.app_id = review.app_id
+             WHERE review.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
          ), latest_reviews AS (
              SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms
              FROM ranked_reviews WHERE row_num = 1
          ), ranked_players AS (
-             SELECT app_id, player_count, captured_at_ms,
-                    ROW_NUMBER() OVER (PARTITION BY app_id ORDER BY captured_at_ms DESC) AS row_num
-             FROM player_snapshots
-             WHERE player_count IS NOT NULL
-               AND captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+             SELECT player.app_id, player.player_count, player.captured_at_ms,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY player.app_id ORDER BY player.captured_at_ms DESC
+                    ) AS row_num
+             FROM player_snapshots player
+             JOIN candidate_scope scope ON scope.app_id = player.app_id
+             WHERE player.player_count IS NOT NULL
+               AND player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
          ), latest_players AS (
              SELECT app_id, player_count, captured_at_ms FROM ranked_players WHERE row_num = 1
          ), daily_window AS (
-             SELECT app_id, day_utc, mean_ccu
-             FROM player_daily
-             WHERE mean_ccu IS NOT NULL
-               AND day_utc >= date(:today, '-9 days')
-               AND day_utc <= :today
+             SELECT daily.app_id, daily.day_utc, daily.mean_ccu
+             FROM player_daily daily
+             JOIN candidate_scope scope ON scope.app_id = daily.app_id
+             WHERE daily.mean_ccu IS NOT NULL
+               AND daily.day_utc >= date(:today, '-9 days')
+               AND daily.day_utc <= :today
          ), daily_activity AS (
              SELECT app_id,
                     CAST(AVG(CASE
@@ -646,7 +674,8 @@ pub fn list_candidates(
                     ORDER BY price.captured_at_ms DESC LIMIT 1
                  ),
                  a.updated_at_ms
-         FROM apps a
+         FROM candidate_scope scope
+         JOIN apps a ON a.app_id = scope.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
              AND p.computed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
          LEFT JOIN app_availability v ON v.app_id = a.app_id
@@ -654,8 +683,7 @@ pub fn list_candidates(
          LEFT JOIN latest_players lp ON lp.app_id = a.app_id
          LEFT JOIN daily_typical d ON d.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
-         WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
-           AND ({section_predicate})
+         WHERE {section_predicate}
          ORDER BY
              {section_order},
              a.updated_at_ms DESC
@@ -901,20 +929,22 @@ pub fn search_by_name(
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  p.computed_at_ms, NULL, NULL, NULL, a.updated_at_ms
-         FROM apps a
+         FROM (
+             SELECT app_id
+             FROM apps
+             WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+             UNION
+             SELECT app_id
+             FROM app_localizations
+             WHERE lower(language) IN ('schinese', 'english', 'en')
+               AND name IS NOT NULL
+               AND trim(name) != ''
+               AND name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+         ) matches
+         JOIN apps a ON a.app_id = matches.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
          LEFT JOIN app_availability v ON v.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
-         WHERE a.canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
-            OR EXISTS (
-                SELECT 1
-                FROM app_localizations loc
-                WHERE loc.app_id = a.app_id
-                  AND lower(loc.language) IN ('schinese', 'english', 'en')
-                  AND loc.name IS NOT NULL
-                  AND trim(loc.name) != ''
-                  AND loc.name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
-            )
          ORDER BY a.canonical_name
          LIMIT ?2",
     )?;
