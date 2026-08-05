@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{fs::File, io::Read};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
@@ -34,8 +35,12 @@ impl Database {
         {
             std::fs::create_dir_all(parent)?;
         }
+        // WAL persistence is recorded in the SQLite header. Inspecting those
+        // bytes avoids a journal_mode PRAGMA every time the worker starts; the
+        // PRAGMA can require locks even when it would only confirm WAL again.
+        let journal_is_wal = database_header_uses_wal(&path)?;
         let conn = open_connection(&path)?;
-        apply_pragmas(&conn)?;
+        apply_connection_pragmas(&conn, !journal_is_wal)?;
         Ok(Self {
             path,
             write: Arc::new(Mutex::new(conn)),
@@ -210,38 +215,41 @@ fn apply_read_pragmas(conn: &Connection) -> StorageResult<()> {
     conn.pragma_update(None, "busy_timeout", 5000i32)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
-    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        return Err(StorageError::migration(format!(
-            "expected read connection journal_mode WAL, got {mode}"
-        )));
-    }
     Ok(())
 }
 
 pub fn apply_pragmas(conn: &Connection) -> StorageResult<()> {
+    apply_connection_pragmas(conn, true)
+}
+
+fn apply_connection_pragmas(conn: &Connection, ensure_wal: bool) -> StorageResult<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000i32)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
-    // Reasserting WAL on every short-lived worker process can require an
-    // exclusive lock even when the database is already in WAL mode.
-    let current_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-    let mode = if current_mode.eq_ignore_ascii_case("wal")
-        || current_mode.eq_ignore_ascii_case("memory")
-    {
-        current_mode
-    } else {
-        conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?
-    };
-    if mode.eq_ignore_ascii_case("wal") || mode.eq_ignore_ascii_case("memory") {
-        // memory databases may not use WAL; accept both.
-    } else {
-        return Err(StorageError::migration(format!(
-            "expected journal_mode WAL or memory, got {mode}"
-        )));
+    if ensure_wal {
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") && !mode.eq_ignore_ascii_case("memory") {
+            return Err(StorageError::migration(format!(
+                "expected journal_mode WAL or memory, got {mode}"
+            )));
+        }
     }
     conn.pragma_update(None, "synchronous", "FULL")?;
     Ok(())
+}
+
+fn database_header_uses_wal(path: &Path) -> StorageResult<bool> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut header = [0_u8; 20];
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(&header[..16] == b"SQLite format 3\0" && header[18] == 2 && header[19] == 2),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 const KEY_SCHEMA_PROBES: &[(&str, &str)] = &[
@@ -430,6 +438,7 @@ mod tests {
         let path = dir.path().join("wal-open.db");
         let db = Database::open(&path).unwrap();
         db.migrate().unwrap();
+        assert!(database_header_uses_wal(&path).unwrap());
 
         let blocker = Connection::open(&path).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
