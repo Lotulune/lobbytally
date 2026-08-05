@@ -50,18 +50,23 @@ impl Repository {
     pub fn readiness_check(&self) -> StorageResult<()> {
         self.db.readiness_check()?;
         self.db.with_conn(|conn| {
+            // Avoid full-table COUNT(*) on large catalogs — EXISTS + LIMIT is O(1).
             let active_algorithms: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM algorithm_configs WHERE status = 'active'",
                 [],
                 |row| row.get(0),
             )?;
-            let apps: i64 = conn.query_row("SELECT COUNT(*) FROM apps", [], |row| row.get(0))?;
             if active_algorithms != 1 {
                 return Err(crate::StorageError::migration(
                     "exactly one active algorithm config is required",
                 ));
             }
-            if apps == 0 {
+            let has_apps: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM apps LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_apps == 0 {
                 return Err(crate::StorageError::migration(
                     "catalog has no app snapshot yet",
                 ));
@@ -1608,7 +1613,8 @@ impl Repository {
     }
 
     pub fn data_updated_at_ms(&self) -> StorageResult<i64> {
-        self.db.with_conn(crate::query::data_updated_at_ms)
+        self.db
+            .cached_data_updated_at_ms(|| self.db.with_conn(crate::query::data_updated_at_ms))
     }
 
     pub fn create_feedback(

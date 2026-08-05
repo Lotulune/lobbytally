@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
@@ -7,12 +8,18 @@ use crate::clock::{Clock, SystemClock};
 use crate::error::{StorageError, StorageResult};
 use crate::migrate::{self, latest_version};
 
+/// How long `/v1/meta` may reuse a previously computed `data_updated_at_ms`.
+/// Full recomputation scans many large tables and is far too expensive for every request.
+const DATA_UPDATED_CACHE_TTL: Duration = Duration::from_secs(30);
+
 /// SQLite access handle with enforced PRAGMA and single-writer coordination.
 #[derive(Clone)]
 pub struct Database {
     path: PathBuf,
     write: Arc<Mutex<Connection>>,
     clock: Arc<dyn Clock>,
+    /// Cached MAX(updated_at) watermark for public meta freshness.
+    data_updated_cache: Arc<Mutex<Option<(Instant, i64)>>>,
 }
 
 impl Database {
@@ -33,6 +40,7 @@ impl Database {
             path,
             write: Arc::new(Mutex::new(conn)),
             clock,
+            data_updated_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -47,6 +55,7 @@ impl Database {
             path: PathBuf::from(":memory:"),
             write: Arc::new(Mutex::new(conn)),
             clock,
+            data_updated_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -71,11 +80,33 @@ impl Database {
     }
 
     pub fn schema_version(&self) -> StorageResult<i64> {
-        let guard = self
-            .write
-            .lock()
-            .map_err(|_| StorageError::migration("write lock poisoned"))?;
-        migrate::current_version(&guard)
+        // Prefer a read connection so frequent meta/ready probes never wait on the writer mutex.
+        self.with_conn(migrate::current_version)
+    }
+
+    /// Invalidate cached public freshness watermark after writes that may advance it.
+    pub fn invalidate_data_updated_cache(&self) {
+        if let Ok(mut guard) = self.data_updated_cache.lock() {
+            *guard = None;
+        }
+    }
+
+    pub(crate) fn cached_data_updated_at_ms(
+        &self,
+        compute: impl FnOnce() -> StorageResult<i64>,
+    ) -> StorageResult<i64> {
+        if let Ok(guard) = self.data_updated_cache.lock() {
+            if let Some((at, value)) = *guard {
+                if at.elapsed() < DATA_UPDATED_CACHE_TTL {
+                    return Ok(value);
+                }
+            }
+        }
+        let value = compute()?;
+        if let Ok(mut guard) = self.data_updated_cache.lock() {
+            *guard = Some((Instant::now(), value));
+        }
+        Ok(value)
     }
 
     pub fn with_conn<T>(
@@ -102,7 +133,10 @@ impl Database {
             .write
             .lock()
             .map_err(|_| StorageError::migration("write lock poisoned"))?;
-        f(&mut guard)
+        let result = f(&mut guard);
+        // Any writer path may advance table watermarks used by public meta freshness.
+        self.invalidate_data_updated_cache();
+        result
     }
 
     pub fn integrity_check(&self) -> StorageResult<Vec<String>> {
@@ -119,6 +153,9 @@ impl Database {
 
     pub fn assert_ready(&self) -> StorageResult<()> {
         self.readiness_check()?;
+        // Full FK scan is O(database size) and can take tens of seconds on production DBs.
+        // Keep it on the startup/ops path only — never on `/health/ready`.
+        self.with_conn(validate_foreign_keys)?;
         let check = self.integrity_check()?;
         if check != ["ok".to_owned()] {
             return Err(StorageError::migration(format!(
@@ -128,7 +165,7 @@ impl Database {
         Ok(())
     }
 
-    /// Lightweight probe for frequent health checks. Full integrity checks stay on startup/ops paths.
+    /// Lightweight probe for frequent health checks. Full integrity/FK checks stay on startup/ops paths.
     pub fn readiness_check(&self) -> StorageResult<()> {
         let version = self.schema_version()?;
         if version != latest_version() {
@@ -146,7 +183,6 @@ impl Database {
                 ));
             }
             validate_key_schema(conn)?;
-            validate_foreign_keys(conn)?;
             Ok(())
         })?;
         Ok(())
@@ -397,7 +433,8 @@ mod tests {
     }
 
     #[test]
-    fn readiness_rejects_foreign_key_violations() {
+    fn readiness_stays_light_when_foreign_keys_are_violated() {
+        // Hot path must not run PRAGMA foreign_key_check (multi-second on large DBs).
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.with_conn_mut(|conn| {
@@ -411,8 +448,9 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        assert!(db.readiness_check().is_ok());
         assert!(matches!(
-            db.readiness_check(),
+            db.assert_ready(),
             Err(StorageError::Migration { .. })
         ));
     }
