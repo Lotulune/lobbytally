@@ -2,10 +2,12 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::time::Duration;
 
 const MAX_FTS_HITS: u32 = 900;
 const MAX_HYBRID_RESULTS: u32 = 300;
 const HYBRID_SOURCE_OVERSAMPLE: u32 = 3;
+const RETRIEVAL_WRITER_YIELD: Duration = Duration::from_millis(50);
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -154,14 +156,7 @@ fn upsert_game_document_on_conn(
     doc: &UpsertGameDocument,
     now_ms: i64,
 ) -> StorageResult<bool> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT content_hash FROM game_documents WHERE document_id = ?1",
-            params![doc.document_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if existing.as_deref() == Some(doc.content_hash.as_str()) {
+    if game_document_matches(conn, doc)? {
         return Ok(false);
     }
     conn.execute(
@@ -214,6 +209,17 @@ fn upsert_game_document_on_conn(
     Ok(true)
 }
 
+fn game_document_matches(conn: &Connection, doc: &UpsertGameDocument) -> StorageResult<bool> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT content_hash FROM game_documents WHERE document_id = ?1",
+            params![doc.document_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(existing.as_deref() == Some(doc.content_hash.as_str()))
+}
+
 fn validate_embedding(embedding: &PutEmbedding) -> StorageResult<()> {
     if embedding.dimensions == 0 || embedding.vector_blob.len() != embedding.dimensions * 4 {
         return Err(StorageError::validation(
@@ -228,27 +234,7 @@ fn put_embedding_on_conn(
     embedding: &PutEmbedding,
     now_ms: i64,
 ) -> StorageResult<bool> {
-    let existing: Option<(i64, Vec<u8>, i64)> = conn
-        .query_row(
-            "SELECT dimensions, vector_blob, is_l2_normalized FROM game_embeddings
-             WHERE document_id = ?1 AND provider = ?2 AND model = ?3 AND content_hash = ?4",
-            params![
-                embedding.document_id,
-                embedding.provider,
-                embedding.model,
-                embedding.content_hash
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    if existing
-        .as_ref()
-        .is_some_and(|(dimensions, blob, normalized)| {
-            *dimensions == embedding.dimensions as i64
-                && blob == &embedding.vector_blob
-                && *normalized == i64::from(embedding.is_l2_normalized)
-        })
-    {
+    if embedding_matches(conn, embedding)? {
         return Ok(false);
     }
     conn.execute(
@@ -275,17 +261,58 @@ fn put_embedding_on_conn(
     Ok(true)
 }
 
+fn embedding_matches(conn: &Connection, embedding: &PutEmbedding) -> StorageResult<bool> {
+    let existing: Option<(i64, Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT dimensions, vector_blob, is_l2_normalized FROM game_embeddings
+             WHERE document_id = ?1 AND provider = ?2 AND model = ?3 AND content_hash = ?4",
+            params![
+                embedding.document_id,
+                embedding.provider,
+                embedding.model,
+                embedding.content_hash
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    Ok(existing
+        .as_ref()
+        .is_some_and(|(dimensions, blob, normalized)| {
+            *dimensions == embedding.dimensions as i64
+                && blob == &embedding.vector_blob
+                && *normalized == i64::from(embedding.is_l2_normalized)
+        }))
+}
+
 fn prune_managed_documents_on_conn(
     conn: &Connection,
     app_id: u32,
     keep_ids: &HashSet<String>,
 ) -> StorageResult<()> {
+    for document_id in stale_managed_document_ids(conn, app_id, keep_ids)? {
+        conn.execute(
+            "DELETE FROM game_fts WHERE document_id = ?1",
+            params![document_id],
+        )?;
+        conn.execute(
+            "DELETE FROM game_documents WHERE document_id = ?1",
+            params![document_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn stale_managed_document_ids(
+    conn: &Connection,
+    app_id: u32,
+    keep_ids: &HashSet<String>,
+) -> StorageResult<Vec<String>> {
     let managed_ids = HashSet::from([
         format!("app:{app_id}:identity"),
         format!("app:{app_id}:multiplayer_profile"),
         format!("app:{app_id}:store_summary"),
     ]);
-    let stale_ids: Vec<String> = {
+    let stale_ids = {
         let mut stmt = conn.prepare(
             "SELECT document_id FROM game_documents
              WHERE app_id = ?1
@@ -301,17 +328,29 @@ fn prune_managed_documents_on_conn(
         }
         stale
     };
-    for document_id in stale_ids {
-        conn.execute(
-            "DELETE FROM game_fts WHERE document_id = ?1",
-            params![document_id],
-        )?;
-        conn.execute(
-            "DELETE FROM game_documents WHERE document_id = ?1",
-            params![document_id],
-        )?;
+    Ok(stale_ids)
+}
+
+fn retrieval_app_needs_write(
+    conn: &Connection,
+    app_id: u32,
+    keep_ids: &HashSet<String>,
+    docs: &[(UpsertGameDocument, Option<PutEmbedding>)],
+) -> StorageResult<bool> {
+    if !stale_managed_document_ids(conn, app_id, keep_ids)?.is_empty() {
+        return Ok(true);
     }
-    Ok(())
+    for (doc, embedding) in docs {
+        if !game_document_matches(conn, doc)? {
+            return Ok(true);
+        }
+        if let Some(embedding) = embedding
+            && !embedding_matches(conn, embedding)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl Repository {
@@ -320,6 +359,9 @@ impl Repository {
     pub fn upsert_game_document(&self, doc: &UpsertGameDocument) -> StorageResult<bool> {
         let now = self.db.now_ms();
         self.db.with_conn_mut(|conn| {
+            if game_document_matches(conn, doc)? {
+                return Ok(false);
+            }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed = upsert_game_document_on_conn(&tx, doc, now)?;
             tx.commit()?;
@@ -365,6 +407,9 @@ impl Repository {
         validate_embedding(embedding)?;
         let now = self.db.now_ms();
         self.db.with_conn_mut(|conn| {
+            if embedding_matches(conn, embedding)? {
+                return Ok(false);
+            }
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed = put_embedding_on_conn(&tx, embedding, now)?;
             tx.commit()?;
@@ -584,9 +629,9 @@ impl Repository {
             ..RetrievalSyncStats::default()
         };
 
-        // Hash outside the write transaction, then commit the complete derived
-        // batch once. Hundreds of FULL-synchronous per-document commits can
-        // otherwise starve the external ingestion worker for close to a minute.
+        // Hash and compare through a WAL reader before taking the writer. Only
+        // changed apps need a short transaction; yielding between them prevents
+        // background FTS maintenance from starving the external Steam worker.
         let prepared = rows
             .iter()
             .map(|source| {
@@ -615,9 +660,25 @@ impl Repository {
                 (source.app_id, keep_ids, docs)
             })
             .collect::<Vec<_>>();
-        self.db.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            for (app_id, keep_ids, docs) in &prepared {
+        let needs_write = self.db.with_conn(|conn| {
+            prepared
+                .iter()
+                .map(|(app_id, keep_ids, docs)| {
+                    retrieval_app_needs_write(conn, *app_id, keep_ids, docs)
+                })
+                .collect::<StorageResult<Vec<_>>>()
+        })?;
+        for ((app_id, keep_ids, docs), needs_write) in prepared.iter().zip(needs_write) {
+            if !needs_write {
+                stats.documents_unchanged += docs.len() as u32;
+                stats.embeddings_unchanged += docs
+                    .iter()
+                    .filter(|(_, embedding)| embedding.is_some())
+                    .count() as u32;
+                continue;
+            }
+            self.db.with_conn_mut(|conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 prune_managed_documents_on_conn(&tx, *app_id, keep_ids)?;
                 for (doc, embedding) in docs {
                     if upsert_game_document_on_conn(&tx, doc, now_ms)? {
@@ -633,10 +694,11 @@ impl Repository {
                         }
                     }
                 }
-            }
-            tx.commit()?;
-            Ok(())
-        })?;
+                tx.commit()?;
+                Ok(())
+            })?;
+            std::thread::sleep(RETRIEVAL_WRITER_YIELD);
+        }
         stats.apps_covered = self.db.with_conn(|conn| {
             let count = conn.query_row(
                 "SELECT COUNT(*)
@@ -1381,6 +1443,29 @@ mod tests {
         // After sync with embeddings, current hashes should already be embedded.
         assert!(missing.is_empty());
         assert!(repo.embedding_count().unwrap() > 0);
+    }
+
+    #[test]
+    fn unchanged_catalog_sync_does_not_wait_for_the_sqlite_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retrieval-writer.db");
+        let db = Database::open(&path).unwrap();
+        let repo = Repository::new(db);
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        repo.seed_demo_if_empty().unwrap();
+
+        let initial = repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
+        assert!(initial.documents_written > 0);
+
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let unchanged = repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(unchanged.documents_written, 0);
+        assert_eq!(unchanged.embeddings_written, 0);
+        assert!(unchanged.documents_unchanged > 0);
     }
 
     #[test]
