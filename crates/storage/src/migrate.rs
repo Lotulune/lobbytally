@@ -99,6 +99,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0019_preference_confidence",
         include_str!("../../../migrations/0019_preference_confidence.sql"),
     ),
+    (
+        20,
+        "0020_feed_query_indexes",
+        include_str!("../../../migrations/0020_feed_query_indexes.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {

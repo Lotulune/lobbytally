@@ -229,7 +229,7 @@ Steam/AI Key 只放在服务端环境；客户端包与日志不得包含。
 1. 备份数据库与当前 `PROVENANCE.json`。
 2. 停止服务（systemd `stop` / WinSW `stop`）。
 3. 替换二进制与文档；保留数据目录与 env。
-4. `mpgs-dbtool migrate <db>`（或启动时自动 migrate）。当前最新为 `0019_preference_confidence`：已有偏好行兼容为置信度 `1.0`，新建偏好默认 `0.0`。新客户端应显式回传该字段；兼容期服务端会让省略字段的旧客户端 PUT 保留数据库当前置信度，该路径已有 HTTP 集成测试。
+4. `mpgs-dbtool migrate <db>`（或启动时自动 migrate）。当前最新为 `0020_feed_query_indexes`，它在保留 `0019_preference_confidence` 偏好置信度语义的同时，为 Feed 最新证据和区域价格查询补充复合索引。
 5. 启动并检查 `/health/ready` 与 `/v1/meta` 的 `schema_version`。
 6. 冒烟：四分区、搜索、详情、偏好、反馈、NL fallback。
 

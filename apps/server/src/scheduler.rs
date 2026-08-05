@@ -14,7 +14,9 @@ const DEFAULT_CATALOG_SYNC_INTERVAL_SECS: u64 = 15 * 60;
 const DEFAULT_CANDIDATE_COLLECTION_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_ENRICHMENT_INTERVAL_SECS: u64 = 5 * 60;
 const RECOMMENDATION_TELEMETRY_RETENTION_INTERVAL_SECS: u64 = 24 * 60 * 60;
-const RETRIEVAL_SYNC_BATCH_SIZE: u32 = 2_000;
+const DEFAULT_RETRIEVAL_SYNC_BATCH_SIZE: u32 = 200;
+const RETRIEVAL_SYNC_BATCH_SIZE_MIN: u32 = 10;
+const RETRIEVAL_SYNC_BATCH_SIZE_MAX: u32 = 10_000;
 const TASK_INTERVAL_MIN_SECS: u64 = 60;
 const TASK_INTERVAL_MAX_SECS: u64 = 86_400;
 const TELEMETRY_RETENTION_TASK: &str = "recommendation_telemetry_retention";
@@ -68,6 +70,10 @@ pub fn spawn(repo: Option<Repository>) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Tokio's first interval tick is immediate. Consume it so a freshly
+        // started API does not launch retrieval maintenance while migrations
+        // and the external Steam worker are also opening the shared database.
+        ticker.tick().await;
         loop {
             ticker.tick().await;
             let run_repo = repo.clone();
@@ -242,7 +248,7 @@ fn run_once_with_schedule(
         retrieval_previous,
         now_ms,
         next_run_at_ms,
-        RETRIEVAL_SYNC_BATCH_SIZE,
+        configured_retrieval_sync_batch_size(),
         true,
     )?;
     let telemetry_previous = previous_status
@@ -352,6 +358,16 @@ fn steam_web_api_key_configured() -> bool {
         .is_some_and(|value| {
             value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
+}
+
+fn configured_retrieval_sync_batch_size() -> u32 {
+    env::var("MPGS_RETRIEVAL_SYNC_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| {
+            (RETRIEVAL_SYNC_BATCH_SIZE_MIN..=RETRIEVAL_SYNC_BATCH_SIZE_MAX).contains(value)
+        })
+        .unwrap_or(DEFAULT_RETRIEVAL_SYNC_BATCH_SIZE)
 }
 
 fn update_scheduled_status(
