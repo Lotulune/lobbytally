@@ -12,6 +12,12 @@ use crate::migrate::{self, latest_version};
 /// How long `/v1/meta` may reuse a previously computed `data_updated_at_ms`.
 /// Full recomputation scans many large tables and is far too expensive for every request.
 const DATA_UPDATED_CACHE_TTL: Duration = Duration::from_secs(30);
+const READ_BUSY_TIMEOUT_MS: i32 = 5_000;
+// Production FTS commits can exceed five seconds on the 2C/1G host. The
+// retrieval scheduler now releases the writer between apps, so waiting through
+// one slow commit is preferable to dropping an ingestion update and retrying it
+// in a later worker pass.
+const WRITE_BUSY_TIMEOUT_MS: i32 = 30_000;
 
 /// SQLite access handle with enforced PRAGMA and single-writer coordination.
 #[derive(Clone)]
@@ -212,7 +218,7 @@ fn open_read_connection(path: &Path) -> StorageResult<Connection> {
 
 fn apply_read_pragmas(conn: &Connection) -> StorageResult<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "busy_timeout", 5000i32)?;
+    conn.pragma_update(None, "busy_timeout", READ_BUSY_TIMEOUT_MS)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.pragma_update(None, "synchronous", "FULL")?;
     Ok(())
@@ -224,7 +230,7 @@ pub fn apply_pragmas(conn: &Connection) -> StorageResult<()> {
 
 fn apply_connection_pragmas(conn: &Connection, ensure_wal: bool) -> StorageResult<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "busy_timeout", 5000i32)?;
+    conn.pragma_update(None, "busy_timeout", WRITE_BUSY_TIMEOUT_MS)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     if ensure_wal {
         let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -446,6 +452,32 @@ mod tests {
         blocker.execute_batch("ROLLBACK").unwrap();
 
         assert!(second.is_ok());
+    }
+
+    #[test]
+    fn file_writer_waits_past_the_legacy_five_second_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer-timeout.db");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let waiting_db = db.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiting_writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            waiting_db.with_conn_mut(|conn| {
+                conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK")?;
+                Ok(())
+            })
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(5_500));
+        blocker.execute_batch("ROLLBACK").unwrap();
+
+        assert!(waiting_writer.join().unwrap().is_ok());
     }
 
     #[test]
