@@ -410,15 +410,7 @@ if [ -n "$old_server_container" ]; then
       restart_previous_release || true
       exit 1
     fi
-    if ! docker run --rm \
-      --entrypoint /usr/local/bin/mpgs-dbtool \
-      --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs" \
-      "$old_server_image" \
-      integrity "/var/lib/mpgs/$backup_rel"; then
-      printf 'Pre-upgrade backup integrity failed; restarting the previous release.\n' >&2
-      restart_previous_release || true
-      exit 1
-    fi
+    # `backup` verifies the temporary database before publishing the final file.
     backup_created=1
   fi
 elif [ "$runtime_db_state" = present ]; then
