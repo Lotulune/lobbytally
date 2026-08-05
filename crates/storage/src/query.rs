@@ -4,7 +4,7 @@ use mpgs_domain::{
     CandidateAvailability, FeedSection, ModeFamily, MultiplayerSignals, RankingSignals,
     RecommendationConfig, SteamAppId,
 };
-use rusqlite::{Connection, OptionalExtension, named_params, params, types::Type};
+use rusqlite::{Connection, OptionalExtension, params, types::Type};
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::AppRecord;
@@ -470,7 +470,45 @@ pub fn list_candidates(
     // Section windows and feed presentation use the current store `apps.release_date`
     // (not the earliest historical date from release_events). "近期正式发售" is ordered
     // and filtered by that store day so 1.0 / re-dated launches surface by calendar day.
-    let mut stmt = conn.prepare(
+    // `section` is a trusted enum. Give SQLite one concrete predicate and sort
+    // shape instead of a bound-parameter OR across every feed section; the
+    // latter prevents release indexes from being selected on large catalogs.
+    let (section_predicate, section_order) = match section {
+        FeedSection::Upcoming => (
+            "((a.release_state IN ('upcoming', 'coming_soon')
+                 AND a.release_date IS NOT NULL
+                 AND a.release_date >= :today
+                 AND a.release_date <= date(:today, '+30 days'))
+               OR a.app_type IN ('demo', 'playtest'))",
+            "a.release_date DESC",
+        ),
+        FeedSection::RecentRelease => (
+            "a.release_state = 'released'
+             AND a.release_date IS NOT NULL
+             AND a.release_date >= :cutoff
+             AND a.release_date <= :today",
+            "a.release_date DESC",
+        ),
+        FeedSection::PopularLegacy => (
+            "a.release_state = 'released'
+             AND a.release_date IS NOT NULL
+             AND a.release_date < :cutoff
+             AND COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_min_ccu
+             AND COALESCE(r.wilson_lower, 0) >= CASE
+                 WHEN COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_high_ccu
+                     THEN :popular_high_ccu_min_wilson
+                 ELSE :popular_min_wilson
+             END",
+            "COALESCE(d.typical_ccu, lp.player_count, 0) DESC",
+        ),
+        FeedSection::ClassicLegacy => (
+            "a.release_state = 'released'
+             AND a.release_date IS NOT NULL
+             AND a.release_date < :cutoff",
+            "COALESCE(r.total_reviews, 0) DESC",
+        ),
+    };
+    let sql = format!(
         "WITH ranked_reviews AS (
              SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms,
                     ROW_NUMBER() OVER (
@@ -617,59 +655,38 @@ pub fn list_candidates(
          LEFT JOIN daily_typical d ON d.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
          WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
-           AND (
-               (:section = 'upcoming' AND (
-                   (a.release_state IN ('upcoming', 'coming_soon')
-                    AND a.release_date IS NOT NULL
-                    AND a.release_date >= :today
-                    AND a.release_date <= date(:today, '+30 days'))
-                   OR a.app_type IN ('demo', 'playtest')
-               ))
-               OR (:section = 'recent_release' AND a.release_state = 'released'
-                   AND a.release_date IS NOT NULL
-                   AND a.release_date >= :cutoff
-                   AND a.release_date <= :today)
-               OR (:section IN ('popular_legacy', 'classic_legacy') AND a.release_state = 'released'
-                   AND a.release_date IS NOT NULL
-                   AND a.release_date < :cutoff)
-           )
-           AND (
-               :section <> 'popular_legacy'
-               OR (
-                   COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_min_ccu
-                   AND COALESCE(r.wilson_lower, 0) >= CASE
-                       WHEN COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_high_ccu
-                           THEN :popular_high_ccu_min_wilson
-                       ELSE :popular_min_wilson
-                   END
-               )
-           )
+           AND ({section_predicate})
          ORDER BY
-             CASE WHEN :section = 'popular_legacy' THEN COALESCE(d.typical_ccu, lp.player_count, 0) END DESC,
-             CASE WHEN :section = 'classic_legacy' THEN COALESCE(r.total_reviews, 0) END DESC,
-             CASE WHEN :section IN ('recent_release', 'upcoming')
-                  THEN a.release_date END DESC,
+             {section_order},
              a.updated_at_ms DESC
-         LIMIT :limit",
-    )?;
-    let rows = stmt.query_map(
-        named_params! {
-            ":section": section.as_str(),
-            ":cutoff": cutoff_date,
-            ":today": today,
-            ":currency": budget_currency,
-            ":country": budget_country,
-            ":popular_min_ccu": config.popular_min_ccu,
-            ":popular_high_ccu": config.popular_high_ccu,
-            ":popular_min_wilson": config.popular_min_wilson,
-            ":popular_high_ccu_min_wilson": config.popular_high_ccu_min_wilson,
-            ":limit": limit,
-        },
-        map_candidate,
-    )?;
+         LIMIT :limit"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    {
+        let mut bind_if_present =
+            |name: &str, value: &dyn rusqlite::ToSql| -> rusqlite::Result<()> {
+                if let Some(index) = stmt.parameter_index(name)? {
+                    stmt.raw_bind_parameter(index, value)?;
+                }
+                Ok(())
+            };
+        bind_if_present(":cutoff", &cutoff_date)?;
+        bind_if_present(":today", &today)?;
+        bind_if_present(":currency", &budget_currency)?;
+        bind_if_present(":country", &budget_country)?;
+        bind_if_present(":popular_min_ccu", &config.popular_min_ccu)?;
+        bind_if_present(":popular_high_ccu", &config.popular_high_ccu)?;
+        bind_if_present(":popular_min_wilson", &config.popular_min_wilson)?;
+        bind_if_present(
+            ":popular_high_ccu_min_wilson",
+            &config.popular_high_ccu_min_wilson,
+        )?;
+        bind_if_present(":limit", &limit)?;
+    }
+    let mut rows = stmt.raw_query();
     let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+    while let Some(row) = rows.next()? {
+        out.push(map_candidate(row)?);
     }
     assign_activity_percentiles(&mut out);
     Ok(out)

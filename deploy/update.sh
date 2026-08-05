@@ -490,19 +490,19 @@ fi
 validate_deployment() {
   attempt=1
   while [ "$attempt" -le 45 ]; do
-    if new_compose exec -T mpgs-server \
-      mpgs-dbtool integrity /var/lib/mpgs/mpgs.db >/dev/null 2>&1; then
-      health_result=0
-      deployment_healthcheck new_compose || health_result=$?
-      case "$health_result" in
-        0) return 0 ;;
-        2)
-          printf 'Deployment reports a build revision other than %s; refusing to retry it.\n' \
-            "$release_sha" >&2
-          return 1
-          ;;
-      esac
-    fi
+    # The quiesced pre-upgrade backup already passed the full integrity/FK
+    # scan. Repeating that O(database size) check against the live database
+    # here delayed every restart and duplicated deployment validation work.
+    health_result=0
+    deployment_healthcheck new_compose || health_result=$?
+    case "$health_result" in
+      0) return 0 ;;
+      2)
+        printf 'Deployment reports a build revision other than %s; refusing to retry it.\n' \
+          "$release_sha" >&2
+        return 1
+        ;;
+    esac
     sleep 2
     attempt=$((attempt + 1))
   done

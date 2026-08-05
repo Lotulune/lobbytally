@@ -74,7 +74,10 @@ async fn build_state() -> Result<AppState, Box<dyn Error>> {
                 let seeded = repo.seed_demo_if_empty()?;
                 info!(seeded, "demo catalog seed enabled");
             }
-            repo.assert_ready()?;
+            // Full integrity/FK scans remain explicit `mpgs-dbtool integrity`
+            // operations. They are O(database size) and must not delay every
+            // process restart before the listener is bound.
+            repo.readiness_check()?;
             info!(%path, version, "database ready");
             Some(repo)
         }
@@ -89,7 +92,7 @@ async fn build_state() -> Result<AppState, Box<dyn Error>> {
             if demo_seed {
                 let seeded = repo.seed_demo_if_empty()?;
                 info!(seeded, "development demo catalog seed enabled");
-                repo.assert_ready()?;
+                repo.readiness_check()?;
             } else {
                 info!(
                     "using empty development database; set MPGS_DATABASE_PATH or MPGS_SEED_DEMO=true"

@@ -6,6 +6,7 @@ job_limit="${MPGS_WORKER_JOB_LIMIT:-10}"
 enrich_limit="${MPGS_WORKER_ENRICH_LIMIT:-100}"
 max_failures="${MPGS_WORKER_MAX_CONSECUTIVE_FAILURES:-5}"
 max_run_secs="${MPGS_WORKER_MAX_RUN_SECS:-1800}"
+retry_interval="${MPGS_WORKER_RETRY_INTERVAL_SECS:-30}"
 health_file="${MPGS_WORKER_HEALTH_FILE:-/var/lib/mpgs/.worker-health}"
 
 require_positive_integer() {
@@ -24,6 +25,7 @@ require_positive_integer MPGS_WORKER_JOB_LIMIT "$job_limit"
 require_positive_integer MPGS_WORKER_ENRICH_LIMIT "$enrich_limit"
 require_positive_integer MPGS_WORKER_MAX_CONSECUTIVE_FAILURES "$max_failures"
 require_positive_integer MPGS_WORKER_MAX_RUN_SECS "$max_run_secs"
+require_positive_integer MPGS_WORKER_RETRY_INTERVAL_SECS "$retry_interval"
 
 write_health() {
     status=$1
@@ -61,6 +63,7 @@ fi
 
 failures=0
 while :; do
+    sleep_secs="$interval"
     started_at=$(date +%s)
     write_health running "$started_at" "$failures"
     if /usr/local/bin/mpgs-dbtool run-steam-worker-once \
@@ -75,6 +78,7 @@ while :; do
             printf 'mpgs worker stopped after %s consecutive failures\n' "$failures" >&2
             exit 1
         fi
+        sleep_secs="$retry_interval"
     fi
-    sleep "$interval"
+    sleep "$sleep_secs"
 done
