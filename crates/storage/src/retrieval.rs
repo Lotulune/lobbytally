@@ -7,7 +7,7 @@ use std::time::Duration;
 const MAX_FTS_HITS: u32 = 900;
 const MAX_HYBRID_RESULTS: u32 = 300;
 const HYBRID_SOURCE_OVERSAMPLE: u32 = 3;
-const RETRIEVAL_WRITER_YIELD: Duration = Duration::from_millis(50);
+const RETRIEVAL_WRITER_HANDOFF: Duration = Duration::from_secs(1);
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -697,7 +697,14 @@ impl Repository {
                 tx.commit()?;
                 Ok(())
             })?;
-            std::thread::sleep(RETRIEVAL_WRITER_YIELD);
+            // SQLite's busy handler does not queue waiting writers fairly. A
+            // short pause can let this connection reacquire the writer before
+            // the external Steam worker wakes up, so leave a full handoff
+            // window after every file-backed commit. In-memory databases
+            // cannot have a second-process writer and should not slow tests.
+            if self.db.path() != std::path::Path::new(":memory:") {
+                std::thread::sleep(RETRIEVAL_WRITER_HANDOFF);
+            }
         }
         stats.apps_covered = self.db.with_conn(|conn| {
             let count = conn.query_row(
@@ -1460,12 +1467,44 @@ mod tests {
 
         let blocker = Connection::open(&path).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
         let unchanged = repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
+        let elapsed = started.elapsed();
         blocker.execute_batch("ROLLBACK").unwrap();
 
         assert_eq!(unchanged.documents_written, 0);
         assert_eq!(unchanged.embeddings_written, 0);
         assert!(unchanged.documents_unchanged > 0);
+        assert!(elapsed < RETRIEVAL_WRITER_HANDOFF);
+    }
+
+    #[test]
+    fn changed_catalog_sync_leaves_an_interprocess_writer_handoff_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retrieval-handoff.db");
+        let db = Database::open(&path).unwrap();
+        let repo = Repository::new(db);
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        repo.seed_demo_if_empty().unwrap();
+        repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
+
+        repo.db
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    "UPDATE apps SET canonical_name = canonical_name || ' updated'
+                     WHERE app_id = (SELECT MIN(app_id) FROM apps)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let changed = repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
+
+        assert!(changed.documents_written > 0);
+        assert!(started.elapsed() >= RETRIEVAL_WRITER_HANDOFF);
     }
 
     #[test]
