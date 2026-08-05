@@ -13,9 +13,5 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
 cargo run -p mpgs-dbtool --quiet -- backup $DbPath $OutPath
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
-
-cargo run -p mpgs-dbtool --quiet -- integrity $OutPath
+# `backup` verifies the temporary database before publishing the final file.
 exit $LASTEXITCODE
