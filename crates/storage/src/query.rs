@@ -5,6 +5,7 @@ use mpgs_domain::{
     RecommendationConfig, SteamAppId,
 };
 use rusqlite::{Connection, OptionalExtension, params, types::Type};
+use std::collections::HashMap;
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::AppRecord;
@@ -520,9 +521,27 @@ pub fn list_candidates(
              AND a.release_date < :cutoff",
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
-             AND a.release_date < :cutoff",
+             AND a.release_date < :cutoff
+             AND COALESCE(r.total_reviews, 0) >= :classic_min_reviews
+             AND COALESCE(r.wilson_lower, 0) >= :classic_min_wilson
+             AND NOT (
+                 COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_min_ccu
+                 AND COALESCE(r.wilson_lower, 0) >= CASE
+                     WHEN COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_high_ccu
+                         THEN :popular_high_ccu_min_wilson
+                     ELSE :popular_min_wilson
+                 END
+             )",
             "COALESCE(r.total_reviews, 0) DESC",
         ),
+    };
+    let classic_activity_percentiles = matches!(section, FeedSection::ClassicLegacy)
+        .then(|| classic_activity_percentiles(conn, cutoff_date, today, limit))
+        .transpose()?;
+    let (ranked_scope_cte, query_scope) = if matches!(section, FeedSection::ClassicLegacy) {
+        (CLASSIC_RANKED_SCOPE_CTE, "ranked_candidate_scope")
+    } else {
+        ("", "candidate_scope")
     };
     let sql = format!(
         "WITH candidate_scope AS MATERIALIZED (
@@ -530,10 +549,10 @@ pub fn list_candidates(
              FROM apps a
              WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
                AND ({scope_predicate})
-         ), daily_window AS (
+         ){ranked_scope_cte}, daily_window AS (
              SELECT daily.app_id, daily.day_utc, daily.mean_ccu
              FROM player_daily daily
-             JOIN candidate_scope scope ON scope.app_id = daily.app_id
+             JOIN {query_scope} scope ON scope.app_id = daily.app_id
              WHERE daily.mean_ccu IS NOT NULL
                AND daily.day_utc >= date(:today, '-9 days')
                AND daily.day_utc <= :today
@@ -650,7 +669,7 @@ pub fn list_candidates(
                     ORDER BY price.captured_at_ms DESC LIMIT 1
                  ),
                  a.updated_at_ms
-         FROM candidate_scope scope
+         FROM {query_scope} scope
          JOIN apps a ON a.app_id = scope.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
              AND p.computed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
@@ -703,6 +722,8 @@ pub fn list_candidates(
             ":popular_high_ccu_min_wilson",
             &config.popular_high_ccu_min_wilson,
         )?;
+        bind_if_present(":classic_min_reviews", &config.classic_min_reviews)?;
+        bind_if_present(":classic_min_wilson", &config.classic_min_wilson)?;
         bind_if_present(":limit", &limit)?;
     }
     let mut rows = stmt.raw_query();
@@ -710,8 +731,121 @@ pub fn list_candidates(
     while let Some(row) = rows.next()? {
         out.push(map_candidate(row)?);
     }
-    assign_activity_percentiles(&mut out);
+    if let Some(percentiles) = classic_activity_percentiles {
+        for row in &mut out {
+            row.activity_percentile = percentiles.get(&row.app_id).copied();
+        }
+    } else {
+        assign_activity_percentiles(&mut out);
+    }
     Ok(out)
+}
+
+const CLASSIC_RANKED_SCOPE_CTE: &str = ", ranked_candidate_scope AS MATERIALIZED (
+    SELECT a.app_id
+    FROM candidate_scope scope
+    JOIN apps a ON a.app_id = scope.app_id
+    LEFT JOIN review_snapshots r ON r.rowid = (
+        SELECT latest_review.rowid
+        FROM review_snapshots latest_review
+        WHERE latest_review.app_id = a.app_id
+          AND latest_review.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
+        ORDER BY latest_review.captured_at_ms DESC, latest_review.language_scope ASC
+        LIMIT 1
+    )
+    ORDER BY COALESCE(r.total_reviews, 0) DESC, a.updated_at_ms DESC
+    LIMIT :limit
+)";
+
+fn classic_activity_percentiles(
+    conn: &Connection,
+    cutoff_date: &str,
+    today: &str,
+    limit: i64,
+) -> StorageResult<HashMap<SteamAppId, f64>> {
+    let sql = format!(
+        "WITH candidate_scope AS MATERIALIZED (
+             SELECT a.app_id
+             FROM apps a
+             WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
+               AND a.release_state = 'released'
+               AND a.release_date IS NOT NULL
+               AND a.release_date < :cutoff
+         ){CLASSIC_RANKED_SCOPE_CTE}, daily_typical AS (
+             SELECT daily.app_id,
+                    CAST(AVG(CASE
+                        WHEN daily.day_utc >= date(:today, '-6 days') THEN daily.mean_ccu
+                    END) AS INTEGER) AS typical_ccu
+             FROM player_daily daily
+             JOIN ranked_candidate_scope scope ON scope.app_id = daily.app_id
+             WHERE daily.mean_ccu IS NOT NULL
+               AND daily.day_utc >= date(:today, '-9 days')
+               AND daily.day_utc <= :today
+             GROUP BY daily.app_id
+         )
+         SELECT scope.app_id,
+                COALESCE(d.typical_ccu, (
+                    SELECT latest_player.player_count
+                    FROM player_snapshots latest_player
+                    WHERE latest_player.app_id = scope.app_id
+                      AND latest_player.player_count IS NOT NULL
+                      AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+                    ORDER BY latest_player.captured_at_ms DESC
+                    LIMIT 1
+                ))
+         FROM ranked_candidate_scope scope
+         LEFT JOIN daily_typical d ON d.app_id = scope.app_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::named_params! {
+            ":cutoff": cutoff_date,
+            ":today": today,
+            ":limit": limit,
+        },
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)? as SteamAppId,
+                row.get::<_, Option<i64>>(1)?.map(|value| value as u32),
+            ))
+        },
+    )?;
+    let activity = rows
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|(app_id, activity)| activity.map(|value| (app_id, value)))
+        .collect();
+    Ok(activity_percentiles(activity))
+}
+
+fn activity_percentiles(mut activity: Vec<(SteamAppId, u32)>) -> HashMap<SteamAppId, f64> {
+    activity.sort_by(|(left_id, left), (right_id, right)| {
+        left.cmp(right).then_with(|| left_id.cmp(right_id))
+    });
+    if activity.is_empty() {
+        return HashMap::new();
+    }
+    if activity.len() == 1 {
+        return HashMap::from([(activity[0].0, 0.5)]);
+    }
+
+    let denominator = (activity.len() - 1) as f64;
+    let mut percentiles = HashMap::with_capacity(activity.len());
+    let mut start = 0usize;
+    while start < activity.len() {
+        let value = activity[start].1;
+        let mut end = start + 1;
+        while end < activity.len() && activity[end].1 == value {
+            end += 1;
+        }
+        let midrank_zero_based = (start as f64 + (end - 1) as f64) / 2.0;
+        let percentile = midrank_zero_based / denominator;
+        for (app_id, _) in &activity[start..end] {
+            percentiles.insert(*app_id, percentile);
+        }
+        start = end;
+    }
+    percentiles
 }
 
 fn assign_activity_percentiles(rows: &mut [GameCandidateRow]) {
@@ -2073,6 +2207,62 @@ mod tests {
                 10,
             )?;
             assert_eq!(rows[0].activity_momentum, None);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn classic_prefilter_keeps_activity_percentiles_from_the_full_ranked_scope() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn(|conn| {
+            for (app_id, name) in [(501, "eligible-classic"), (502, "low-review-title")] {
+                crate::catalog::upsert_app(
+                    conn,
+                    app_id,
+                    "game",
+                    name,
+                    "released",
+                    Some("2020-01-01"),
+                    Some("day"),
+                    None,
+                    1,
+                )?;
+            }
+            conn.execute_batch(
+                "INSERT INTO review_snapshots (
+                     app_id, region_scope, language_scope, captured_at_ms,
+                     total_positive, total_negative, total_reviews, wilson_lower,
+                     filter_offtopic_activity, parameter_hash, content_hash, source
+                 ) VALUES
+                 (501, 'all', 'all', CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                    2800, 200, 3000, 0.83, 1, 'p1', 'r1', 'test'),
+                 (502, 'all', 'all', CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                    90, 10, 100, 0.90, 1, 'p2', 'r2', 'test');
+                 INSERT INTO player_snapshots (
+                     app_id, captured_at_ms, player_count, result_code,
+                     content_hash, source
+                 ) VALUES
+                 (501, CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                    100, 1, 'c1', 'test'),
+                 (502, CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                    1000, 1, 'c2', 'test');",
+            )?;
+
+            let rows = list_candidates(
+                conn,
+                FeedSection::ClassicLegacy,
+                CUTOFF,
+                TODAY,
+                "CNY",
+                &RecommendationConfig::default(),
+                10,
+            )?;
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].app_id, 501);
+            assert_eq!(rows[0].activity_percentile, Some(0.0));
             Ok(())
         })
         .unwrap();
