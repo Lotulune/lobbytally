@@ -538,17 +538,55 @@ pub fn list_candidates(
     let classic_activity_percentiles = matches!(section, FeedSection::ClassicLegacy)
         .then(|| classic_activity_percentiles(conn, cutoff_date, today, limit))
         .transpose()?;
-    let (latest_reviews_cte, ranked_scope_cte, query_scope, review_join) =
-        if matches!(section, FeedSection::ClassicLegacy) {
-            (
-                CLASSIC_LATEST_REVIEWS_CTE,
-                CLASSIC_RANKED_SCOPE_CTE,
-                "ranked_candidate_scope",
-                CLASSIC_REVIEW_JOIN,
-            )
-        } else {
-            ("", "", "candidate_scope", CANDIDATE_REVIEW_JOIN)
-        };
+    let (
+        latest_reviews_cte,
+        ranked_scope_cte,
+        activity_scope,
+        final_scope,
+        final_predicate,
+        review_join,
+    ) = if matches!(section, FeedSection::ClassicLegacy) {
+        (
+            CLASSIC_LATEST_REVIEWS_CTE,
+            CLASSIC_RANKED_SCOPE_CTE,
+            "ranked_candidate_scope",
+            "classic_eligible_scope",
+            "1=1",
+            CLASSIC_REVIEW_JOIN,
+        )
+    } else {
+        (
+            "",
+            "",
+            "candidate_scope",
+            "candidate_scope",
+            section_predicate,
+            CANDIDATE_REVIEW_JOIN,
+        )
+    };
+    let eligible_scope_cte = if matches!(section, FeedSection::ClassicLegacy) {
+        format!(
+            ", classic_eligible_scope AS MATERIALIZED (
+                 SELECT scope.app_id
+                 FROM ranked_candidate_scope scope
+                 JOIN apps a ON a.app_id = scope.app_id
+                 LEFT JOIN latest_reviews r ON r.app_id = a.app_id
+                 LEFT JOIN player_snapshots lp ON lp.rowid = (
+                     SELECT latest_player.rowid
+                     FROM player_snapshots latest_player
+                     WHERE latest_player.app_id = a.app_id
+                       AND latest_player.player_count IS NOT NULL
+                       AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+                     ORDER BY latest_player.captured_at_ms DESC
+                     LIMIT 1
+                 )
+                 LEFT JOIN daily_typical d ON d.app_id = a.app_id
+                 WHERE {section_predicate}
+             )"
+        )
+    } else {
+        String::new()
+    };
     let sql = format!(
         "WITH {latest_reviews_cte}candidate_scope AS MATERIALIZED (
              SELECT a.app_id
@@ -558,7 +596,7 @@ pub fn list_candidates(
          ){ranked_scope_cte}, daily_window AS (
              SELECT daily.app_id, daily.day_utc, daily.mean_ccu
              FROM player_daily daily
-             JOIN {query_scope} scope ON scope.app_id = daily.app_id
+             JOIN {activity_scope} scope ON scope.app_id = daily.app_id
              WHERE daily.mean_ccu IS NOT NULL
                AND daily.day_utc >= date(:today, '-9 days')
                AND daily.day_utc <= :today
@@ -590,7 +628,7 @@ pub fn list_candidates(
                         ))
                     END AS momentum
              FROM daily_activity
-         )
+         ){eligible_scope_cte}
          SELECT a.app_id, a.canonical_name, a.app_type, a.release_state,
                 a.release_date,
                 p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
@@ -675,7 +713,7 @@ pub fn list_candidates(
                     ORDER BY price.captured_at_ms DESC LIMIT 1
                  ),
                  a.updated_at_ms
-         FROM {query_scope} scope
+         FROM {final_scope} scope
          JOIN apps a ON a.app_id = scope.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
              AND p.computed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
@@ -692,7 +730,7 @@ pub fn list_candidates(
          )
          LEFT JOIN daily_typical d ON d.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
-         WHERE {section_predicate}
+         WHERE {final_predicate}
          ORDER BY
              {section_order},
              a.updated_at_ms DESC
