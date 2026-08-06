@@ -46,8 +46,11 @@ const STORE_SEARCH_TARGET_DEFAULT: u32 = 2_000;
 const STORE_SEARCH_TARGET_MAX: u32 = 10_000;
 const CANDIDATE_WORKER_PAGES_DEFAULT: u32 = 10;
 const CANDIDATE_WORKER_PAGES_MAX: u32 = 100;
+const CANDIDATE_REFRESH_CONTINUATION_PAGES: u32 = 1;
 const _: () = assert!(CANDIDATE_WORKER_PAGES_DEFAULT > 1);
 const _: () = assert!(CANDIDATE_WORKER_PAGES_DEFAULT <= CANDIDATE_WORKER_PAGES_MAX);
+const _: () = assert!(CANDIDATE_REFRESH_CONTINUATION_PAGES > 0);
+const _: () = assert!(CANDIDATE_REFRESH_CONTINUATION_PAGES < CANDIDATE_WORKER_PAGES_DEFAULT);
 const STORE_SEARCH_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const ENRICH_LIMIT_DEFAULT: u32 = 100;
 const ENRICH_LIMIT_MAX: u32 = 5_000;
@@ -160,6 +163,14 @@ fn candidate_worker_pages() -> u32 {
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| (1..=CANDIDATE_WORKER_PAGES_MAX).contains(value))
         .unwrap_or(CANDIDATE_WORKER_PAGES_DEFAULT)
+}
+
+fn candidate_continuation_page_budget(refresh_mode: bool, configured_page_budget: u32) -> u32 {
+    if refresh_mode {
+        CANDIDATE_REFRESH_CONTINUATION_PAGES
+    } else {
+        configured_page_budget.max(1)
+    }
 }
 const M7_MIN_CANDIDATES: i64 = 2_000;
 const M7_MIN_TRUSTED_FRIEND_PROFILES: i64 = 300;
@@ -1800,7 +1811,7 @@ fn collect_steam_candidates(
 ) -> Result<CollectionStats, CollectionError> {
     let page_budget = candidate_worker_pages();
     let mut stats = collect_released_steam_candidates(repo, target, page_budget)?;
-    match collect_upcoming_steam_candidates(repo, page_budget) {
+    match collect_upcoming_steam_candidates(repo, target, page_budget) {
         Ok(upcoming) => stats.merge(upcoming),
         Err(mut failure) => {
             failure.stats.merge(stats);
@@ -1873,6 +1884,7 @@ fn collect_released_steam_candidates(
         stored_cursor.as_ref(),
     );
     let refresh_mode = plan.refresh_mode;
+    let continuation_page_budget = candidate_continuation_page_budget(refresh_mode, page_budget);
     let mut start = plan.continuation_start;
     let mut continuation_pages = 0_u32;
 
@@ -1948,7 +1960,7 @@ fn collect_released_steam_candidates(
             current,
             target,
             continuation_pages,
-            page_budget,
+            continuation_page_budget,
             page.is_complete(),
         ) {
             return Ok(stats);
@@ -1970,6 +1982,7 @@ fn collect_released_steam_candidates(
 
 fn collect_upcoming_steam_candidates(
     repo: &Repository,
+    target: u32,
     page_budget: u32,
 ) -> Result<CollectionStats, CollectionError> {
     let client = store_search_client()?;
@@ -1988,6 +2001,15 @@ fn collect_upcoming_steam_candidates(
             message: format!("invalid stored upcoming cursor: {error}"),
             stats,
         })?;
+    let coverage = repo
+        .m3_catalog_coverage()
+        .map_err(|error| CollectionError {
+            category: "storage",
+            message: error.to_string(),
+            stats,
+        })?;
+    let refresh_mode = coverage.normalized_multiplayer_candidates >= i64::from(target);
+    let continuation_page_budget = candidate_continuation_page_budget(refresh_mode, page_budget);
     let mut start = stored_cursor
         .as_ref()
         .filter(|cursor| !cursor.complete)
@@ -2012,7 +2034,7 @@ fn collect_upcoming_steam_candidates(
         thread::sleep(Duration::from_millis(1_100));
     }
 
-    for page_index in 0..page_budget.max(1) {
+    for page_index in 0..continuation_page_budget {
         let request = StoreSearchRequest::with_sort(start, 100, StoreSearchSort::ReleasedAsc)
             .map_err(|error| CollectionError {
                 category: source_error_category(&error),
@@ -2051,7 +2073,7 @@ fn collect_upcoming_steam_candidates(
             break;
         }
         start = page.next_start();
-        if page_index + 1 < page_budget {
+        if page_index + 1 < continuation_page_budget {
             thread::sleep(Duration::from_millis(1_100));
         }
     }
@@ -2939,6 +2961,19 @@ mod tests {
                 continuation_start: 2_100,
             }
         );
+        let refresh_page_budget = candidate_continuation_page_budget(
+            refresh.refresh_mode,
+            CANDIDATE_WORKER_PAGES_DEFAULT,
+        );
+        assert_eq!(refresh_page_budget, CANDIDATE_REFRESH_CONTINUATION_PAGES);
+        assert!(candidate_collection_satisfied(
+            refresh.refresh_mode,
+            i64::from(STORE_SEARCH_TARGET_DEFAULT),
+            STORE_SEARCH_TARGET_DEFAULT,
+            1,
+            refresh_page_budget,
+            false,
+        ));
 
         let complete = StoreSearchCursor {
             complete: true,
@@ -2966,6 +3001,13 @@ mod tests {
         assert!(!bootstrap.refresh_mode);
         assert!(!bootstrap.refresh_top);
         assert_eq!(bootstrap.continuation_start, 2_100);
+        assert_eq!(
+            candidate_continuation_page_budget(
+                bootstrap.refresh_mode,
+                CANDIDATE_WORKER_PAGES_DEFAULT,
+            ),
+            CANDIDATE_WORKER_PAGES_DEFAULT
+        );
     }
 
     fn app_list_request() -> AppListRequest {
@@ -2991,11 +3033,13 @@ mod tests {
     #[test]
     fn candidate_worker_uses_a_bounded_multi_page_backlog_batch() {
         assert_eq!(candidate_worker_pages(), CANDIDATE_WORKER_PAGES_DEFAULT);
-        assert!(!candidate_collection_satisfied(
-            true, 5_487, 2_000, 1, 10, false,
-        ));
         assert!(candidate_collection_satisfied(
-            true, 5_487, 2_000, 1, 10, true,
+            true,
+            5_487,
+            2_000,
+            1,
+            CANDIDATE_REFRESH_CONTINUATION_PAGES,
+            false,
         ));
     }
 
