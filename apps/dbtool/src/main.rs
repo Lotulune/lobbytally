@@ -22,7 +22,7 @@ use mpgs_steam_source::{
 };
 use mpgs_storage::{
     Clock, Database, EnrichmentNeedFilter, HASH_EMBED_MODEL, PutEmbedding, Repository,
-    StorageResult, SystemClock,
+    StorageError, StorageResult, SystemClock,
 };
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +54,7 @@ const ENRICH_LIMIT_MAX: u32 = 5_000;
 const ENRICH_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ENRICH_INTER_REQUEST_MS: u64 = 2_500;
 const ENRICH_RATE_LIMIT_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
-const STORAGE_WRITE_RETRIES: u64 = 3;
+const STORAGE_WRITE_RETRIES: u64 = 5;
 
 fn env_flag(name: &str) -> bool {
     env::var(name).ok().is_some_and(|value| {
@@ -2099,25 +2099,26 @@ fn ingest_candidate_page(
     page: &StoreSearchPage,
     stats: &mut CollectionStats,
 ) -> Result<i64, CollectionError> {
-    let ingested = repo
-        .ingest_store_search_page(page)
-        .map_err(|error| CollectionError {
-            category: "storage",
-            message: error.to_string(),
-            stats: *stats,
+    let ingested =
+        storage_write_with_retry(|| repo.ingest_store_search_page(page)).map_err(|error| {
+            CollectionError {
+                category: error.category,
+                message: error.message,
+                stats: *stats,
+            }
         })?;
     let app_ids = page
         .candidates
         .iter()
         .map(|candidate| candidate.app_id)
         .collect::<Vec<_>>();
-    let _ = repo
-        .materialize_store_category_profiles_for_apps(&app_ids)
-        .map_err(|error| CollectionError {
-            category: "storage",
-            message: error.to_string(),
-            stats: *stats,
-        })?;
+    let _ =
+        storage_write_with_retry(|| repo.materialize_store_category_profiles_for_apps(&app_ids))
+            .map_err(|error| CollectionError {
+                category: error.category,
+                message: error.message,
+                stats: *stats,
+            })?;
     stats.success_count = stats.success_count.saturating_add(ingested as i64);
     repo.m3_catalog_coverage()
         .map(|coverage| coverage.normalized_multiplayer_candidates)
@@ -2621,16 +2622,31 @@ fn enrich_ccu(
     Ok(())
 }
 
-fn persist_with_retry(mut write: impl FnMut() -> StorageResult<()>) -> Result<(), SoftEnrichError> {
+fn retryable_storage_write_error(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn storage_write_with_retry<T>(
+    mut write: impl FnMut() -> StorageResult<T>,
+) -> Result<T, SoftEnrichError> {
     let mut last_error = None;
     for attempt in 0..STORAGE_WRITE_RETRIES {
         match write() {
-            Ok(()) => return Ok(()),
+            Ok(value) => return Ok(value),
             Err(error) => {
+                let retryable = retryable_storage_write_error(&error);
                 last_error = Some(error.to_string());
-                if attempt + 1 < STORAGE_WRITE_RETRIES {
-                    thread::sleep(Duration::from_secs(1_u64 << attempt));
+                if !retryable || attempt + 1 == STORAGE_WRITE_RETRIES {
+                    break;
                 }
+                thread::sleep(Duration::from_secs(1_u64 << attempt));
             }
         }
     }
@@ -2638,6 +2654,10 @@ fn persist_with_retry(mut write: impl FnMut() -> StorageResult<()>) -> Result<()
         category: "storage",
         message: last_error.unwrap_or_else(|| "unknown storage failure".into()),
     })
+}
+
+fn persist_with_retry(write: impl FnMut() -> StorageResult<()>) -> Result<(), SoftEnrichError> {
+    storage_write_with_retry(write)
 }
 
 fn fetch_raw_with_retry(
@@ -3018,6 +3038,24 @@ mod tests {
             worker_job_error_category("response_too_large"),
             "parse_changed"
         );
+    }
+
+    #[test]
+    fn storage_write_retry_is_limited_to_sqlite_contention() {
+        let busy = StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        ));
+        assert!(retryable_storage_write_error(&busy));
+
+        let mut attempts = 0;
+        let failure = storage_write_with_retry::<()>(|| {
+            attempts += 1;
+            Err(StorageError::validation("permanent"))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(failure.category, "storage");
     }
 
     #[test]
