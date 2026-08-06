@@ -13,7 +13,7 @@ use crate::error::SourceError;
 use crate::proposal::{AppCatalogProposal, AppTypeProposal, SourceStability};
 use crate::raw::RawResponse;
 
-pub const ADAPTER_VERSION: &str = "store-search-0.3.0";
+pub const ADAPTER_VERSION: &str = "store-search-0.4.0";
 pub const SOURCE_NAME: &str = "steam_store_search";
 pub const MULTIPLAYER_CATEGORY_HINT: &str = "Multi-player";
 pub const MAX_PAGE_SIZE: u32 = 100;
@@ -159,10 +159,13 @@ pub fn parse_store_search_page(
     let mut result_count = 0_u32;
     for row in fragment.select(&row_selector) {
         result_count = result_count.saturating_add(1);
-        let raw_app_id = row
-            .value()
-            .attr("data-ds-appid")
-            .ok_or_else(|| SourceError::invalid_structure("search row is missing data-ds-appid"))?;
+        let raw_app_id = row.value().attr("data-ds-appid").unwrap_or_default().trim();
+        // Steam includes package/bundle rows in this result set. They carry
+        // the same row class but an empty data-ds-appid, so they are not app
+        // candidates and must not invalidate the whole page.
+        if raw_app_id.is_empty() {
+            continue;
+        }
         let app_id = raw_app_id
             .split(',')
             .next()
@@ -254,6 +257,24 @@ mod tests {
             parse_store_search_page(&request, &empty),
             Err(SourceError::InvalidStructure { .. })
         ));
+    }
+
+    #[test]
+    fn skips_package_rows_with_empty_app_id() {
+        let raw = page(
+            r#"{
+                "success": 1,
+                "start": 0,
+                "total_count": 2,
+                "results_html": "<a class=\"search_result_row\" data-ds-packageid=\"1662\" data-ds-appid=\"\"><span class=\"title\">Package</span></a><a class=\"search_result_row\" data-ds-appid=\"548430\"><span class=\"title\">Deep Rock Galactic</span></a>"
+            }"#,
+        );
+        let request = StoreSearchRequest::new(0, 100).unwrap();
+        let parsed = parse_store_search_page(&request, &raw).unwrap();
+
+        assert_eq!(parsed.result_count, 2);
+        assert_eq!(parsed.candidates.len(), 1);
+        assert_eq!(parsed.candidates[0].app_id, 548430);
     }
 
     #[test]
