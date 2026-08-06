@@ -530,30 +530,6 @@ pub fn list_candidates(
              FROM apps a
              WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
                AND ({scope_predicate})
-         ), ranked_reviews AS (
-             SELECT review.app_id, review.total_reviews, review.total_positive,
-                    review.wilson_lower, review.captured_at_ms,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY review.app_id
-                        ORDER BY review.captured_at_ms DESC, review.language_scope ASC
-                    ) AS row_num
-             FROM review_snapshots review
-             JOIN candidate_scope scope ON scope.app_id = review.app_id
-             WHERE review.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
-         ), latest_reviews AS (
-             SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms
-             FROM ranked_reviews WHERE row_num = 1
-         ), ranked_players AS (
-             SELECT player.app_id, player.player_count, player.captured_at_ms,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY player.app_id ORDER BY player.captured_at_ms DESC
-                    ) AS row_num
-             FROM player_snapshots player
-             JOIN candidate_scope scope ON scope.app_id = player.app_id
-             WHERE player.player_count IS NOT NULL
-               AND player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
-         ), latest_players AS (
-             SELECT app_id, player_count, captured_at_ms FROM ranked_players WHERE row_num = 1
          ), daily_window AS (
              SELECT daily.app_id, daily.day_utc, daily.mean_ccu
              FROM player_daily daily
@@ -679,8 +655,26 @@ pub fn list_candidates(
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
              AND p.computed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
          LEFT JOIN app_availability v ON v.app_id = a.app_id
-         LEFT JOIN latest_reviews r ON r.app_id = a.app_id
-         LEFT JOIN latest_players lp ON lp.app_id = a.app_id
+         -- Snapshot primary keys start with app_id. Resolve only the newest
+         -- row needed by this candidate instead of window-sorting every
+         -- recent snapshot for the whole section cohort.
+         LEFT JOIN review_snapshots r ON r.rowid = (
+             SELECT latest_review.rowid
+             FROM review_snapshots latest_review
+             WHERE latest_review.app_id = a.app_id
+               AND latest_review.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
+             ORDER BY latest_review.captured_at_ms DESC, latest_review.language_scope ASC
+             LIMIT 1
+         )
+         LEFT JOIN player_snapshots lp ON lp.rowid = (
+             SELECT latest_player.rowid
+             FROM player_snapshots latest_player
+             WHERE latest_player.app_id = a.app_id
+               AND latest_player.player_count IS NOT NULL
+               AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+             ORDER BY latest_player.captured_at_ms DESC
+             LIMIT 1
+         )
          LEFT JOIN daily_typical d ON d.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
          WHERE {section_predicate}
