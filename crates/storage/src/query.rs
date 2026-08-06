@@ -538,13 +538,19 @@ pub fn list_candidates(
     let classic_activity_percentiles = matches!(section, FeedSection::ClassicLegacy)
         .then(|| classic_activity_percentiles(conn, cutoff_date, today, limit))
         .transpose()?;
-    let (ranked_scope_cte, query_scope) = if matches!(section, FeedSection::ClassicLegacy) {
-        (CLASSIC_RANKED_SCOPE_CTE, "ranked_candidate_scope")
-    } else {
-        ("", "candidate_scope")
-    };
+    let (latest_reviews_cte, ranked_scope_cte, query_scope, review_join) =
+        if matches!(section, FeedSection::ClassicLegacy) {
+            (
+                CLASSIC_LATEST_REVIEWS_CTE,
+                CLASSIC_RANKED_SCOPE_CTE,
+                "ranked_candidate_scope",
+                CLASSIC_REVIEW_JOIN,
+            )
+        } else {
+            ("", "", "candidate_scope", CANDIDATE_REVIEW_JOIN)
+        };
     let sql = format!(
-        "WITH candidate_scope AS MATERIALIZED (
+        "WITH {latest_reviews_cte}candidate_scope AS MATERIALIZED (
              SELECT a.app_id
              FROM apps a
              WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
@@ -674,17 +680,7 @@ pub fn list_candidates(
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
              AND p.computed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
          LEFT JOIN app_availability v ON v.app_id = a.app_id
-         -- Snapshot primary keys start with app_id. Resolve only the newest
-         -- row needed by this candidate instead of window-sorting every
-         -- recent snapshot for the whole section cohort.
-         LEFT JOIN review_snapshots r ON r.rowid = (
-             SELECT latest_review.rowid
-             FROM review_snapshots latest_review
-             WHERE latest_review.app_id = a.app_id
-               AND latest_review.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
-             ORDER BY latest_review.captured_at_ms DESC, latest_review.language_scope ASC
-             LIMIT 1
-         )
+         {review_join}
          LEFT JOIN player_snapshots lp ON lp.rowid = (
              SELECT latest_player.rowid
              FROM player_snapshots latest_player
@@ -741,18 +737,36 @@ pub fn list_candidates(
     Ok(out)
 }
 
+const CLASSIC_LATEST_REVIEWS_CTE: &str = "latest_reviews AS MATERIALIZED (
+    SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms
+    FROM (
+        SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms,
+               ROW_NUMBER() OVER (
+                   PARTITION BY app_id
+                   ORDER BY captured_at_ms DESC, language_scope ASC
+               ) AS snapshot_rank
+        FROM review_snapshots
+        WHERE captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
+    )
+    WHERE snapshot_rank = 1
+), ";
+
+const CLASSIC_REVIEW_JOIN: &str = "LEFT JOIN latest_reviews r ON r.app_id = a.app_id";
+
+const CANDIDATE_REVIEW_JOIN: &str = "LEFT JOIN review_snapshots r ON r.rowid = (
+    SELECT latest_review.rowid
+    FROM review_snapshots latest_review
+    WHERE latest_review.app_id = a.app_id
+      AND latest_review.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
+    ORDER BY latest_review.captured_at_ms DESC, latest_review.language_scope ASC
+    LIMIT 1
+)";
+
 const CLASSIC_RANKED_SCOPE_CTE: &str = ", ranked_candidate_scope AS MATERIALIZED (
     SELECT a.app_id
     FROM candidate_scope scope
     JOIN apps a ON a.app_id = scope.app_id
-    LEFT JOIN review_snapshots r ON r.rowid = (
-        SELECT latest_review.rowid
-        FROM review_snapshots latest_review
-        WHERE latest_review.app_id = a.app_id
-          AND latest_review.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
-        ORDER BY latest_review.captured_at_ms DESC, latest_review.language_scope ASC
-        LIMIT 1
-    )
+    LEFT JOIN latest_reviews r ON r.app_id = a.app_id
     ORDER BY COALESCE(r.total_reviews, 0) DESC, a.updated_at_ms DESC
     LIMIT :limit
 )";
@@ -764,7 +778,7 @@ fn classic_activity_percentiles(
     limit: i64,
 ) -> StorageResult<HashMap<SteamAppId, f64>> {
     let sql = format!(
-        "WITH candidate_scope AS MATERIALIZED (
+        "WITH {CLASSIC_LATEST_REVIEWS_CTE}candidate_scope AS MATERIALIZED (
              SELECT a.app_id
              FROM apps a
              WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
