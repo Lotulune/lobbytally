@@ -217,6 +217,10 @@ systemctl status mpgs-update.timer --no-pager
 
 大库的在线备份、外键检查和完整性检查可能超过 10 分钟，仓库单元预留 30 分钟；若服务因旧版超时进入 `failed` 且 timer 不再活动，更新单元后需重新执行 `daemon-reload` 与 `enable --now`。
 
+自动更新会在全部应用写入者停止后、备份开始前执行 `recover-steam-leases`，把被停止
+worker 的未过期 Steam 任务租约恢复为待处理，避免部署后等待 30 分钟租约自然过期。
+不得在 worker 仍运行时手工执行该命令。
+
 定时器只在成对发布指针前移后部署；指针未变化时 Compose 不重建容器。失败与自动
 回滚记录在 `journalctl -u mpgs-update.service`；失败数据库副本不会自动删除，升级前
 备份按上述保留策略清理，应持续监控磁盘容量。

@@ -300,6 +300,22 @@ fn run() -> Result<(), String> {
             println!("ready=ok");
             Ok(())
         }
+        "recover-steam-leases" => {
+            let db_path = required_path(args.next(), "--db path")?;
+            if args.next().is_some() {
+                return Err("recover-steam-leases accepts only db-path".into());
+            }
+            // Deployment calls this after stopping every application writer and
+            // before taking the backup. Do not migrate the database here.
+            let db = Database::open(&db_path).map_err(err)?;
+            let schema_version = db.schema_version().map_err(err)?;
+            let repo = Repository::new(db);
+            let recovered = repo.recover_leased_jobs(Some("steam")).map_err(err)?;
+            println!("path={}", db_path.display());
+            println!("schema_version={schema_version}");
+            println!("steam_leases_recovered={recovered}");
+            Ok(())
+        }
         "m3-audit" => {
             let db_path = required_path(args.next(), "--db path")?;
             let db = Database::open(&db_path).map_err(err)?;
@@ -2902,6 +2918,7 @@ fn usage() -> &'static str {
        recommendation-audit <db-path> --as-of YYYY-MM-DD [--user-id ID] [--top N] [--strict] [--json]\n\
        migrate <db-path>\n\
        integrity <db-path>\n\
+       recover-steam-leases <db-path>\n\
        m3-audit <db-path>\n\
        m7-data-audit <db-path> [--allow-upcoming-shortfall=<reason>]\n\
        sync-retrieval <db-path> [limit=5000] [after_app_id=0]\n\

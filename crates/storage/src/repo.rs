@@ -1209,6 +1209,12 @@ impl Repository {
         })
     }
 
+    pub fn recover_leased_jobs(&self, source_filter: Option<&str>) -> StorageResult<usize> {
+        let now = self.db.now_ms();
+        self.db
+            .with_conn_mut(|conn| jobs::recover_leased_jobs(conn, now, source_filter))
+    }
+
     pub fn complete_job(
         &self,
         job_id: i64,

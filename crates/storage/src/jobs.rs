@@ -153,6 +153,42 @@ pub fn lease_jobs(
     Ok(leased)
 }
 
+/// Return leases to the queue after the owning worker has been stopped.
+///
+/// This is intentionally separate from normal expiry recovery: callers must
+/// first guarantee that no worker for the selected source is still running.
+pub fn recover_leased_jobs(
+    conn: &Connection,
+    now_ms: i64,
+    source_filter: Option<&str>,
+) -> StorageResult<usize> {
+    if source_filter.is_some_and(|source| source.trim().is_empty()) {
+        return Err(StorageError::validation(
+            "lease recovery source must not be empty",
+        ));
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let changed = if let Some(source) = source_filter {
+        tx.execute(
+            "UPDATE jobs
+             SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+                 lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
+             WHERE status = 'leased' AND source = ?2",
+            params![now_ms, source],
+        )?
+    } else {
+        tx.execute(
+            "UPDATE jobs
+             SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+                 lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
+             WHERE status = 'leased'",
+            params![now_ms],
+        )?
+    };
+    tx.commit()?;
+    Ok(changed)
+}
+
 pub fn complete_job(
     conn: &Connection,
     job_id: i64,
@@ -391,6 +427,73 @@ mod tests {
             let recovered = get_job(conn, job_id)?.expect("job");
             assert_eq!(recovered.status, "dead");
             assert_eq!(recovered.attempts, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn stopped_worker_leases_are_recovered_by_source() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            let steam_job = enqueue_job(
+                conn,
+                &EnqueueJob {
+                    source: "steam".into(),
+                    task_type: "collect_candidates".into(),
+                    entity_key: "global".into(),
+                    priority: 1,
+                    due_at_ms: 0,
+                    idempotency_key: "recover-steam".into(),
+                    payload_json: None,
+                    max_attempts: 3,
+                },
+                0,
+            )?;
+            let other_job = enqueue_job(
+                conn,
+                &EnqueueJob {
+                    source: "other".into(),
+                    task_type: "refresh".into(),
+                    entity_key: "global".into(),
+                    priority: 1,
+                    due_at_ms: 0,
+                    idempotency_key: "recover-other".into(),
+                    payload_json: None,
+                    max_attempts: 3,
+                },
+                0,
+            )?;
+            let final_job = enqueue_job(
+                conn,
+                &EnqueueJob {
+                    source: "steam".into(),
+                    task_type: "sync_catalog".into(),
+                    entity_key: "global".into(),
+                    priority: 1,
+                    due_at_ms: 0,
+                    idempotency_key: "recover-final".into(),
+                    payload_json: None,
+                    max_attempts: 1,
+                },
+                0,
+            )?;
+            assert_eq!(lease_jobs(conn, "worker-a", 3, 10_000, 0, None)?.len(), 3);
+
+            assert_eq!(recover_leased_jobs(conn, 1, Some("steam"))?, 2);
+            let steam = get_job(conn, steam_job)?.expect("steam job");
+            let other = get_job(conn, other_job)?.expect("other job");
+            let final_attempt = get_job(conn, final_job)?.expect("final job");
+            assert_eq!(steam.status, "pending");
+            assert_eq!(steam.attempts, 1);
+            assert_eq!(other.status, "leased");
+            assert_eq!(final_attempt.status, "dead");
+
+            let recovered = lease_jobs(conn, "worker-b", 1, 10_000, 1, Some("steam"))?;
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].job_id, steam_job);
+            assert_eq!(recovered[0].attempts, 2);
             Ok(())
         })
         .unwrap();
