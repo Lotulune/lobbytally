@@ -1390,6 +1390,8 @@ pub struct CalendarItemRow {
     pub cover_url: Option<String>,
 }
 
+const CALENDAR_UNDATED_LIMIT: i64 = 100;
+
 pub fn list_calendar(
     conn: &Connection,
     from_date: &str,
@@ -1420,17 +1422,68 @@ pub fn list_calendar(
     }
     let mut dated = Vec::new();
     let mut undated = Vec::new();
-    // Select a fixed predicate after validating `state`. Keeping both branches
-    // behind a bound parameter makes SQLite build a slower MULTI-INDEX OR plan.
+    // Build the candidate scope before joining review/media snapshots. Upcoming
+    // entries without a date are useful for an explicit "undated" bucket, but
+    // returning every stale catalog row made the calendar both noisy and slow.
     let state_predicate = if state == "upcoming" {
-        "a.release_state IN ('upcoming', 'coming_soon')
-         AND (a.release_date IS NULL OR (a.release_date >= ?1 AND a.release_date <= ?2))"
+        "a.release_state IN ('upcoming', 'coming_soon')"
     } else {
-        "a.release_state = 'released'
-         AND a.release_date >= ?1 AND a.release_date <= ?2"
+        "a.release_state = 'released'"
+    };
+    let undated_predicate = if state == "upcoming" {
+        "a.release_date IS NULL"
+    } else {
+        "0"
     };
     let sql = format!(
-        "SELECT a.app_id, a.app_type, a.canonical_name, a.release_state, a.release_date,
+        "WITH eligible_apps AS MATERIALIZED (
+             SELECT a.app_id
+             FROM apps a
+             WHERE {state_predicate}
+               AND a.app_type IN ('game', 'demo', 'playtest')
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM feature_evidence evidence
+                       WHERE evidence.app_id = a.app_id
+                         AND evidence.feature_name = 'category_hint'
+                         AND evidence.is_active = 1
+                         AND evidence.confidence >= 0.3
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM multiplayer_profiles profile
+                       WHERE profile.app_id = a.app_id
+                         AND (
+                             profile.dominant_mode IS NOT NULL
+                             OR profile.private_session IS NOT NULL
+                             OR profile.online_coop IS NOT NULL
+                             OR profile.self_hosted_server IS NOT NULL
+                             OR profile.drop_in_out IS NOT NULL
+                             OR profile.crossplay IS NOT NULL
+                             OR profile.recommended_max_players IS NOT NULL
+                         )
+                   )
+               )
+         ),
+         dated_scope AS MATERIALIZED (
+             SELECT a.app_id
+             FROM eligible_apps eligible
+             JOIN apps a ON a.app_id = eligible.app_id
+             WHERE a.release_date >= ?1 AND a.release_date <= ?2
+         ),
+         undated_scope AS MATERIALIZED (
+             SELECT a.app_id
+             FROM eligible_apps eligible
+             JOIN apps a ON a.app_id = eligible.app_id
+             WHERE {undated_predicate}
+             ORDER BY a.updated_at_ms DESC, a.canonical_name ASC
+             LIMIT {CALENDAR_UNDATED_LIMIT}
+         ),
+         calendar_scope AS (
+             SELECT app_id FROM dated_scope
+             UNION ALL
+             SELECT app_id FROM undated_scope
+         )
+         SELECT a.app_id, a.app_type, a.canonical_name, a.release_state, a.release_date,
                 a.release_date_raw, a.release_date_precision, a.is_early_access,
                 a.current_data_confidence, a.source_modified_at_ms,
                 a.created_at_ms, a.updated_at_ms,
@@ -1442,32 +1495,9 @@ pub fn list_calendar(
                     LIMIT 1
                 ),
                 media.capsule_url
-         FROM apps a
+         FROM calendar_scope scope
+         JOIN apps a ON a.app_id = scope.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
-         WHERE {state_predicate}
-           AND a.app_type IN ('game', 'demo', 'playtest')
-           AND (
-               EXISTS (
-                   SELECT 1 FROM feature_evidence evidence
-                   WHERE evidence.app_id = a.app_id
-                     AND evidence.feature_name = 'category_hint'
-                     AND evidence.is_active = 1
-                     AND evidence.confidence >= 0.3
-               )
-               OR EXISTS (
-                   SELECT 1 FROM multiplayer_profiles profile
-                   WHERE profile.app_id = a.app_id
-                     AND (
-                         profile.dominant_mode IS NOT NULL
-                         OR profile.private_session IS NOT NULL
-                         OR profile.online_coop IS NOT NULL
-                         OR profile.self_hosted_server IS NOT NULL
-                         OR profile.drop_in_out IS NOT NULL
-                         OR profile.crossplay IS NOT NULL
-                         OR profile.recommended_max_players IS NOT NULL
-                     )
-               )
-           )
          ORDER BY a.release_date IS NULL, a.release_date, a.canonical_name"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1718,8 +1748,8 @@ pub fn data_updated_at_ms(conn: &Connection) -> StorageResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GameCandidateRow, list_calendar, list_candidates, resolve_display_dominant_mode,
-        section_matches,
+        CALENDAR_UNDATED_LIMIT, GameCandidateRow, list_calendar, list_candidates,
+        resolve_display_dominant_mode, section_matches,
     };
     use crate::Database;
     use mpgs_domain::{
@@ -2165,6 +2195,42 @@ mod tests {
                 undated.iter().map(|row| row.app.app_id).collect::<Vec<_>>(),
                 vec![104]
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn calendar_bounds_undated_upcoming_items() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn(|conn| {
+            for app_id in 200..350 {
+                crate::catalog::upsert_app(
+                    conn,
+                    app_id,
+                    "game",
+                    &format!("undated-{app_id}"),
+                    "coming_soon",
+                    None,
+                    None,
+                    None,
+                    i64::from(app_id),
+                )?;
+                conn.execute(
+                    "INSERT INTO multiplayer_profiles (
+                         app_id, dominant_mode, recommended_min_players,
+                         profile_confidence, computed_at_ms
+                     ) VALUES (?1, 'generic_multiplayer', 2, 0.3, ?2)",
+                    (app_id, app_id),
+                )?;
+            }
+
+            let (dated, undated) = list_calendar(conn, "2026-08-01", "2026-08-31", "upcoming")?;
+            assert!(dated.is_empty());
+            assert_eq!(undated.len(), CALENDAR_UNDATED_LIMIT as usize);
+            assert_eq!(undated.first().map(|row| row.app.app_id), Some(250));
+            assert_eq!(undated.last().map(|row| row.app.app_id), Some(349));
             Ok(())
         })
         .unwrap();
