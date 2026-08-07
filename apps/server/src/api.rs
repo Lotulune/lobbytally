@@ -6815,7 +6815,8 @@ async fn get_calendar(
         return response;
     }
     match storage_result(repo, move |repo| {
-        let (dated, undated) = repo.list_calendar(&from, &to, &calendar_state)?;
+        let (dated, undated) =
+            repo.list_calendar_cached(data_updated_at_ms, &from, &to, &calendar_state)?;
         Ok((
             dated
                 .into_iter()

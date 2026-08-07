@@ -1332,9 +1332,9 @@ pub fn list_calendar(
     }
     let mut dated = Vec::new();
     let mut undated = Vec::new();
-    // Build the candidate scope before joining review/media snapshots. Upcoming
-    // entries without a date are useful for an explicit "undated" bucket, but
-    // returning every stale catalog row made the calendar both noisy and slow.
+    // Filter the dated and undated branches before checking multiplayer evidence.
+    // Materializing every eligible upcoming app made a 60-day calendar scan the
+    // whole upcoming catalog even though only a few hundred rows can be returned.
     let state_predicate = if state == "upcoming" {
         "a.release_state IN ('upcoming', 'coming_soon')"
     } else {
@@ -1345,46 +1345,44 @@ pub fn list_calendar(
     } else {
         "0"
     };
+    let eligibility_predicate = "(
+        EXISTS (
+            SELECT 1 FROM feature_evidence evidence
+            WHERE evidence.app_id = a.app_id
+              AND evidence.feature_name = 'category_hint'
+              AND evidence.is_active = 1
+              AND evidence.confidence >= 0.3
+        )
+        OR EXISTS (
+            SELECT 1 FROM multiplayer_profiles profile
+            WHERE profile.app_id = a.app_id
+              AND (
+                  profile.dominant_mode IS NOT NULL
+                  OR profile.private_session IS NOT NULL
+                  OR profile.online_coop IS NOT NULL
+                  OR profile.self_hosted_server IS NOT NULL
+                  OR profile.drop_in_out IS NOT NULL
+                  OR profile.crossplay IS NOT NULL
+                  OR profile.recommended_max_players IS NOT NULL
+              )
+        )
+    )";
     let sql = format!(
-        "WITH eligible_apps AS MATERIALIZED (
+        "WITH dated_scope AS MATERIALIZED (
              SELECT a.app_id
              FROM apps a
              WHERE {state_predicate}
                AND a.app_type IN ('game', 'demo', 'playtest')
-               AND (
-                   EXISTS (
-                       SELECT 1 FROM feature_evidence evidence
-                       WHERE evidence.app_id = a.app_id
-                         AND evidence.feature_name = 'category_hint'
-                         AND evidence.is_active = 1
-                         AND evidence.confidence >= 0.3
-                   )
-                   OR EXISTS (
-                       SELECT 1 FROM multiplayer_profiles profile
-                       WHERE profile.app_id = a.app_id
-                         AND (
-                             profile.dominant_mode IS NOT NULL
-                             OR profile.private_session IS NOT NULL
-                             OR profile.online_coop IS NOT NULL
-                             OR profile.self_hosted_server IS NOT NULL
-                             OR profile.drop_in_out IS NOT NULL
-                             OR profile.crossplay IS NOT NULL
-                             OR profile.recommended_max_players IS NOT NULL
-                         )
-                   )
-               )
-         ),
-         dated_scope AS MATERIALIZED (
-             SELECT a.app_id
-             FROM eligible_apps eligible
-             JOIN apps a ON a.app_id = eligible.app_id
-             WHERE a.release_date >= ?1 AND a.release_date <= ?2
+               AND a.release_date >= ?1 AND a.release_date <= ?2
+               AND {eligibility_predicate}
          ),
          undated_scope AS MATERIALIZED (
              SELECT a.app_id
-             FROM eligible_apps eligible
-             JOIN apps a ON a.app_id = eligible.app_id
-             WHERE {undated_predicate}
+             FROM apps a
+             WHERE {state_predicate}
+               AND a.app_type IN ('game', 'demo', 'playtest')
+               AND {undated_predicate}
+               AND {eligibility_predicate}
              ORDER BY a.updated_at_ms DESC, a.canonical_name ASC
              LIMIT {CALENDAR_UNDATED_LIMIT}
          ),

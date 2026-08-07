@@ -19,6 +19,7 @@ use mpgs_steam_source::{
 };
 use std::{
     collections::HashMap,
+    hash::Hash,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -28,7 +29,7 @@ pub const CCU_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
 pub const PRICE_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const ENGLISH_NAME_RETRY_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const MEDIA_BACKFILL_CLAIM_TIMEOUT_MS: i64 = 5 * 60 * 1_000;
-const MAX_CANDIDATE_CACHE_ENTRIES: usize = 4;
+const MAX_READ_CACHE_ENTRIES: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct CandidateCacheKey {
@@ -40,13 +41,21 @@ struct CandidateCacheKey {
     limit: i64,
 }
 
-#[derive(Default)]
-struct CandidateCache {
+struct SnapshotCache<K, V> {
     snapshot_ms: Option<i64>,
-    entries: HashMap<CandidateCacheKey, Vec<crate::query::GameCandidateRow>>,
+    entries: HashMap<K, V>,
 }
 
-impl CandidateCache {
+impl<K, V> Default for SnapshotCache<K, V> {
+    fn default() -> Self {
+        Self {
+            snapshot_ms: None,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Clone + Eq + Hash, V> SnapshotCache<K, V> {
     fn select_snapshot(&mut self, snapshot_ms: i64) -> bool {
         if self
             .snapshot_ms
@@ -61,21 +70,37 @@ impl CandidateCache {
         true
     }
 
-    fn insert(&mut self, key: CandidateCacheKey, rows: Vec<crate::query::GameCandidateRow>) {
-        if self.entries.len() >= MAX_CANDIDATE_CACHE_ENTRIES
+    fn insert(&mut self, key: K, value: V) {
+        if self.entries.len() >= MAX_READ_CACHE_ENTRIES
             && !self.entries.contains_key(&key)
             && let Some(evicted) = self.entries.keys().next().cloned()
         {
             self.entries.remove(&evicted);
         }
-        self.entries.insert(key, rows);
+        self.entries.insert(key, value);
     }
 }
+
+type CandidateCache = SnapshotCache<CandidateCacheKey, Vec<crate::query::GameCandidateRow>>;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CalendarCacheKey {
+    from: String,
+    to: String,
+    state: String,
+}
+
+type CalendarRows = (
+    Vec<crate::query::CalendarItemRow>,
+    Vec<crate::query::CalendarItemRow>,
+);
+type CalendarCache = SnapshotCache<CalendarCacheKey, CalendarRows>;
 
 #[derive(Clone)]
 pub struct Repository {
     pub(crate) db: Database,
     candidate_cache: Arc<Mutex<CandidateCache>>,
+    calendar_cache: Arc<Mutex<CalendarCache>>,
 }
 
 impl Repository {
@@ -83,6 +108,7 @@ impl Repository {
         Self {
             db,
             candidate_cache: Arc::new(Mutex::new(CandidateCache::default())),
+            calendar_cache: Arc::new(Mutex::new(CalendarCache::default())),
         }
     }
 
@@ -1717,6 +1743,34 @@ impl Repository {
     )> {
         self.db
             .with_conn(|conn| crate::query::list_calendar(conn, from, to, state))
+    }
+
+    pub fn list_calendar_cached(
+        &self,
+        snapshot_ms: i64,
+        from: &str,
+        to: &str,
+        state: &str,
+    ) -> StorageResult<CalendarRows> {
+        let key = CalendarCacheKey {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            state: state.to_owned(),
+        };
+        if let Ok(mut cache) = self.calendar_cache.lock()
+            && cache.select_snapshot(snapshot_ms)
+            && let Some(rows) = cache.entries.get(&key)
+        {
+            return Ok(rows.clone());
+        }
+
+        let rows = self.list_calendar(from, to, state)?;
+        if let Ok(mut cache) = self.calendar_cache.lock()
+            && cache.select_snapshot(snapshot_ms)
+        {
+            cache.insert(key, rows.clone());
+        }
+        Ok(rows)
     }
 
     pub fn data_updated_at_ms(&self) -> StorageResult<i64> {

@@ -140,6 +140,56 @@ fn candidate_cache_is_bounded_by_the_data_snapshot() {
 }
 
 #[test]
+fn calendar_cache_is_bounded_by_the_data_snapshot() {
+    let (repo, _) = repo_with_clock(1_000);
+    let insert_calendar_app = |app_id, name: &str| {
+        repo.database()
+            .with_conn(|conn| {
+                crate::catalog::upsert_app(
+                    conn,
+                    app_id,
+                    "game",
+                    name,
+                    "upcoming",
+                    Some("2026-08-08"),
+                    Some("day"),
+                    None,
+                    i64::from(app_id),
+                )?;
+                crate::curation::insert_feature_evidence(
+                    conn,
+                    app_id,
+                    "category_hint",
+                    &serde_json::json!(["Online Co-op"]),
+                    "test",
+                    &format!("calendar-{app_id}"),
+                    0.3,
+                    i64::from(app_id),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    };
+
+    insert_calendar_app(200, "Calendar 200");
+    let first = repo
+        .list_calendar_cached(1, "2026-08-07", "2026-10-06", "upcoming")
+        .unwrap();
+    assert_eq!(first.0.len(), 1);
+
+    insert_calendar_app(201, "Calendar 201");
+    let same_snapshot = repo
+        .list_calendar_cached(1, "2026-08-07", "2026-10-06", "upcoming")
+        .unwrap();
+    assert_eq!(same_snapshot.0.len(), 1);
+
+    let next_snapshot = repo
+        .list_calendar_cached(2, "2026-08-07", "2026-10-06", "upcoming")
+        .unwrap();
+    assert_eq!(next_snapshot.0.len(), 2);
+}
+
+#[test]
 fn previous_version_with_data_upgrades() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("upgrade.db");
