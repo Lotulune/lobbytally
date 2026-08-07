@@ -483,7 +483,9 @@ if [ -n "$old_server_container" ]; then
       restart_previous_release || true
       exit 1
     fi
-    # `backup` verifies the temporary database before publishing the final file.
+    # `backup` verifies the temporary database before publishing the final file;
+    # the command's source probe is intentionally lightweight because all
+    # application writers are already quiesced here.
     backup_created=1
   fi
 elif [ "$runtime_db_state" = present ]; then
@@ -556,9 +558,9 @@ validate_deployment() {
   max_attempts=$(( (health_timeout_secs + 1) / 2 ))
   attempt=1
   while [ "$attempt" -le "$max_attempts" ]; do
-    # The quiesced pre-upgrade backup already passed the full integrity/FK
-    # scan. Repeating that O(database size) check against the live database
-    # here delayed every restart and duplicated deployment validation work.
+    # The quiesced pre-upgrade backup already passed the full integrity check.
+    # Repeating an O(database size) scan against the live database here would
+    # delay every restart and duplicate deployment validation work.
     health_result=0
     deployment_healthcheck new_compose || health_result=$?
     case "$health_result" in

@@ -900,7 +900,12 @@ fn run() -> Result<(), String> {
             let db_path = required_path(args.next(), "--db path")?;
             let out_path = required_path(args.next(), "--out path")?;
             let db = Database::open(&db_path).map_err(err)?;
-            db.assert_ready().map_err(err)?;
+            // The backup implementation verifies the copied database with a
+            // full integrity check before publishing it. Avoid repeating the
+            // O(database size) integrity/FK scans against the quiesced source;
+            // deploys on the small production host otherwise spend most of
+            // their downtime here before the backup even starts.
+            db.readiness_check().map_err(err)?;
             let repo = Repository::new(db);
             repo.backup_to(&out_path).map_err(err)?;
             println!("backed up {} -> {}", db_path.display(), out_path.display());

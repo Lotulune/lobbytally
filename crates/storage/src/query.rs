@@ -989,6 +989,21 @@ pub fn search_by_name(
              FROM app_name_fts
              WHERE app_name_fts MATCH :fts_query
                AND language IN ('canonical', 'schinese', 'english', 'en')
+         ), selected_apps AS MATERIALIZED (
+             SELECT a.app_id
+             FROM name_matches matches
+             JOIN apps a ON a.app_id = matches.app_id
+             WHERE a.canonical_name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
+                OR EXISTS (
+                    SELECT 1 FROM app_localizations localization
+                    WHERE localization.app_id = a.app_id
+                      AND lower(localization.language) IN ('schinese', 'english', 'en')
+                      AND localization.name IS NOT NULL
+                      AND trim(localization.name) <> ''
+                      AND localization.name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
+                )
+             ORDER BY a.canonical_name, a.app_id
+             LIMIT :limit
          )
          SELECT a.app_id, a.canonical_name, a.app_type, a.release_state, a.release_date,
                 p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
@@ -1046,22 +1061,12 @@ pub fn search_by_name(
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  p.computed_at_ms, NULL, NULL, NULL, a.updated_at_ms
-         FROM name_matches matches
+         FROM selected_apps matches
          JOIN apps a ON a.app_id = matches.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
          LEFT JOIN app_availability v ON v.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
-         WHERE a.canonical_name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
-            OR EXISTS (
-                SELECT 1 FROM app_localizations localization
-                WHERE localization.app_id = a.app_id
-                  AND lower(localization.language) IN ('schinese', 'english', 'en')
-                  AND localization.name IS NOT NULL
-                  AND trim(localization.name) <> ''
-                  AND localization.name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
-            )
-         ORDER BY a.canonical_name, a.app_id
-         LIMIT :limit",
+         ORDER BY a.canonical_name, a.app_id",
     )?;
     let rows = stmt.query_map(
         named_params! {
@@ -1100,7 +1105,25 @@ fn search_by_name_like(
     // Match both the list/display canonical string and CN/EN localization names.
     // Other languages are intentionally not included yet.
     let mut stmt = conn.prepare(
-        "SELECT a.app_id, a.canonical_name, a.app_type, a.release_state, a.release_date,
+        "WITH name_matches AS MATERIALIZED (
+             SELECT app_id
+             FROM apps
+             WHERE canonical_name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
+             UNION
+             SELECT app_id
+             FROM app_localizations
+             WHERE lower(language) IN ('schinese', 'english', 'en')
+               AND name IS NOT NULL
+               AND trim(name) != ''
+               AND name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
+         ), selected_apps AS MATERIALIZED (
+             SELECT a.app_id
+             FROM name_matches matches
+             JOIN apps a ON a.app_id = matches.app_id
+             ORDER BY a.canonical_name, a.app_id
+             LIMIT :limit
+         )
+         SELECT a.app_id, a.canonical_name, a.app_type, a.release_state, a.release_date,
                 p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
                 p.recommended_min_players, p.recommended_max_players, p.profile_confidence,
                 NULL, NULL, NULL, NULL, NULL,
@@ -1156,18 +1179,7 @@ fn search_by_name_like(
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  p.computed_at_ms, NULL, NULL, NULL, a.updated_at_ms
-         FROM (
-             SELECT app_id
-             FROM apps
-             WHERE canonical_name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
-             UNION
-             SELECT app_id
-             FROM app_localizations
-             WHERE lower(language) IN ('schinese', 'english', 'en')
-               AND name IS NOT NULL
-               AND trim(name) != ''
-               AND name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
-         ) matches
+         FROM selected_apps matches
          JOIN apps a ON a.app_id = matches.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
          LEFT JOIN app_availability v ON v.app_id = a.app_id
