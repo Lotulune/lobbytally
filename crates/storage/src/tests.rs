@@ -2221,6 +2221,70 @@ fn search_matches_chinese_and_english_localization_names() {
 }
 
 #[test]
+fn search_name_trigram_migration_backfills_and_tracks_name_changes() {
+    let db = Database::open_in_memory().unwrap();
+    db.with_conn_mut(|conn| {
+        migrate::migrate_to(conn, 22, 1_000)?;
+        conn.execute(
+            "INSERT INTO apps (
+                 app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+             ) VALUES (548430, 'game', '星际深岩银河', 'released', 1, 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO app_localizations (
+                 app_id, language, name, short_description, source, updated_at_ms
+             ) VALUES (548430, 'english', 'Deep Rock Galactic', NULL, 'test', 1)",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(db.migrate().unwrap(), latest_version());
+    let repo = Repository::new(db);
+
+    assert_eq!(repo.search_games("际深岩", 10).unwrap()[0].app_id, 548430);
+    assert_eq!(
+        repo.search_games("Rock Gala", 10).unwrap()[0].app_id,
+        548430
+    );
+
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET canonical_name = '深岩银河重制版' WHERE app_id = 548430",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    repo.upsert_app_localization(
+        548430,
+        "english",
+        Some("Cavern Crew Remastered"),
+        None,
+        "test",
+    )
+    .unwrap();
+
+    let stale_index_rows: i64 = repo
+        .database()
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM app_name_fts
+                 WHERE app_name_fts MATCH '\"际深岩\" OR \"Rock Galactic\"'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert_eq!(stale_index_rows, 0);
+    assert_eq!(repo.search_games("银河重", 10).unwrap()[0].app_id, 548430);
+    assert_eq!(repo.search_games("Crew Rem", 10).unwrap()[0].app_id, 548430);
+}
+
+#[test]
 fn missing_english_name_retries_after_refresh_cooldown() {
     let (repo, clock) = repo_with_clock(1_000_000);
     repo.database()

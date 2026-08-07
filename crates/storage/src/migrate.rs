@@ -114,6 +114,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0022_latest_review_snapshots",
         include_str!("../../../migrations/0022_latest_review_snapshots.sql"),
     ),
+    (
+        23,
+        "0023_search_name_trigram",
+        include_str!("../../../migrations/0023_search_name_trigram.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {
