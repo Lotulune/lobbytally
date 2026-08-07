@@ -445,6 +445,20 @@ if [ -n "$old_server_container" ]; then
     restart_previous_release || true
     exit 1
   fi
+  if [ "$runtime_db_state" = present ] && [ -n "$old_worker_container" ]; then
+    # The stopped worker may have held a 30-minute job lease. With every
+    # application writer quiesced, returning those Steam jobs to pending is
+    # safe and prevents each deployment from creating an ingestion gap.
+    if ! docker run --rm --network none --read-only \
+      --entrypoint /usr/local/bin/mpgs-dbtool \
+      --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs" \
+      "$new_server_image" \
+      recover-steam-leases /var/lib/mpgs/mpgs.db; then
+      printf 'Could not recover stopped worker leases; restarting the previous release.\n' >&2
+      restart_previous_release || true
+      exit 1
+    fi
+  fi
   if [ "$runtime_db_state" = present ]; then
     old_short=unknown
     if validate_release_sha "$old_release_sha" >/dev/null 2>&1; then
