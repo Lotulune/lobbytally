@@ -235,7 +235,7 @@ Steam/AI Key 只放在服务端环境；客户端包与日志不得包含。
 1. 备份数据库与当前 `PROVENANCE.json`。
 2. 停止服务（systemd `stop` / WinSW `stop`）。
 3. 替换二进制与文档；保留数据目录与 env。
-4. `mpgs-dbtool migrate <db>`（或启动时自动 migrate）。当前最新为 `0021_read_path_indexes`，它在 `0020_feed_query_indexes` 的基础上，为 Feed/日历的最新评论读取和 demo/playtest 反查补充索引。
+4. `mpgs-dbtool migrate <db>`（或启动时自动 migrate）。当前最新为 `0022_latest_review_snapshots`，它回填并持续维护每个 app 的最新评论投影；Feed、详情和日历不再重复扫描评论历史。`0021_read_path_indexes` 的最新评论与 demo/playtest 反查索引仍保留。
 5. 启动并检查 `/health/ready` 与 `/v1/meta` 的 `schema_version`。
 6. 冒烟：四分区、搜索、详情、偏好、反馈、NL fallback。
 

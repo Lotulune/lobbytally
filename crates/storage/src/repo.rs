@@ -17,22 +17,73 @@ use mpgs_steam_source::{
     AppCatalogProposal, AppListPage, AppListRequest, AppRelationProposal, CcuProposal, GoldenGame,
     PopularReviewsProposal, ReviewSummaryProposal, StoreDetailsProposal, StoreSearchPage,
 };
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 pub const REVIEW_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CCU_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
 pub const PRICE_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const ENGLISH_NAME_RETRY_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const MEDIA_BACKFILL_CLAIM_TIMEOUT_MS: i64 = 5 * 60 * 1_000;
+const MAX_CANDIDATE_CACHE_ENTRIES: usize = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CandidateCacheKey {
+    section: mpgs_domain::FeedSection,
+    cutoff_date: String,
+    today: String,
+    budget_currency: String,
+    config_json: String,
+    limit: i64,
+}
+
+#[derive(Default)]
+struct CandidateCache {
+    snapshot_ms: Option<i64>,
+    entries: HashMap<CandidateCacheKey, Vec<crate::query::GameCandidateRow>>,
+}
+
+impl CandidateCache {
+    fn select_snapshot(&mut self, snapshot_ms: i64) -> bool {
+        if self
+            .snapshot_ms
+            .is_some_and(|current| current > snapshot_ms)
+        {
+            return false;
+        }
+        if self.snapshot_ms != Some(snapshot_ms) {
+            self.snapshot_ms = Some(snapshot_ms);
+            self.entries.clear();
+        }
+        true
+    }
+
+    fn insert(&mut self, key: CandidateCacheKey, rows: Vec<crate::query::GameCandidateRow>) {
+        if self.entries.len() >= MAX_CANDIDATE_CACHE_ENTRIES
+            && !self.entries.contains_key(&key)
+            && let Some(evicted) = self.entries.keys().next().cloned()
+        {
+            self.entries.remove(&evicted);
+        }
+        self.entries.insert(key, rows);
+    }
+}
 
 #[derive(Clone)]
 pub struct Repository {
     pub(crate) db: Database,
+    candidate_cache: Arc<Mutex<CandidateCache>>,
 }
 
 impl Repository {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            candidate_cache: Arc::new(Mutex::new(CandidateCache::default())),
+        }
     }
 
     pub fn database(&self) -> &Database {
@@ -1570,6 +1621,47 @@ impl Repository {
                 limit,
             )
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_candidates_cached(
+        &self,
+        snapshot_ms: i64,
+        section: mpgs_domain::FeedSection,
+        cutoff_date: &str,
+        today: &str,
+        budget_currency: &str,
+        config: &mpgs_domain::RecommendationConfig,
+        limit: i64,
+    ) -> StorageResult<Vec<crate::query::GameCandidateRow>> {
+        let config_json = serde_json::to_string(config).map_err(|error| {
+            crate::StorageError::validation(format!(
+                "recommendation config cache key is invalid: {error}"
+            ))
+        })?;
+        let key = CandidateCacheKey {
+            section,
+            cutoff_date: cutoff_date.to_owned(),
+            today: today.to_owned(),
+            budget_currency: budget_currency.to_owned(),
+            config_json,
+            limit,
+        };
+        if let Ok(mut cache) = self.candidate_cache.lock()
+            && cache.select_snapshot(snapshot_ms)
+            && let Some(rows) = cache.entries.get(&key)
+        {
+            return Ok(rows.clone());
+        }
+
+        let rows =
+            self.list_candidates(section, cutoff_date, today, budget_currency, config, limit)?;
+        if let Ok(mut cache) = self.candidate_cache.lock()
+            && cache.select_snapshot(snapshot_ms)
+        {
+            cache.insert(key, rows.clone());
+        }
+        Ok(rows)
     }
 
     pub fn search_games(

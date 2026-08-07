@@ -5,7 +5,6 @@ use mpgs_domain::{
     RecommendationConfig, SteamAppId,
 };
 use rusqlite::{Connection, OptionalExtension, params, types::Type};
-use std::collections::HashMap;
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::AppRecord;
@@ -535,21 +534,25 @@ pub fn list_candidates(
             "COALESCE(r.total_reviews, 0) DESC",
         ),
     };
-    let classic_activity_percentiles = matches!(section, FeedSection::ClassicLegacy)
-        .then(|| classic_activity_percentiles(conn, cutoff_date, today, limit))
-        .transpose()?;
     let (
-        latest_reviews_cte,
         ranked_scope_cte,
         activity_scope,
+        activity_percentile_ctes,
+        activity_percentile_join,
+        activity_percentile_select,
+        player_join,
         final_scope,
         final_predicate,
         review_join,
     ) = if matches!(section, FeedSection::ClassicLegacy) {
         (
-            CLASSIC_LATEST_REVIEWS_CTE,
             CLASSIC_RANKED_SCOPE_CTE,
             "ranked_candidate_scope",
+            CLASSIC_ACTIVITY_PERCENTILE_CTES,
+            "LEFT JOIN ranked_activity_percentiles activity_rank
+                    ON activity_rank.app_id = a.app_id",
+            "activity_rank.activity_percentile",
+            CLASSIC_PLAYER_JOIN,
             "classic_eligible_scope",
             "1=1",
             CLASSIC_REVIEW_JOIN,
@@ -557,8 +560,11 @@ pub fn list_candidates(
     } else {
         (
             "",
-            "",
             "candidate_scope",
+            "",
+            "",
+            "NULL",
+            CANDIDATE_PLAYER_JOIN,
             "candidate_scope",
             section_predicate,
             CANDIDATE_REVIEW_JOIN,
@@ -570,16 +576,9 @@ pub fn list_candidates(
                  SELECT scope.app_id
                  FROM ranked_candidate_scope scope
                  JOIN apps a ON a.app_id = scope.app_id
-                 LEFT JOIN latest_reviews r ON r.app_id = a.app_id
-                 LEFT JOIN player_snapshots lp ON lp.rowid = (
-                     SELECT latest_player.rowid
-                     FROM player_snapshots latest_player
-                     WHERE latest_player.app_id = a.app_id
-                       AND latest_player.player_count IS NOT NULL
-                       AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
-                     ORDER BY latest_player.captured_at_ms DESC
-                     LIMIT 1
-                 )
+                 JOIN latest_review_snapshots r ON r.app_id = a.app_id
+                    AND r.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
+                 {player_join}
                  LEFT JOIN daily_typical d ON d.app_id = a.app_id
                  WHERE {section_predicate}
              )"
@@ -588,7 +587,7 @@ pub fn list_candidates(
         String::new()
     };
     let sql = format!(
-        "WITH {latest_reviews_cte}candidate_scope AS MATERIALIZED (
+        "WITH candidate_scope AS MATERIALIZED (
              SELECT a.app_id
              FROM apps a
              WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
@@ -628,7 +627,7 @@ pub fn list_candidates(
                         ))
                     END AS momentum
              FROM daily_activity
-         ){eligible_scope_cte}
+         ){activity_percentile_ctes}{eligible_scope_cte}
          SELECT a.app_id, a.canonical_name, a.app_type, a.release_state,
                 a.release_date,
                 p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
@@ -712,24 +711,18 @@ pub fn list_candidates(
                       AND price.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
                     ORDER BY price.captured_at_ms DESC LIMIT 1
                  ),
-                 a.updated_at_ms
+                 a.updated_at_ms,
+                 {activity_percentile_select}
          FROM {final_scope} scope
          JOIN apps a ON a.app_id = scope.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
              AND p.computed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
          LEFT JOIN app_availability v ON v.app_id = a.app_id
          {review_join}
-         LEFT JOIN player_snapshots lp ON lp.rowid = (
-             SELECT latest_player.rowid
-             FROM player_snapshots latest_player
-             WHERE latest_player.app_id = a.app_id
-               AND latest_player.player_count IS NOT NULL
-               AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
-             ORDER BY latest_player.captured_at_ms DESC
-             LIMIT 1
-         )
+         {player_join}
          LEFT JOIN daily_typical d ON d.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
+         {activity_percentile_join}
          WHERE {final_predicate}
          ORDER BY
              {section_order},
@@ -763,142 +756,74 @@ pub fn list_candidates(
     let mut rows = stmt.raw_query();
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        out.push(map_candidate(row)?);
+        out.push(map_candidate_with_percentile(row)?);
     }
-    if let Some(percentiles) = classic_activity_percentiles {
-        for row in &mut out {
-            row.activity_percentile = percentiles.get(&row.app_id).copied();
-        }
-    } else {
+    if !matches!(section, FeedSection::ClassicLegacy) {
         assign_activity_percentiles(&mut out);
     }
     Ok(out)
 }
 
-const CLASSIC_LATEST_REVIEWS_CTE: &str = "latest_reviews AS MATERIALIZED (
-    SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms
-    FROM (
-        SELECT app_id, total_reviews, total_positive, wilson_lower, captured_at_ms,
-               ROW_NUMBER() OVER (
-                   PARTITION BY app_id
-                   ORDER BY captured_at_ms DESC, language_scope ASC
-               ) AS snapshot_rank
-        FROM review_snapshots
-        WHERE captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
-    )
-    WHERE snapshot_rank = 1
-), ";
+const CLASSIC_REVIEW_JOIN: &str = "JOIN latest_review_snapshots r ON r.app_id = a.app_id
+    AND r.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000";
 
-const CLASSIC_REVIEW_JOIN: &str = "LEFT JOIN latest_reviews r ON r.app_id = a.app_id";
-
-const CANDIDATE_REVIEW_JOIN: &str = "LEFT JOIN review_snapshots r ON r.rowid = (
-    SELECT latest_review.rowid
-    FROM review_snapshots latest_review
-    WHERE latest_review.app_id = a.app_id
-      AND latest_review.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
-    ORDER BY latest_review.captured_at_ms DESC, latest_review.language_scope ASC
-    LIMIT 1
-)";
+const CANDIDATE_REVIEW_JOIN: &str = "LEFT JOIN latest_review_snapshots r ON r.app_id = a.app_id
+    AND r.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000";
 
 const CLASSIC_RANKED_SCOPE_CTE: &str = ", ranked_candidate_scope AS MATERIALIZED (
     SELECT a.app_id
     FROM candidate_scope scope
     JOIN apps a ON a.app_id = scope.app_id
-    LEFT JOIN latest_reviews r ON r.app_id = a.app_id
+    JOIN latest_review_snapshots r ON r.app_id = a.app_id
+       AND r.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
     ORDER BY COALESCE(r.total_reviews, 0) DESC, a.updated_at_ms DESC
     LIMIT :limit
 )";
 
-fn classic_activity_percentiles(
-    conn: &Connection,
-    cutoff_date: &str,
-    today: &str,
-    limit: i64,
-) -> StorageResult<HashMap<SteamAppId, f64>> {
-    let sql = format!(
-        "WITH {CLASSIC_LATEST_REVIEWS_CTE}candidate_scope AS MATERIALIZED (
-             SELECT a.app_id
-             FROM apps a
-             WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
-               AND a.release_state = 'released'
-               AND a.release_date IS NOT NULL
-               AND a.release_date < :cutoff
-         ){CLASSIC_RANKED_SCOPE_CTE}, daily_typical AS (
-             SELECT daily.app_id,
-                    CAST(AVG(CASE
-                        WHEN daily.day_utc >= date(:today, '-6 days') THEN daily.mean_ccu
-                    END) AS INTEGER) AS typical_ccu
-             FROM player_daily daily
-             JOIN ranked_candidate_scope scope ON scope.app_id = daily.app_id
-             WHERE daily.mean_ccu IS NOT NULL
-               AND daily.day_utc >= date(:today, '-9 days')
-               AND daily.day_utc <= :today
-             GROUP BY daily.app_id
-         )
-         SELECT scope.app_id,
-                COALESCE(d.typical_ccu, (
-                    SELECT latest_player.player_count
-                    FROM player_snapshots latest_player
-                    WHERE latest_player.app_id = scope.app_id
-                      AND latest_player.player_count IS NOT NULL
-                      AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
-                    ORDER BY latest_player.captured_at_ms DESC
-                    LIMIT 1
-                ))
-         FROM ranked_candidate_scope scope
-         LEFT JOIN daily_typical d ON d.app_id = scope.app_id"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::named_params! {
-            ":cutoff": cutoff_date,
-            ":today": today,
-            ":limit": limit,
-        },
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)? as SteamAppId,
-                row.get::<_, Option<i64>>(1)?.map(|value| value as u32),
-            ))
-        },
-    )?;
-    let activity = rows
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter_map(|(app_id, activity)| activity.map(|value| (app_id, value)))
-        .collect();
-    Ok(activity_percentiles(activity))
-}
+const CLASSIC_ACTIVITY_PERCENTILE_CTES: &str = ", latest_players AS MATERIALIZED (
+    SELECT scope.app_id,
+           (
+               SELECT latest_player.rowid
+               FROM player_snapshots latest_player
+               WHERE latest_player.app_id = scope.app_id
+                 AND latest_player.player_count IS NOT NULL
+                 AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+               ORDER BY latest_player.captured_at_ms DESC
+               LIMIT 1
+           ) AS player_rowid
+    FROM ranked_candidate_scope scope
+), ranked_activity_values AS MATERIALIZED (
+    SELECT scope.app_id, COALESCE(d.typical_ccu, lp.player_count) AS activity_value
+    FROM ranked_candidate_scope scope
+    LEFT JOIN latest_players latest_scope ON latest_scope.app_id = scope.app_id
+    LEFT JOIN player_snapshots lp ON lp.rowid = latest_scope.player_rowid
+    LEFT JOIN daily_typical d ON d.app_id = scope.app_id
+), ranked_activity_percentiles AS MATERIALIZED (
+    SELECT app_id,
+           CASE
+               WHEN COUNT(*) OVER () = 1 THEN 0.5
+               ELSE (
+                   2.0 * (RANK() OVER (ORDER BY activity_value) - 1)
+                       + COUNT(*) OVER (PARTITION BY activity_value) - 1
+               ) / (2.0 * (COUNT(*) OVER () - 1))
+           END AS activity_percentile
+    FROM ranked_activity_values
+    WHERE activity_value IS NOT NULL
+)";
 
-fn activity_percentiles(mut activity: Vec<(SteamAppId, u32)>) -> HashMap<SteamAppId, f64> {
-    activity.sort_by(|(left_id, left), (right_id, right)| {
-        left.cmp(right).then_with(|| left_id.cmp(right_id))
-    });
-    if activity.is_empty() {
-        return HashMap::new();
-    }
-    if activity.len() == 1 {
-        return HashMap::from([(activity[0].0, 0.5)]);
-    }
+const CLASSIC_PLAYER_JOIN: &str = "LEFT JOIN latest_players latest_player_scope
+    ON latest_player_scope.app_id = a.app_id
+LEFT JOIN player_snapshots lp ON lp.rowid = latest_player_scope.player_rowid";
 
-    let denominator = (activity.len() - 1) as f64;
-    let mut percentiles = HashMap::with_capacity(activity.len());
-    let mut start = 0usize;
-    while start < activity.len() {
-        let value = activity[start].1;
-        let mut end = start + 1;
-        while end < activity.len() && activity[end].1 == value {
-            end += 1;
-        }
-        let midrank_zero_based = (start as f64 + (end - 1) as f64) / 2.0;
-        let percentile = midrank_zero_based / denominator;
-        for (app_id, _) in &activity[start..end] {
-            percentiles.insert(*app_id, percentile);
-        }
-        start = end;
-    }
-    percentiles
-}
+const CANDIDATE_PLAYER_JOIN: &str = "LEFT JOIN player_snapshots lp ON lp.rowid = (
+    SELECT latest_player.rowid
+    FROM player_snapshots latest_player
+    WHERE latest_player.app_id = a.app_id
+      AND latest_player.player_count IS NOT NULL
+      AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+    ORDER BY latest_player.captured_at_ms DESC
+    LIMIT 1
+)";
 
 fn assign_activity_percentiles(rows: &mut [GameCandidateRow]) {
     let mut activity: Vec<(usize, u32)> = rows
@@ -1175,26 +1100,14 @@ pub fn get_game_detail(conn: &Connection, app_id: u32) -> StorageResult<Option<G
         "SELECT a.app_id, a.canonical_name, a.app_type, a.release_state, a.release_date,
                 p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
                 p.recommended_min_players, p.recommended_max_players, p.profile_confidence,
-                (
-                    SELECT r.total_reviews FROM review_snapshots r
-                    WHERE r.app_id = a.app_id
-                    ORDER BY r.captured_at_ms DESC LIMIT 1
-                ),
-                (
-                    SELECT r.total_positive FROM review_snapshots r
-                    WHERE r.app_id = a.app_id
-                    ORDER BY r.captured_at_ms DESC LIMIT 1
-                ),
+                r.total_reviews,
+                r.total_positive,
                 (
                     SELECT s.player_count FROM player_snapshots s
                     WHERE s.app_id = a.app_id AND s.player_count IS NOT NULL
                     ORDER BY s.captured_at_ms DESC LIMIT 1
                 ),
-                (
-                    SELECT r.wilson_lower FROM review_snapshots r
-                    WHERE r.app_id = a.app_id
-                    ORDER BY r.captured_at_ms DESC LIMIT 1
-                ),
+                r.wilson_lower,
                 (
                     SELECT CAST(AVG(d.mean_ccu) AS INTEGER) FROM player_daily d
                     WHERE d.app_id = a.app_id AND d.mean_ccu IS NOT NULL
@@ -1264,11 +1177,7 @@ pub fn get_game_detail(conn: &Connection, app_id: u32) -> StorageResult<Option<G
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  p.computed_at_ms,
-                 (
-                    SELECT r.captured_at_ms FROM review_snapshots r
-                    WHERE r.app_id = a.app_id
-                    ORDER BY r.captured_at_ms DESC LIMIT 1
-                 ),
+                 r.captured_at_ms,
                  COALESCE(
                     (
                        SELECT CAST(strftime('%s', MAX(d.day_utc)) AS INTEGER) * 1000
@@ -1291,6 +1200,7 @@ pub fn get_game_detail(conn: &Connection, app_id: u32) -> StorageResult<Option<G
           LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
           LEFT JOIN app_availability v ON v.app_id = a.app_id
           LEFT JOIN app_media media ON media.app_id = a.app_id
+          LEFT JOIN latest_review_snapshots r ON r.app_id = a.app_id
           LEFT JOIN app_localizations loc ON loc.app_id = a.app_id AND loc.language = (
               SELECT language FROM app_localizations l2
               WHERE l2.app_id = a.app_id
@@ -1487,16 +1397,11 @@ pub fn list_calendar(
                 a.release_date_raw, a.release_date_precision, a.is_early_access,
                 a.current_data_confidence, a.source_modified_at_ms,
                 a.created_at_ms, a.updated_at_ms,
-                (
-                    SELECT review.total_reviews
-                    FROM review_snapshots review
-                    WHERE review.app_id = a.app_id
-                    ORDER BY review.captured_at_ms DESC, review.language_scope ASC
-                    LIMIT 1
-                ),
+                review.total_reviews,
                 media.capsule_url
          FROM calendar_scope scope
          JOIN apps a ON a.app_id = scope.app_id
+         LEFT JOIN latest_review_snapshots review ON review.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
          ORDER BY a.release_date IS NULL, a.release_date, a.canonical_name"
     );
@@ -1640,6 +1545,12 @@ fn map_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameCandidateRow> 
         price_observed_at_ms: row.get(41)?,
         release_observed_at_ms: row.get(42)?,
     })
+}
+
+fn map_candidate_with_percentile(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameCandidateRow> {
+    let mut candidate = map_candidate(row)?;
+    candidate.activity_percentile = row.get(43)?;
+    Ok(candidate)
 }
 
 fn parse_json_bool_signal(value: Option<&str>) -> (Option<bool>, Option<f64>, Option<i64>) {
