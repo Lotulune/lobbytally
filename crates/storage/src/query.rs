@@ -4,7 +4,7 @@ use mpgs_domain::{
     CandidateAvailability, FeedSection, ModeFamily, MultiplayerSignals, RankingSignals,
     RecommendationConfig, SteamAppId,
 };
-use rusqlite::{Connection, OptionalExtension, params, types::Type};
+use rusqlite::{Connection, OptionalExtension, named_params, params, types::Type};
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::AppRecord;
@@ -966,7 +966,8 @@ pub fn search_by_name(
     query: &str,
     limit: i64,
 ) -> StorageResult<Vec<GameCandidateRow>> {
-    let escaped = query
+    let trimmed = query.trim();
+    let escaped = trimmed
         .trim()
         .replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -975,6 +976,127 @@ pub fn search_by_name(
         return Ok(Vec::new());
     }
     let pattern = format!("%{escaped}%");
+    let Some(fts_query) = trigram_match_query(trimmed) else {
+        return search_by_name_like(conn, &pattern, limit);
+    };
+
+    // The trigram index narrows the candidate app IDs. Keep the original LIKE
+    // predicate as an exact verification step so FTS ranking/tokenization can
+    // never alter the public substring semantics.
+    let mut stmt = conn.prepare(
+        "WITH name_matches AS MATERIALIZED (
+             SELECT DISTINCT app_id
+             FROM app_name_fts
+             WHERE app_name_fts MATCH :fts_query
+               AND language IN ('canonical', 'schinese', 'english', 'en')
+         )
+         SELECT a.app_id, a.canonical_name, a.app_type, a.release_state, a.release_date,
+                p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
+                p.recommended_min_players, p.recommended_max_players, p.profile_confidence,
+                NULL, NULL, NULL, NULL, NULL,
+                COALESCE(v.platforms_json, '[]'), COALESCE(v.languages_json, '[]'),
+                v.typical_session_minutes_min, v.typical_session_minutes_max, v.is_free,
+                NULL, NULL,
+                (a.app_type IN ('demo', 'playtest') OR EXISTS (
+                    SELECT 1 FROM app_relations demo_relation
+                    WHERE demo_relation.target_app_id = a.app_id
+                      AND demo_relation.relation_type IN ('demo_of', 'playtest_of')
+                )),
+                 a.release_date_raw, a.release_date_precision,
+                 media.capsule_url, media.updated_at_ms, NULL,
+                 p.drop_in_out, p.crossplay, p.service_status, NULL,
+                 (
+                    SELECT json_object(
+                        'value', json(evidence.value_json),
+                        'confidence', evidence.confidence,
+                        'observed_at_ms', evidence.observed_at_ms
+                    ) FROM feature_evidence evidence
+                    WHERE evidence.app_id = a.app_id
+                      AND evidence.feature_name = 'matchmaking_core'
+                      AND evidence.is_active = 1
+                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
+                 ),
+                 (
+                    SELECT json_object(
+                        'value', json(evidence.value_json),
+                        'confidence', evidence.confidence,
+                        'observed_at_ms', evidence.observed_at_ms
+                    ) FROM feature_evidence evidence
+                    WHERE evidence.app_id = a.app_id
+                      AND evidence.feature_name = 'public_world_dependency'
+                      AND evidence.is_active = 1
+                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
+                 ),
+                 (
+                    SELECT json_object(
+                        'value', json(evidence.value_json),
+                        'confidence', evidence.confidence,
+                        'observed_at_ms', evidence.observed_at_ms
+                    ) FROM feature_evidence evidence
+                    WHERE evidence.app_id = a.app_id
+                      AND evidence.feature_name = 'service_shutdown_risk'
+                      AND evidence.is_active = 1
+                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
+                 ),
+                 (
+                    SELECT evidence.value_json FROM feature_evidence evidence
+                    WHERE evidence.app_id = a.app_id
+                      AND evidence.feature_name = 'catalog_taxonomy'
+                      AND evidence.is_active = 1
+                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
+                 ),
+                 p.computed_at_ms, NULL, NULL, NULL, a.updated_at_ms
+         FROM name_matches matches
+         JOIN apps a ON a.app_id = matches.app_id
+         LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
+         LEFT JOIN app_availability v ON v.app_id = a.app_id
+         LEFT JOIN app_media media ON media.app_id = a.app_id
+         WHERE a.canonical_name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
+            OR EXISTS (
+                SELECT 1 FROM app_localizations localization
+                WHERE localization.app_id = a.app_id
+                  AND lower(localization.language) IN ('schinese', 'english', 'en')
+                  AND localization.name IS NOT NULL
+                  AND trim(localization.name) <> ''
+                  AND localization.name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
+            )
+         ORDER BY a.canonical_name, a.app_id
+         LIMIT :limit",
+    )?;
+    let rows = stmt.query_map(
+        named_params! {
+            ":fts_query": fts_query,
+            ":pattern": pattern,
+            ":limit": limit,
+        },
+        map_candidate,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    if out.is_empty() {
+        // Trigram tokenizers intentionally do not index one/two-character
+        // fragments and may reject punctuation-heavy input. Preserve the old
+        // behavior as a correctness fallback for those rare cases.
+        search_by_name_like(conn, &pattern, limit)
+    } else {
+        Ok(out)
+    }
+}
+
+fn trigram_match_query(query: &str) -> Option<String> {
+    if query.chars().count() < 3 {
+        return None;
+    }
+    Some(format!("\"{}\"", query.replace('\"', "\"\"")))
+}
+
+fn search_by_name_like(
+    conn: &Connection,
+    pattern: &str,
+    limit: i64,
+) -> StorageResult<Vec<GameCandidateRow>> {
     // Match both the list/display canonical string and CN/EN localization names.
     // Other languages are intentionally not included yet.
     let mut stmt = conn.prepare(
@@ -1037,23 +1159,26 @@ pub fn search_by_name(
          FROM (
              SELECT app_id
              FROM apps
-             WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+             WHERE canonical_name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
              UNION
              SELECT app_id
              FROM app_localizations
              WHERE lower(language) IN ('schinese', 'english', 'en')
                AND name IS NOT NULL
                AND trim(name) != ''
-               AND name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+               AND name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
          ) matches
          JOIN apps a ON a.app_id = matches.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
          LEFT JOIN app_availability v ON v.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
-         ORDER BY a.canonical_name
-         LIMIT ?2",
+         ORDER BY a.canonical_name, a.app_id
+         LIMIT :limit",
     )?;
-    let rows = stmt.query_map(params![pattern, limit], map_candidate)?;
+    let rows = stmt.query_map(
+        named_params![":pattern": pattern, ":limit": limit],
+        map_candidate,
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);

@@ -412,7 +412,7 @@ PRAGMA trusted_schema = OFF;
 - 服务启动时只有 `migrate` 角色可执行迁移；其他角色检查版本并在不兼容时拒绝 ready。
 - 破坏性迁移采用“新增列/表 -> 双写/回填 -> 切读 -> 后续版本清理”。
 - 每个迁移在空库、上一版本副本和包含代表性数据的测试库上验证。
-- 当前最新版本为 `0022_latest_review_snapshots`。该迁移回填并通过触发器维护每个 app 的最新评论投影，Feed、详情和日历无需为每次请求重建历史快照窗口；`0021_read_path_indexes` 的复合索引仍保留给历史查询。正式数据库仍须由用户确认后运行 migrator，代码库中存在迁移文件不等于某个部署已经升级。
+- 当前最新版本为 `0023_search_name_trigram`。`0022_latest_review_snapshots` 回填并通过触发器维护每个 app 的最新评论投影，Feed、详情和日历无需为每次请求重建历史快照窗口；`0023_search_name_trigram` 通过三元 FTS 索引加速中英文名称子串搜索，并由 apps/localization 触发器保持新入库名称可搜；`0021_read_path_indexes` 的复合索引仍保留给历史查询。正式数据库仍须由用户确认后运行 migrator，代码库中存在迁移文件不等于某个部署已经升级。
 
 ## 10. 保留策略
 
