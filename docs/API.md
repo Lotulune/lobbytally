@@ -286,7 +286,7 @@ order=asc|desc
 ?state=upcoming&from=2026-07-01&to=2026-12-31
 ```
 
-`state` 必须是 `recent` 或 `upcoming`，省略时默认为 `upcoming`。未传 `from/to` 时，`upcoming` 默认查询今天至未来 60 天，`recent` 默认查询过去 180 天至今天；显式传入的日期最大跨度一年。日期不精确的条目进入 `undated_items`，不能伪造具体日期。每个条目包含 `release_date_precision`、`source_modified_at_ms`、`review_total` 和布尔型 `early_data`；`early_data` 由评论数量判断，不使用来源置信度代替评论成熟度。
+`state` 必须是 `recent` 或 `upcoming`，省略时默认为 `upcoming`。未传 `from/to` 时，`upcoming` 默认查询今天至未来 60 天，`recent` 默认查询过去 180 天至今天；显式传入的日期最大跨度一年。日期不精确或未知的条目进入 `undated_items`，不能伪造具体日期；为避免历史未知日期候选挤占日历响应，`upcoming` 的 `undated_items` 最多返回最近更新的 100 条。每个条目包含 `release_date_precision`、`source_modified_at_ms`、`review_total` 和布尔型 `early_data`；`early_data` 由评论数量判断，不使用来源置信度代替评论成熟度。
 
 ```json
 {
