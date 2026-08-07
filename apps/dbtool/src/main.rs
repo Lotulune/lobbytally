@@ -1028,8 +1028,8 @@ fn worker_retry_delay_ms(attempts: i64) -> i64 {
     WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent)
 }
 
-fn current_coverage_ratio(repo: &Repository) -> Result<Option<f64>, String> {
-    let coverage = repo.m3_catalog_coverage().map_err(err)?;
+fn current_coverage_ratio(repo: &Repository) -> StorageResult<Option<f64>> {
+    let coverage = repo.m3_catalog_coverage()?;
     Ok(Some(if coverage.normalized_multiplayer_candidates > 0 {
         (coverage.recommendation_ready_profiles as f64
             / coverage.normalized_multiplayer_candidates as f64)
@@ -1053,13 +1053,12 @@ fn record_worker_refresh(
     task_name: &str,
     cursor_key: &str,
     error_category: Option<&str>,
-) -> Result<(), String> {
+) -> StorageResult<()> {
     let previous = repo
-        .data_refresh_status()
-        .map_err(err)?
+        .data_refresh_status()?
         .into_iter()
         .find(|status| status.task_name == task_name);
-    let cursor = repo.source_cursor(cursor_key).map_err(err)?;
+    let cursor = repo.source_cursor(cursor_key)?;
     let now_ms = repo.database().now_ms();
     repo.update_data_refresh_status(
         task_name,
@@ -1075,13 +1074,20 @@ fn record_worker_refresh(
         cursor.as_deref(),
         current_coverage_ratio(repo)?,
     )
-    .map_err(err)
 }
 
 fn worker_storage_error(_error: impl std::fmt::Display) -> WorkerTaskError {
     WorkerTaskError {
         category: "network",
     }
+}
+
+fn worker_storage_with_retry<T>(
+    write: impl FnMut() -> StorageResult<T>,
+) -> Result<T, WorkerTaskError> {
+    storage_write_with_retry(write).map_err(|_| WorkerTaskError {
+        category: "storage",
+    })
 }
 
 fn worker_task_error(category: &'static str, _message: impl Into<String>) -> WorkerTaskError {
@@ -1141,25 +1147,41 @@ fn run_steam_worker_once(
         };
         match result {
             Ok(()) => {
-                repo.complete_job(job.job_id, owner, &worker_completion_key(owner, job.job_id))
-                    .map_err(err)?;
-                if let Some((task_name, cursor_key)) = status {
-                    record_worker_refresh(repo, task_name, cursor_key, None)?;
+                let completion_key = worker_completion_key(owner, job.job_id);
+                storage_write_with_retry(|| repo.complete_job(job.job_id, owner, &completion_key))
+                    .map_err(|failure| failure.message)?;
+                if let Some((task_name, cursor_key)) = status
+                    && let Err(failure) = storage_write_with_retry(|| {
+                        record_worker_refresh(repo, task_name, cursor_key, None)
+                    })
+                {
+                    eprintln!(
+                        "warn job_id={} task_type={} status_refresh={}",
+                        job.job_id, job.task_type, failure.message
+                    );
                 }
                 stats.completed = stats.completed.saturating_add(1);
             }
             Err(failure) => {
                 let job_error_category = worker_job_error_category(failure.category);
-                let failed = repo
-                    .fail_job(
+                let failed = storage_write_with_retry(|| {
+                    repo.fail_job(
                         job.job_id,
                         owner,
                         job_error_category,
                         worker_retry_delay_ms(job.attempts),
                     )
-                    .map_err(err)?;
-                if let Some((task_name, cursor_key)) = status {
-                    record_worker_refresh(repo, task_name, cursor_key, Some(job_error_category))?;
+                })
+                .map_err(|failure| failure.message)?;
+                if let Some((task_name, cursor_key)) = status
+                    && let Err(failure) = storage_write_with_retry(|| {
+                        record_worker_refresh(repo, task_name, cursor_key, Some(job_error_category))
+                    })
+                {
+                    eprintln!(
+                        "warn job_id={} task_type={} status_refresh={}",
+                        job.job_id, job.task_type, failure.message
+                    );
                 }
                 if failed.status == "dead" {
                     stats.dead = stats.dead.saturating_add(1);
@@ -1178,19 +1200,20 @@ fn run_steam_worker_once(
 
 fn run_catalog_worker_task(repo: &Repository, api_key: &str) -> Result<(), WorkerTaskError> {
     let max_pages = catalog_worker_pages();
-    let run_id = repo
-        .start_source_run(
+    let notes = format!(
+        "worker=true;max_pages={max_pages};page_size={APP_LIST_PAGE_SIZE_DEFAULT};key=present"
+    );
+    let run_id = worker_storage_with_retry(|| {
+        repo.start_source_run(
             APP_LIST_SOURCE_NAME,
             "catalog_sync",
             APP_LIST_ADAPTER_VERSION,
-            Some(&format!(
-                "worker=true;max_pages={max_pages};page_size={APP_LIST_PAGE_SIZE_DEFAULT};key=present"
-            )),
+            Some(&notes),
         )
-        .map_err(worker_storage_error)?;
+    })?;
     match collect_steam_catalog(repo, api_key, max_pages, APP_LIST_PAGE_SIZE_DEFAULT) {
-        Ok(stats) => repo
-            .finish_source_run(
+        Ok(stats) => worker_storage_with_retry(|| {
+            repo.finish_source_run(
                 run_id,
                 "succeeded",
                 stats.request_count,
@@ -1198,29 +1221,31 @@ fn run_catalog_worker_task(repo: &Repository, api_key: &str) -> Result<(), Worke
                 None,
                 Some("cursor persisted"),
             )
-            .map_err(worker_storage_error),
+        }),
         Err(failure) => {
             let status = if failure.stats.success_count > 0 {
                 "partial"
             } else {
                 "failed"
             };
-            let _ = repo.finish_source_run(
-                run_id,
-                status,
-                failure.stats.request_count,
-                failure.stats.success_count,
-                Some(failure.category),
-                Some(&failure.message),
-            );
+            let _ = worker_storage_with_retry(|| {
+                repo.finish_source_run(
+                    run_id,
+                    status,
+                    failure.stats.request_count,
+                    failure.stats.success_count,
+                    Some(failure.category),
+                    Some(&failure.message),
+                )
+            });
             Err(worker_task_error(failure.category, failure.message))
         }
     }
 }
 
 fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
-    let run_id = repo
-        .start_source_run(
+    let run_id = worker_storage_with_retry(|| {
+        repo.start_source_run(
             STORE_SEARCH_SOURCE_NAME,
             "candidate_discovery",
             STORE_SEARCH_ADAPTER_VERSION,
@@ -1228,10 +1253,10 @@ fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
                 "worker=true;channels=released_desc,comingsoon_released_asc;category2=1;cc=CN;l=schinese",
             ),
         )
-        .map_err(worker_storage_error)?;
+    })?;
     match collect_steam_candidates(repo, STORE_SEARCH_TARGET_DEFAULT) {
-        Ok(stats) => repo
-            .finish_source_run(
+        Ok(stats) => worker_storage_with_retry(|| {
+            repo.finish_source_run(
                 run_id,
                 "succeeded",
                 stats.request_count,
@@ -1239,21 +1264,23 @@ fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
                 None,
                 Some("target reached or bounded refresh completed"),
             )
-            .map_err(worker_storage_error),
+        }),
         Err(failure) => {
             let status = if failure.stats.success_count > 0 {
                 "partial"
             } else {
                 "failed"
             };
-            let _ = repo.finish_source_run(
-                run_id,
-                status,
-                failure.stats.request_count,
-                failure.stats.success_count,
-                Some(failure.category),
-                Some(&failure.message),
-            );
+            let _ = worker_storage_with_retry(|| {
+                repo.finish_source_run(
+                    run_id,
+                    status,
+                    failure.stats.request_count,
+                    failure.stats.success_count,
+                    Some(failure.category),
+                    Some(&failure.message),
+                )
+            });
             Err(worker_task_error(failure.category, failure.message))
         }
     }
@@ -1308,25 +1335,26 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
         .filter(|target| target.needs_any())
         .collect();
     let coverage = repo.media_coverage_stats().map_err(worker_storage_error)?;
-    let run_id = repo
-        .start_source_run(
+    let run_notes = format!(
+        "worker=true;phase={phase};limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{}",
+        targets.len(),
+        cursor.after_app_id,
+        coverage.coverage_ratio,
+        coverage.apps_with_media,
+        coverage.candidate_apps
+    );
+    let run_id = worker_storage_with_retry(|| {
+        repo.start_source_run(
             STORE_SOURCE_NAME,
             "candidate_enrichment",
             STORE_ADAPTER_VERSION,
-            Some(&format!(
-                "worker=true;phase={phase};limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{}",
-                targets.len(),
-                cursor.after_app_id,
-                coverage.coverage_ratio,
-                coverage.apps_with_media,
-                coverage.candidate_apps
-            )),
+            Some(&run_notes),
         )
-        .map_err(worker_storage_error)?;
+    })?;
     if targets.is_empty() {
-        return repo
-            .finish_source_run(run_id, "succeeded", 0, 0, None, Some("no targets due"))
-            .map_err(worker_storage_error);
+        return worker_storage_with_retry(|| {
+            repo.finish_source_run(run_id, "succeeded", 0, 0, None, Some("no targets due"))
+        });
     }
     match enrich_steam_candidates(repo, &targets, &country_code, &language) {
         Ok(stats) => {
@@ -1335,12 +1363,11 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
                     .last()
                     .map_or(cursor.after_app_id, |target| target.app_id),
             };
-            repo.save_source_cursor(
-                ENRICH_CURSOR_KEY,
-                STORE_SOURCE_NAME,
-                &serde_json::to_value(next_cursor).map_err(worker_storage_error)?,
-            )
-            .map_err(worker_storage_error)?;
+            let next_cursor_value =
+                serde_json::to_value(next_cursor).map_err(worker_storage_error)?;
+            worker_storage_with_retry(|| {
+                repo.save_source_cursor(ENRICH_CURSOR_KEY, STORE_SOURCE_NAME, &next_cursor_value)
+            })?;
             let status = if stats.error_count > 0 && stats.success_count > 0 {
                 "partial"
             } else if stats.error_count > 0 {
@@ -1348,24 +1375,26 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
             } else {
                 "succeeded"
             };
-            repo.finish_source_run(
-                run_id,
-                status,
-                stats.request_count,
-                stats.success_count,
-                (stats.error_count > 0).then_some("partial_errors"),
-                Some(&format!(
-                    "apps_attempted={} store={} store_not_found={} reviews={} popular_reviews={} ccu={} errors={}",
-                    stats.apps_attempted,
-                    stats.store_ok,
-                    stats.store_not_found,
-                    stats.reviews_ok,
-                    stats.popular_reviews_ok,
-                    stats.ccu_ok,
-                    stats.error_count
-                )),
-            )
-            .map_err(worker_storage_error)?;
+            let notes = format!(
+                "apps_attempted={} store={} store_not_found={} reviews={} popular_reviews={} ccu={} errors={}",
+                stats.apps_attempted,
+                stats.store_ok,
+                stats.store_not_found,
+                stats.reviews_ok,
+                stats.popular_reviews_ok,
+                stats.ccu_ok,
+                stats.error_count
+            );
+            worker_storage_with_retry(|| {
+                repo.finish_source_run(
+                    run_id,
+                    status,
+                    stats.request_count,
+                    stats.success_count,
+                    (stats.error_count > 0).then_some("partial_errors"),
+                    Some(&notes),
+                )
+            })?;
             if stats.error_count > 0 {
                 Err(worker_task_error(
                     "network",
@@ -1376,14 +1405,16 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
             }
         }
         Err(failure) => {
-            let _ = repo.finish_source_run(
-                run_id,
-                "failed",
-                failure.stats.request_count,
-                failure.stats.success_count,
-                Some(failure.category),
-                Some(&failure.message),
-            );
+            let _ = worker_storage_with_retry(|| {
+                repo.finish_source_run(
+                    run_id,
+                    "failed",
+                    failure.stats.request_count,
+                    failure.stats.success_count,
+                    Some(failure.category),
+                    Some(&failure.message),
+                )
+            });
             Err(worker_task_error(failure.category, failure.message))
         }
     }

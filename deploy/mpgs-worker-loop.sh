@@ -2,8 +2,8 @@
 set -eu
 
 interval="${MPGS_WORKER_INTERVAL_SECS:-60}"
-job_limit="${MPGS_WORKER_JOB_LIMIT:-10}"
-enrich_limit="${MPGS_WORKER_ENRICH_LIMIT:-100}"
+job_limit="${MPGS_WORKER_JOB_LIMIT:-1}"
+enrich_limit="${MPGS_WORKER_ENRICH_LIMIT:-20}"
 max_failures="${MPGS_WORKER_MAX_CONSECUTIVE_FAILURES:-5}"
 max_run_secs="${MPGS_WORKER_MAX_RUN_SECS:-1800}"
 retry_interval="${MPGS_WORKER_RETRY_INTERVAL_SECS:-30}"
