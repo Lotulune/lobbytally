@@ -62,6 +62,29 @@ set +a
 
 branch=${MPGS_DEPLOY_BRANCH:-main}
 mode=${MPGS_DEPLOY_MODE:-full}
+backup_retention_count=${MPGS_BACKUP_RETENTION_COUNT:-3}
+health_timeout_secs=${MPGS_DEPLOY_HEALTH_TIMEOUT_SECS:-600}
+
+require_bounded_positive_integer() {
+  name=$1
+  value=$2
+  maximum=$3
+  case "$value" in
+    ''|*[!0-9]*|0)
+      printf '%s must be a positive integer (got: %s)\n' "$name" "$value" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$value" -gt "$maximum" ]; then
+    printf '%s must not exceed %s (got: %s)\n' "$name" "$maximum" "$value" >&2
+    exit 2
+  fi
+}
+
+require_bounded_positive_integer MPGS_BACKUP_RETENTION_COUNT \
+  "$backup_retention_count" 100
+require_bounded_positive_integer MPGS_DEPLOY_HEALTH_TIMEOUT_SECS \
+  "$health_timeout_secs" 3600
 
 case "$mode" in
   backend)
@@ -260,6 +283,36 @@ deployment_healthcheck() {
     /usr/local/bin/mpgs-worker-loop --healthcheck >/dev/null 2>&1
 }
 
+prune_pre_update_backups() {
+  target_container=$1
+  docker exec "$target_container" /bin/sh -c '
+    set -eu
+    keep=$1
+    first_stale=$((keep + 1))
+    stale=$(
+      find /var/lib/mpgs/backups -maxdepth 1 -type f \
+        -name "pre-update-*.db" -printf "%T@ %p\n" \
+        | sort -nr \
+        | tail -n "+$first_stale" \
+        | cut -d " " -f 2-
+    )
+    removed=0
+    for path in $stale; do
+      case "$path" in
+        /var/lib/mpgs/backups/pre-update-*.db)
+          rm -f -- "$path"
+          removed=$((removed + 1))
+          ;;
+        *)
+          printf "Refusing to prune unexpected backup path: %s\n" "$path" >&2
+          exit 1
+          ;;
+      esac
+    done
+    printf "%s\n" "$removed"
+  ' sh "$backup_retention_count"
+}
+
 advance_source_checkout() {
   [ "$advance_source" -eq 1 ] || return 0
   # A fast-forward is brief but must not be interrupted between worktree and
@@ -308,6 +361,12 @@ if [ "$mode_matches" -eq 1 ] \
     printf 'Healthy containers are at %s, but the source fast-forward failed.\n' \
       "$release_sha" >&2
     exit 1
+  fi
+  if pruned_count=$(prune_pre_update_backups "$old_server_container"); then
+    printf 'Pruned %s old pre-update backup(s); retaining the newest %s.\n' \
+      "$pruned_count" "$backup_retention_count"
+  else
+    printf 'Warning: could not prune old pre-update backups.\n' >&2
   fi
   printf 'MPGS %s deployment is already healthy at %s\n' "$mode" "$release_sha"
   exit 0
@@ -480,8 +539,9 @@ if ! new_compose up -d --no-build --pull never --remove-orphans $services; then
 fi
 
 validate_deployment() {
+  max_attempts=$(( (health_timeout_secs + 1) / 2 ))
   attempt=1
-  while [ "$attempt" -le 45 ]; do
+  while [ "$attempt" -le "$max_attempts" ]; do
     # The quiesced pre-upgrade backup already passed the full integrity/FK
     # scan. Repeating that O(database size) check against the live database
     # here delayed every restart and duplicated deployment validation work.
@@ -522,6 +582,13 @@ server_container=$(new_compose ps -q mpgs-server)
 docker exec "$server_container" /bin/sh -c \
   'umask 077; printf "%s\n" "$1" > /var/lib/mpgs/.release-sha' \
   sh "$release_sha"
+
+if pruned_count=$(prune_pre_update_backups "$server_container"); then
+  printf 'Pruned %s old pre-update backup(s); retaining the newest %s.\n' \
+    "$pruned_count" "$backup_retention_count"
+else
+  printf 'Warning: could not prune old pre-update backups.\n' >&2
+fi
 
 if [ -n "$old_server_image" ]; then
   docker image rm "$old_server_image" >/dev/null 2>&1 || true

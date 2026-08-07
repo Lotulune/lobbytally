@@ -14,7 +14,7 @@ const DEFAULT_CATALOG_SYNC_INTERVAL_SECS: u64 = 15 * 60;
 const DEFAULT_CANDIDATE_COLLECTION_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_ENRICHMENT_INTERVAL_SECS: u64 = 5 * 60;
 const RECOMMENDATION_TELEMETRY_RETENTION_INTERVAL_SECS: u64 = 24 * 60 * 60;
-const DEFAULT_RETRIEVAL_SYNC_BATCH_SIZE: u32 = 200;
+const DEFAULT_RETRIEVAL_SYNC_BATCH_SIZE: u32 = 20;
 const RETRIEVAL_SYNC_BATCH_SIZE_MIN: u32 = 10;
 const RETRIEVAL_SYNC_BATCH_SIZE_MAX: u32 = 10_000;
 const TASK_INTERVAL_MIN_SECS: u64 = 60;
@@ -146,6 +146,38 @@ fn run_once_with_schedule(
     };
     let previous_status = repo.data_refresh_status()?;
 
+    // Local FTS/hash maintenance is derived data and must not compete with a
+    // pending or leased Steam ingestion job for SQLite's single writer. Run it
+    // before enqueueing this tick's Steam work only when the prior queue is
+    // empty; the worker will see newly queued work after this bounded batch.
+    let steam_work_active = ["sync_catalog", "collect_candidates", "enrich_catalog"]
+        .into_iter()
+        .try_fold(false, |active, task_type| {
+            Ok::<_, mpgs_storage::StorageError>(
+                active || repo.has_active_job("steam", task_type, "scheduled")?,
+            )
+        })?;
+
+    // Telemetry retention is an independent, daily housekeeping task. Keep it
+    // on cadence even when ingestion work is queued; only the heavier derived
+    // writes below need to yield to the Steam worker.
+    let telemetry_previous = previous_status
+        .iter()
+        .find(|status| status.task_name == TELEMETRY_RETENTION_TASK);
+    run_recommendation_telemetry_retention(repo, telemetry_previous, now_ms, next_run_at_ms)?;
+
+    if !steam_work_active {
+        run_local_maintenance(
+            repo,
+            &previous_status,
+            coverage_ratio,
+            now_ms,
+            next_run_at_ms,
+        )?;
+    } else {
+        info!("local data maintenance deferred while Steam ingestion is active");
+    }
+
     // Lease-backed collection work is deliberately queued rather than run in a
     // database transaction. A co-located worker leases these tasks and writes
     // source snapshots independently, so Steam failure cannot clear a good
@@ -215,6 +247,16 @@ fn run_once_with_schedule(
         )?;
     }
 
+    Ok(())
+}
+
+fn run_local_maintenance(
+    repo: &Repository,
+    previous_status: &[DataRefreshStatus],
+    coverage_ratio: Option<f64>,
+    now_ms: i64,
+    next_run_at_ms: i64,
+) -> mpgs_storage::StorageResult<()> {
     let quality_previous = previous_status
         .iter()
         .find(|status| status.task_name == "quality_check");
@@ -251,10 +293,6 @@ fn run_once_with_schedule(
         configured_retrieval_sync_batch_size(),
         true,
     )?;
-    let telemetry_previous = previous_status
-        .iter()
-        .find(|status| status.task_name == TELEMETRY_RETENTION_TASK);
-    run_recommendation_telemetry_retention(repo, telemetry_previous, now_ms, next_run_at_ms)?;
     Ok(())
 }
 
@@ -563,6 +601,57 @@ mod tests {
                 .unwrap(),
             "candidate collection waits for its longer interval"
         );
+    }
+
+    #[test]
+    fn defers_local_writes_while_a_scheduled_steam_job_is_active() {
+        let clock = Arc::new(FakeClock::new(0));
+        let db = Database::open_in_memory_with_clock(clock).unwrap();
+        let repo = Repository::new(db);
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        repo.seed_demo_if_empty().unwrap();
+        for task_name in ["candidate_collection", "enrichment"] {
+            repo.update_data_refresh_status(task_name, None, Some(60_000), None, None, None)
+                .unwrap();
+        }
+        let job_id = repo
+            .enqueue_job(&EnqueueJob {
+                source: "steam".into(),
+                task_type: "enrich_catalog".into(),
+                entity_key: "scheduled".into(),
+                priority: 50,
+                due_at_ms: 0,
+                idempotency_key: "active-steam-maintenance-guard".into(),
+                payload_json: None,
+                max_attempts: 3,
+            })
+            .unwrap();
+
+        run_once_with_catalog_sync(&repo, DEFAULT_INTERVAL_SECS, false).unwrap();
+        let deferred = repo
+            .data_refresh_status()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.task_name == "quality_check")
+            .unwrap();
+        assert!(deferred.last_success_at_ms.is_none());
+
+        let leased = repo
+            .lease_jobs("test-worker", 1, 60_000, Some("steam"))
+            .unwrap();
+        assert_eq!(leased[0].job_id, job_id);
+        repo.complete_job(job_id, "test-worker", "maintenance-guard-complete")
+            .unwrap();
+
+        run_once_with_catalog_sync(&repo, DEFAULT_INTERVAL_SECS, false).unwrap();
+        let completed = repo
+            .data_refresh_status()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.task_name == "quality_check")
+            .unwrap();
+        assert_eq!(completed.last_success_at_ms, Some(0));
     }
 
     #[test]

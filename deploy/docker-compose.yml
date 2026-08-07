@@ -7,7 +7,10 @@ services:
       - >-
         install -d -o mpgs -g mpgs -m 0750
         /var/lib/mpgs /var/lib/mpgs/avatars /var/lib/mpgs/backups
-        && chown -R mpgs:mpgs /var/lib/mpgs
+        && chown -R mpgs:mpgs /var/lib/mpgs/avatars
+        && find /var/lib/mpgs -maxdepth 1 -type f
+        \( -name 'mpgs.db*' -o -name '.release-sha' -o -name '.worker-health*' \)
+        -exec chown mpgs:mpgs {} +
     volumes:
       - ./runtime:/var/lib/mpgs
     restart: "no"

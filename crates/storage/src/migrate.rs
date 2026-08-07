@@ -104,6 +104,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0020_feed_query_indexes",
         include_str!("../../../migrations/0020_feed_query_indexes.sql"),
     ),
+    (
+        21,
+        "0021_read_path_indexes",
+        include_str!("../../../migrations/0021_read_path_indexes.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {
@@ -244,5 +249,25 @@ mod tests {
             current_version(&renamed),
             Err(StorageError::Migration { .. })
         ));
+    }
+
+    #[test]
+    fn latest_migration_adds_feed_and_calendar_read_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_to_latest(&mut conn, 1).unwrap();
+
+        for index in [
+            "idx_app_relations_target_type",
+            "idx_review_snapshots_app_latest",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing index {index}");
+        }
     }
 }

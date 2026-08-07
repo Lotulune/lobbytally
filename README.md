@@ -71,9 +71,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 Docker 部署默认同时提供 Web、API 和持续 Steam worker；也可只部署后端：
 
 ```bash
+cp deploy/.env.example deploy/.env
 cp deploy/mpgs.env.example deploy/mpgs.env
 # 填写随机 MPGS_ADMIN_TOKEN；Steam AppList 增量同步还需可选的服务端 Web API Key。
-docker compose -f deploy/docker-compose.yml up -d --build
+# 生产从 GHCR 拉取 GitHub Actions 已构建的不可变镜像，不在 VPS 编译。
+./deploy/update.sh
 curl http://127.0.0.1:18082/health/ready
 
 # 后端模式由 update.sh 按 deploy/.env 中的配置启动，入口为 18081

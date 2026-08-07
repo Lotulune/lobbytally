@@ -132,7 +132,7 @@ AI 失败通常不返回 5xx，而是以成功响应中的 `ai_status=fallback` 
   "service_version": "0.1.0",
   "algorithm_version": "rules-0.3.1",
   "config_version": "rules-0.2.0",
-  "schema_version": 19,
+  "schema_version": 21,
   "build_git_sha": "unknown",
   "data_updated_at_ms": 1783936800000,
   "supported_sections": [

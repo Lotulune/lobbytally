@@ -128,7 +128,7 @@ mpgs-dbtool m7-data-audit <db> --allow-upcoming-shortfall='官方目录当日新
 
 `deploy/docker-compose.yml` 包含 `mpgs-server`、可选静态 Web 网关 `mpgs-web` 和周期执行租约任务的 `mpgs-worker`。SQLite 与头像通过同一宿主机目录挂载到 `/var/lib/mpgs`，不得改成网络共享卷。
 一次性的 `mpgs-init` 会在 server/worker 启动前创建并校正该目录的容器
-UID/GID；worker 还通过 `.worker-health` 暴露最近一次运行状态，连续失败会退出并由
+UID/GID（不会递归扫描备份目录）；worker 还通过 `.worker-health` 暴露最近一次运行状态，连续失败会退出并由
 Compose 重启。`docker compose ps` 出现 `unhealthy` 时应检查 worker 日志，而不能只看
 API readiness。
 
@@ -165,7 +165,7 @@ docker compose -f deploy/docker-compose.yml up -d --build
 curl http://127.0.0.1:18082/.well-known/mpgs
 ```
 
-迁移已有数据库时，先使用 `mpgs-dbtool backup <source> <backup>` 生成一致性副本，再把副本放到 `deploy/runtime/mpgs.db`。worker 默认每 60 秒领取一次任务；没有 `MPGS_STEAM_WEB_API_KEY` 时官方 AppList 同步保持禁用，但候选发现、商店详情、评价和 CCU 富化仍会执行。连续 7 天采集完成前，`m7-data-audit` 返回失败属于预期状态。
+迁移已有数据库时，先使用 `mpgs-dbtool backup <source> <backup>` 生成一致性副本，再把副本放到 `deploy/runtime/mpgs.db`。worker 默认每 60 秒领取一个任务；单轮富化默认 20 个 App，以免 30 分钟租约在串行任务中失效。没有 `MPGS_STEAM_WEB_API_KEY` 时官方 AppList 同步保持禁用，但候选发现、商店详情、评价和 CCU 富化仍会执行。连续 7 天采集完成前，`m7-data-audit` 返回失败属于预期状态。
 
 正式 VPS 不应在宿主机编译 Rust。CI 的 Web、Rust quality 与 Linux package
 门禁全部通过后，`.github/workflows/container-images.yml` 才会发布成对的
@@ -193,6 +193,10 @@ fast-forward 到同一 SHA。更新器从临时副本运行，因此源码切换
 保留失败数据库副本、恢复升级前备份，并把旧容器的精确本地 image ID 临时标记为
 标准回滚镜像引用后自动重启，避免依赖已经移动的旧 tag。
 
+成功部署后更新器默认只保留最近 3 份 `pre-update-*.db`，可在 `deploy/.env` 中用
+`MPGS_BACKUP_RETENTION_COUNT` 调整（范围 `1..100`）。`MPGS_DEPLOY_HEALTH_TIMEOUT_SECS`
+默认 600 秒，用于低配主机上的一次性迁移/索引构建；它不会改变 systemd 的总超时。
+
 紧急固定某个已发布版本时，可在 `deploy/.env` 临时设置完整的 40 位
 `MPGS_RELEASE_SHA`；成功恢复并确认后应删除该 pin，重新跟随发布指针。运行时密钥只
 保存在 `deploy/mpgs.env`，不得放入 `deploy/.env`、GitHub workflow 或镜像标签。
@@ -214,8 +218,8 @@ systemctl status mpgs-update.timer --no-pager
 大库的在线备份、外键检查和完整性检查可能超过 10 分钟，仓库单元预留 30 分钟；若服务因旧版超时进入 `failed` 且 timer 不再活动，更新单元后需重新执行 `daemon-reload` 与 `enable --now`。
 
 定时器只在成对发布指针前移后部署；指针未变化时 Compose 不重建容器。失败与自动
-回滚记录在 `journalctl -u mpgs-update.service`，升级前备份和失败数据库副本不会
-自动删除，应纳入磁盘容量与保留策略。
+回滚记录在 `journalctl -u mpgs-update.service`；失败数据库副本不会自动删除，升级前
+备份按上述保留策略清理，应持续监控磁盘容量。
 
 ### 3.6 密钥轮换
 
@@ -231,7 +235,7 @@ Steam/AI Key 只放在服务端环境；客户端包与日志不得包含。
 1. 备份数据库与当前 `PROVENANCE.json`。
 2. 停止服务（systemd `stop` / WinSW `stop`）。
 3. 替换二进制与文档；保留数据目录与 env。
-4. `mpgs-dbtool migrate <db>`（或启动时自动 migrate）。当前最新为 `0020_feed_query_indexes`，它在保留 `0019_preference_confidence` 偏好置信度语义的同时，为 Feed 最新证据和区域价格查询补充复合索引。
+4. `mpgs-dbtool migrate <db>`（或启动时自动 migrate）。当前最新为 `0021_read_path_indexes`，它在 `0020_feed_query_indexes` 的基础上，为 Feed/日历的最新评论读取和 demo/playtest 反查补充索引。
 5. 启动并检查 `/health/ready` 与 `/v1/meta` 的 `schema_version`。
 6. 冒烟：四分区、搜索、详情、偏好、反馈、NL fallback。
 
