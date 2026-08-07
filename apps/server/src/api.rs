@@ -3143,7 +3143,8 @@ async fn get_feed_inner(
     let recommendation_config = active_config.config.clone();
     let candidate_limit = i64::from(active_config.config.candidate_limit);
     let candidates = match storage_result(repo, move |repo| {
-        repo.list_candidates(
+        repo.list_candidates_cached(
+            snapshot_ms,
             section,
             &cutoff_query,
             &today_query,

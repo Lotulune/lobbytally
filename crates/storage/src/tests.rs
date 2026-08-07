@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use mpgs_domain::FeedbackType;
+use mpgs_domain::{FeedSection, FeedbackType, RecommendationConfig};
 use mpgs_steam_source::{
     APP_LIST_SOURCE_NAME, AppCatalogProposal, AppListRequest, AppTypeProposal, CcuProposal,
     CcuRequest, RawResponse, ReviewSummaryProposal, ReviewSummaryRequest, SourceStability,
@@ -63,6 +63,80 @@ fn demo_seed_includes_capsules_for_known_steam_apps() {
         })
         .unwrap();
     assert_eq!(synthetic_media_count, 0);
+}
+
+#[test]
+fn candidate_cache_is_bounded_by_the_data_snapshot() {
+    let (repo, _) = repo_with_clock(1_000);
+    repo.database()
+        .with_conn(|conn| {
+            crate::catalog::upsert_app(
+                conn,
+                100,
+                "demo",
+                "Demo 100",
+                "upcoming",
+                Some("2026-08-08"),
+                Some("day"),
+                None,
+                100,
+            )
+        })
+        .unwrap();
+    let config = RecommendationConfig::default();
+    let first = repo
+        .list_candidates_cached(
+            1,
+            FeedSection::Upcoming,
+            "2026-02-08",
+            "2026-08-07",
+            "CNY",
+            &config,
+            100,
+        )
+        .unwrap();
+    assert_eq!(first.len(), 1);
+
+    repo.database()
+        .with_conn(|conn| {
+            crate::catalog::upsert_app(
+                conn,
+                101,
+                "demo",
+                "Demo 101",
+                "upcoming",
+                Some("2026-08-08"),
+                Some("day"),
+                None,
+                101,
+            )
+        })
+        .unwrap();
+    let same_snapshot = repo
+        .list_candidates_cached(
+            1,
+            FeedSection::Upcoming,
+            "2026-02-08",
+            "2026-08-07",
+            "CNY",
+            &config,
+            100,
+        )
+        .unwrap();
+    assert_eq!(same_snapshot.len(), 1);
+
+    let next_snapshot = repo
+        .list_candidates_cached(
+            2,
+            FeedSection::Upcoming,
+            "2026-02-08",
+            "2026-08-07",
+            "CNY",
+            &config,
+            100,
+        )
+        .unwrap();
+    assert_eq!(next_snapshot.len(), 2);
 }
 
 #[test]

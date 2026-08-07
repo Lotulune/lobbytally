@@ -109,6 +109,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0021_read_path_indexes",
         include_str!("../../../migrations/0021_read_path_indexes.sql"),
     ),
+    (
+        22,
+        "0022_latest_review_snapshots",
+        include_str!("../../../migrations/0022_latest_review_snapshots.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {
@@ -269,5 +274,73 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing index {index}");
         }
+    }
+
+    #[test]
+    fn latest_review_projection_tracks_insert_update_and_delete() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_to_latest(&mut conn, 1).unwrap();
+        conn.execute(
+            "INSERT INTO apps (
+                 app_id, app_type, canonical_name, release_state,
+                 created_at_ms, updated_at_ms
+             ) VALUES (42, 'game', 'Projection Test', 'released', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO review_snapshots (
+                 app_id, region_scope, language_scope, captured_at_ms,
+                 total_positive, total_negative, total_reviews, wilson_lower,
+                 filter_offtopic_activity, parameter_hash, content_hash, source
+             ) VALUES
+             (42, 'all', 'english', 20, 90, 10, 100, 0.80, 1, 'p1', 'c1', 'test'),
+             (42, 'all', 'schinese', 10, 40, 10, 50, 0.70, 1, 'p2', 'c2', 'test'),
+             (42, 'all', 'schinese', 20, 95, 5, 100, 0.85, 1, 'p3', 'c3', 'test');",
+        )
+        .unwrap();
+
+        let projected: (String, i64, f64) = conn
+            .query_row(
+                "SELECT language_scope, total_positive, wilson_lower
+                 FROM latest_review_snapshots WHERE app_id = 42",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(projected, ("english".to_owned(), 90, 0.80));
+
+        conn.execute(
+            "UPDATE review_snapshots
+             SET total_positive = 91, wilson_lower = 0.81
+             WHERE app_id = 42 AND language_scope = 'english' AND captured_at_ms = 20",
+            [],
+        )
+        .unwrap();
+        let updated: (i64, f64) = conn
+            .query_row(
+                "SELECT total_positive, wilson_lower
+                 FROM latest_review_snapshots WHERE app_id = 42",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(updated, (91, 0.81));
+
+        conn.execute(
+            "DELETE FROM review_snapshots
+             WHERE app_id = 42 AND language_scope = 'english' AND captured_at_ms = 20",
+            [],
+        )
+        .unwrap();
+        let fallback: (String, i64, f64) = conn
+            .query_row(
+                "SELECT language_scope, total_positive, wilson_lower
+                 FROM latest_review_snapshots WHERE app_id = 42",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(fallback, ("schinese".to_owned(), 95, 0.85));
     }
 }
