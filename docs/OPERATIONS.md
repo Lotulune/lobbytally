@@ -110,6 +110,8 @@ mpgs-dbtool embed-documents <db>
 
 `collect-steam-catalog` 只读取服务端环境中的 `MPGS_STEAM_WEB_API_KEY`，密钥不得作为命令参数、写入 SQLite 或进入客户端包。服务端以 5 分钟的默认检查频率观察三类独立到期时间：目录同步 15 分钟、候选发现 6 小时、富化 5 分钟。候选发现同时刷新近期发售与 `comingsoon` 通道；候选池未达目标时，每个通道默认推进 10 页，可用 `MPGS_CANDIDATE_WORKER_PAGES` 在 `1..100` 内覆盖。候选池达标后，环境变量不再放大稳态扫描，每个通道刷新首页并最多推进 1 个续页。每类任务在同类 `pending` 或 `leased` 作业存在时不会再入队，因此慢目录同步不会积压并抢占候选/富化。使用同一数据库文件的主机必须周期执行 `run-steam-worker-once`。worker 以 SQLite 租约防止重复领取，并把成功时间、下次运行、错误类别、游标和覆盖率回写到 `/admin/v1/data-status`。`enrich-steam-app` 是运营点名 AppID 的受控强制商店入库路径。不要通过网络文件系统运行该 worker；远程部署需要走受控 ingestion API。默认商店区域 `CN/schinese`。富化会优先补齐影响日历的商店详情，再同步全语言评价汇总、简体中文热门评价前 10 条与 CCU；`MPGS_ENRICH_STORE_ONLY` / `MPGS_ENRICH_SKIP_*` 在 CLI 与后台 worker 中语义一致。采集需遵守限流与 [SOURCES.md](SOURCES.md)。
 
+日历接口的 `upcoming` 状态默认只查询今天至未来 60 天；`recent` 仍查询过去 180 天至今天。需要更大窗口时必须显式传入 `from` / `to`，避免前端或缓存配置把日历默认范围扩大到 180 天。
+
 `m7-data-audit` 是 DATA-206 的发布前命令，默认严格验证：至少 2,000 个规范化候选、300 个可信熟人联机画像、四个分区各 20 个候选、日期与封面各 95% 覆盖，以及 300 个重点画像各自连续 7 天的评价和 CCU 数据。它使用当前算法配置及与公开 feed 相同的分区资格规则，失败会返回非零退出码。若 Steam 当前新游确实不足 20 个，只能显式记录原因后运行：
 
 ```powershell
