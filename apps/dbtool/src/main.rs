@@ -191,8 +191,6 @@ struct StoreSearchCursor {
 struct CandidateCollectionPlan {
     /// At/above the minimum target, process at most one continuation page.
     refresh_mode: bool,
-    /// Also refresh page zero without disturbing the continuation cursor.
-    refresh_top: bool,
     continuation_start: u32,
 }
 
@@ -207,7 +205,6 @@ fn candidate_collection_plan(
     let refresh_mode = candidate_count >= i64::from(target);
     CandidateCollectionPlan {
         refresh_mode,
-        refresh_top: refresh_mode && continuation_start > 0,
         continuation_start,
     }
 }
@@ -300,6 +297,7 @@ fn run() -> Result<(), String> {
             println!("ready=ok");
             Ok(())
         }
+        "feature-evidence-retention" => run_feature_evidence_retention(args),
         "recover-steam-leases" => {
             let db_path = required_path(args.next(), "--db path")?;
             if args.next().is_some() {
@@ -1049,21 +1047,14 @@ fn worker_retry_delay_ms(attempts: i64) -> i64 {
     WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent)
 }
 
-fn current_coverage_ratio(repo: &Repository) -> StorageResult<Option<f64>> {
-    let coverage = repo.m3_catalog_coverage()?;
-    Ok(Some(if coverage.normalized_multiplayer_candidates > 0 {
-        (coverage.recommendation_ready_profiles as f64
-            / coverage.normalized_multiplayer_candidates as f64)
-            .clamp(0.0, 1.0)
-    } else {
-        0.0
-    }))
-}
-
 fn worker_task_status(task_type: &str) -> Option<(&'static str, &'static str)> {
     match task_type {
         "sync_catalog" => Some(("catalog_sync", APP_LIST_CURSOR_KEY)),
-        "collect_candidates" => Some(("candidate_collection", STORE_SEARCH_STATUS_CURSOR_KEY)),
+        "collect_candidates" => Some(("candidate_continuation", STORE_SEARCH_STATUS_CURSOR_KEY)),
+        "collect_candidate_top" => Some(("candidate_top_refresh", STORE_SEARCH_STATUS_CURSOR_KEY)),
+        "collect_candidate_continuation" => {
+            Some(("candidate_continuation", STORE_SEARCH_STATUS_CURSOR_KEY))
+        }
         "enrich_catalog" => Some(("enrichment", ENRICH_CURSOR_KEY)),
         _ => None,
     }
@@ -1093,7 +1084,7 @@ fn record_worker_refresh(
         previous.as_ref().and_then(|status| status.next_run_at_ms),
         error_category,
         cursor.as_deref(),
-        current_coverage_ratio(repo)?,
+        None,
     )
 }
 
@@ -1160,6 +1151,8 @@ fn run_steam_worker_once(
                 )),
             },
             "collect_candidates" => run_candidate_worker_task(repo),
+            "collect_candidate_top" => run_candidate_top_worker_task(repo),
+            "collect_candidate_continuation" => run_candidate_worker_task(repo),
             "enrich_catalog" => run_enrichment_worker_task(repo, enrich_limit),
             _ => Err(worker_task_error(
                 "invalid_payload",
@@ -1179,6 +1172,14 @@ fn run_steam_worker_once(
                     eprintln!(
                         "warn job_id={} task_type={} status_refresh={}",
                         job.job_id, job.task_type, failure.message
+                    );
+                }
+                if let Err(failure) =
+                    storage_write_with_retry(|| repo.refresh_pipeline_status_snapshot())
+                {
+                    eprintln!(
+                        "warn job_id={} snapshot_refresh={}",
+                        job.job_id, failure.message
                     );
                 }
                 stats.completed = stats.completed.saturating_add(1);
@@ -1208,6 +1209,14 @@ fn run_steam_worker_once(
                     stats.dead = stats.dead.saturating_add(1);
                 } else {
                     stats.retried = stats.retried.saturating_add(1);
+                }
+                if let Err(snapshot_failure) =
+                    storage_write_with_retry(|| repo.refresh_pipeline_status_snapshot())
+                {
+                    eprintln!(
+                        "warn job_id={} snapshot_refresh={}",
+                        job.job_id, snapshot_failure.message
+                    );
                 }
                 eprintln!(
                     "warn job_id={} task_type={} category={}",
@@ -1284,6 +1293,47 @@ fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
                 stats.success_count,
                 None,
                 Some("target reached or bounded refresh completed"),
+            )
+        }),
+        Err(failure) => {
+            let status = if failure.stats.success_count > 0 {
+                "partial"
+            } else {
+                "failed"
+            };
+            let _ = worker_storage_with_retry(|| {
+                repo.finish_source_run(
+                    run_id,
+                    status,
+                    failure.stats.request_count,
+                    failure.stats.success_count,
+                    Some(failure.category),
+                    Some(&failure.message),
+                )
+            });
+            Err(worker_task_error(failure.category, failure.message))
+        }
+    }
+}
+
+fn run_candidate_top_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
+    let run_id = worker_storage_with_retry(|| {
+        repo.start_source_run(
+            STORE_SEARCH_SOURCE_NAME,
+            "candidate_top_refresh",
+            STORE_SEARCH_ADAPTER_VERSION,
+            Some("worker=true;pages=top;channels=released_desc,comingsoon_released_asc"),
+        )
+    })?;
+    match collect_steam_candidate_top_pages(repo) {
+        Ok(stats) => worker_storage_with_retry(|| {
+            repo.finish_source_run(
+                run_id,
+                "succeeded",
+                stats.request_count,
+                stats.success_count,
+                None,
+                Some("top pages refreshed"),
             )
         }),
         Err(failure) => {
@@ -1874,6 +1924,32 @@ fn collect_steam_candidates(
     Ok(stats)
 }
 
+fn collect_steam_candidate_top_pages(
+    repo: &Repository,
+) -> Result<CollectionStats, CollectionError> {
+    let client = store_search_client()?;
+    let mut stats = CollectionStats::default();
+    for sort in [StoreSearchSort::ReleasedDesc, StoreSearchSort::ReleasedAsc] {
+        let request =
+            StoreSearchRequest::with_sort(0, 100, sort).map_err(|error| CollectionError {
+                category: source_error_category(&error),
+                message: error.to_string(),
+                stats,
+            })?;
+        let page = fetch_store_search_page_with_retry(&client, &request, &mut stats)?;
+        let current = ingest_candidate_page(repo, &page, &mut stats)?;
+        println!(
+            "progress candidates={current} page_start={} rows={} refresh=top sort={}",
+            page.start,
+            page.result_count,
+            sort.as_query_value()
+        );
+        thread::sleep(Duration::from_millis(1_100));
+    }
+    save_candidate_status_cursor(repo, stats)?;
+    Ok(stats)
+}
+
 fn required_app_id(arg: Option<String>) -> Result<u32, String> {
     let value = arg.ok_or_else(|| "missing Steam app-id".to_owned())?;
     let app_id = value
@@ -1907,8 +1983,8 @@ fn collect_released_steam_candidates(
 ) -> Result<CollectionStats, CollectionError> {
     let client = store_search_client()?;
     let mut stats = CollectionStats::default();
-    let coverage = repo
-        .m3_catalog_coverage()
+    let candidate_count = repo
+        .multiplayer_candidate_count()
         .map_err(|error| CollectionError {
             category: "storage",
             message: error.to_string(),
@@ -1930,44 +2006,22 @@ fn collect_released_steam_candidates(
         })?;
     // Once the minimum coverage target is met, keep discovery fresh without
     // turning a scheduled job into an unbounded full-catalog crawl.
-    let plan = candidate_collection_plan(
-        coverage.normalized_multiplayer_candidates,
-        target,
-        stored_cursor.as_ref(),
-    );
+    let plan = candidate_collection_plan(candidate_count, target, stored_cursor.as_ref());
     let refresh_mode = plan.refresh_mode;
     let continuation_page_budget = candidate_continuation_page_budget(refresh_mode, page_budget);
     let mut start = plan.continuation_start;
     let mut continuation_pages = 0_u32;
 
-    // Refresh the volatile top-ranked page every scheduled pass while retaining
-    // the durable continuation cursor. This catches newly popular games quickly
-    // and still advances a bounded continuation batch each run.
-    if plan.refresh_top {
-        let request = StoreSearchRequest::new(0, 100).map_err(|error| CollectionError {
-            category: source_error_category(&error),
-            message: error.to_string(),
-            stats,
-        })?;
-        let page = fetch_store_search_page_with_retry(&client, &request, &mut stats)?;
-        let current = ingest_candidate_page(repo, &page, &mut stats)?;
-        println!(
-            "progress candidates={current} target={target} page_start={} rows={} refresh=top",
-            page.start, page.result_count
-        );
-        thread::sleep(Duration::from_millis(1_100));
-    }
-
     loop {
         if !refresh_mode {
             let current = repo
-                .m3_catalog_coverage()
+                .multiplayer_candidate_count()
                 .map_err(|error| CollectionError {
                     category: "storage",
                     message: error.to_string(),
                     stats,
                 })?;
-            if current.normalized_multiplayer_candidates >= i64::from(target) {
+            if current >= i64::from(target) {
                 return Ok(stats);
             }
         }
@@ -2053,38 +2107,19 @@ fn collect_upcoming_steam_candidates(
             message: format!("invalid stored upcoming cursor: {error}"),
             stats,
         })?;
-    let coverage = repo
-        .m3_catalog_coverage()
+    let candidate_count = repo
+        .multiplayer_candidate_count()
         .map_err(|error| CollectionError {
             category: "storage",
             message: error.to_string(),
             stats,
         })?;
-    let refresh_mode = coverage.normalized_multiplayer_candidates >= i64::from(target);
+    let refresh_mode = candidate_count >= i64::from(target);
     let continuation_page_budget = candidate_continuation_page_budget(refresh_mode, page_budget);
     let mut start = stored_cursor
         .as_ref()
         .filter(|cursor| !cursor.complete)
         .map_or(0, |cursor| cursor.next_start);
-
-    // A complete window is intentionally restarted so changed dates and newly
-    // listed upcoming games are refreshed without waiting for a manual script.
-    if start > 0 {
-        let request = StoreSearchRequest::with_sort(0, 100, StoreSearchSort::ReleasedAsc).map_err(
-            |error| CollectionError {
-                category: source_error_category(&error),
-                message: error.to_string(),
-                stats,
-            },
-        )?;
-        let page = fetch_store_search_page_with_retry(&client, &request, &mut stats)?;
-        let current = ingest_candidate_page(repo, &page, &mut stats)?;
-        println!(
-            "progress candidates={current} channel=upcoming page_start={} rows={} refresh=top",
-            page.start, page.result_count
-        );
-        thread::sleep(Duration::from_millis(1_100));
-    }
 
     for page_index in 0..continuation_page_budget {
         let request = StoreSearchRequest::with_sort(start, 100, StoreSearchSort::ReleasedAsc)
@@ -2194,8 +2229,7 @@ fn ingest_candidate_page(
                 stats: *stats,
             })?;
     stats.success_count = stats.success_count.saturating_add(ingested as i64);
-    repo.m3_catalog_coverage()
-        .map(|coverage| coverage.normalized_multiplayer_candidates)
+    repo.multiplayer_candidate_count()
         .map_err(|error| CollectionError {
             category: "storage",
             message: error.to_string(),
@@ -2923,6 +2957,7 @@ fn usage() -> &'static str {
        recommendation-audit <db-path> --as-of YYYY-MM-DD [--user-id ID] [--top N] [--strict] [--json]\n\
        migrate <db-path>\n\
        integrity <db-path>\n\
+       feature-evidence-retention <db-path> [retention-ms] [--apply --confirm --backup path]\n\
        recover-steam-leases <db-path>\n\
        m3-audit <db-path>\n\
        m7-data-audit <db-path> [--allow-upcoming-shortfall=<reason>]\n\
@@ -2946,9 +2981,100 @@ fn usage() -> &'static str {
        MPGS_STEAM_LANGUAGE (default schinese)\n"
 }
 
+fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut args = args.peekable();
+    let db_path = required_path(args.next(), "--db path")?;
+    let retention_ms = if args.peek().is_some_and(|value| !value.starts_with("--")) {
+        args.next()
+            .expect("peeked retention value")
+            .parse::<i64>()
+            .map_err(|_| "retention-ms must be an integer".to_owned())?
+    } else {
+        2_592_000_000
+    };
+    if retention_ms <= 0 {
+        return Err("retention-ms must be positive".into());
+    }
+    let mut apply = false;
+    let mut confirm = false;
+    let mut backup_path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--apply" => apply = true,
+            "--confirm" => confirm = true,
+            "--backup" => backup_path = Some(required_path(args.next(), "--backup path")?),
+            _ => return Err(format!("unknown feature-evidence-retention option: {arg}")),
+        }
+    }
+    let db = Database::open(&db_path).map_err(err)?;
+    db.assert_ready().map_err(err)?;
+    let cutoff = db.now_ms().saturating_sub(retention_ms);
+    let (rows, bytes) = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(value_json) + length(source_ref)), 0)
+                 FROM feature_evidence WHERE is_active = 0 AND observed_at_ms < ?1",
+                [cutoff],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(Into::into)
+        })
+        .map_err(err)?;
+    println!("path={}", db_path.display());
+    println!("cutoff_ms={cutoff}");
+    println!("inactive_rows={rows}");
+    println!("estimated_payload_bytes={bytes}");
+    if !apply {
+        println!("dry_run=true");
+        return Ok(());
+    }
+    if !confirm {
+        return Err("--apply requires --confirm".into());
+    }
+    let backup = backup_path.ok_or_else(|| "--apply requires --backup path".to_owned())?;
+    if !backup.is_file() {
+        return Err(format!("backup path does not exist: {}", backup.display()));
+    }
+    let deleted = db
+        .with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            let deleted = tx.execute(
+                "DELETE FROM feature_evidence
+                 WHERE evidence_id IN (
+                   SELECT evidence_id FROM feature_evidence
+                   WHERE is_active = 0 AND observed_at_ms < ?1
+                   ORDER BY evidence_id LIMIT 100000
+                 )",
+                [cutoff],
+            )?;
+            tx.commit()?;
+            Ok(deleted)
+        })
+        .map_err(err)?;
+    println!("deleted_rows={deleted}");
+    println!("compact=false");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_retention_defaults_to_dry_run_and_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retention.db");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        drop(db);
+
+        run_feature_evidence_retention([path.display().to_string()].into_iter()).unwrap();
+        let error = run_feature_evidence_retention(
+            [path.display().to_string(), "--apply".to_owned()].into_iter(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "--apply requires --confirm");
+    }
 
     #[test]
     fn enrichment_retry_uses_a_long_rate_limit_cooldown() {
@@ -3010,7 +3136,6 @@ mod tests {
             refresh,
             CandidateCollectionPlan {
                 refresh_mode: true,
-                refresh_top: true,
                 continuation_start: 2_100,
             }
         );
@@ -3041,7 +3166,6 @@ mod tests {
             restart,
             CandidateCollectionPlan {
                 refresh_mode: true,
-                refresh_top: false,
                 continuation_start: 0,
             }
         );
@@ -3052,7 +3176,6 @@ mod tests {
             Some(&in_progress),
         );
         assert!(!bootstrap.refresh_mode);
-        assert!(!bootstrap.refresh_top);
         assert_eq!(bootstrap.continuation_start, 2_100);
         assert_eq!(
             candidate_continuation_page_budget(

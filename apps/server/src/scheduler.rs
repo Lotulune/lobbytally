@@ -11,9 +11,11 @@ use tracing::{info, warn};
 
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 const DEFAULT_CATALOG_SYNC_INTERVAL_SECS: u64 = 15 * 60;
-const DEFAULT_CANDIDATE_COLLECTION_INTERVAL_SECS: u64 = 6 * 60 * 60;
+const DEFAULT_CANDIDATE_TOP_REFRESH_INTERVAL_SECS: u64 = 15 * 60;
+const DEFAULT_CANDIDATE_CONTINUATION_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_ENRICHMENT_INTERVAL_SECS: u64 = 5 * 60;
 const RECOMMENDATION_TELEMETRY_RETENTION_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const PIPELINE_SNAPSHOT_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_RETRIEVAL_SYNC_BATCH_SIZE: u32 = 20;
 const RETRIEVAL_SYNC_BATCH_SIZE_MIN: u32 = 10;
 const RETRIEVAL_SYNC_BATCH_SIZE_MAX: u32 = 10_000;
@@ -24,7 +26,8 @@ const TELEMETRY_RETENTION_TASK: &str = "recommendation_telemetry_retention";
 #[derive(Clone, Copy)]
 struct TaskIntervals {
     catalog_sync_secs: u64,
-    candidate_collection_secs: u64,
+    candidate_top_refresh_secs: u64,
+    candidate_continuation_secs: u64,
     enrichment_secs: u64,
 }
 
@@ -36,9 +39,14 @@ impl TaskIntervals {
                 DEFAULT_CATALOG_SYNC_INTERVAL_SECS,
                 TASK_INTERVAL_MIN_SECS,
             ),
-            candidate_collection_secs: configured_interval(
-                "MPGS_CANDIDATE_COLLECTION_INTERVAL_SECS",
-                DEFAULT_CANDIDATE_COLLECTION_INTERVAL_SECS,
+            candidate_top_refresh_secs: configured_interval(
+                "MPGS_CANDIDATE_TOP_REFRESH_INTERVAL_SECS",
+                DEFAULT_CANDIDATE_TOP_REFRESH_INTERVAL_SECS,
+                TASK_INTERVAL_MIN_SECS,
+            ),
+            candidate_continuation_secs: configured_interval(
+                "MPGS_CANDIDATE_CONTINUATION_INTERVAL_SECS",
+                DEFAULT_CANDIDATE_CONTINUATION_INTERVAL_SECS,
                 TASK_INTERVAL_MIN_SECS,
             ),
             enrichment_secs: configured_interval(
@@ -54,7 +62,8 @@ impl Default for TaskIntervals {
     fn default() -> Self {
         Self {
             catalog_sync_secs: DEFAULT_CATALOG_SYNC_INTERVAL_SECS,
-            candidate_collection_secs: DEFAULT_CANDIDATE_COLLECTION_INTERVAL_SECS,
+            candidate_top_refresh_secs: DEFAULT_CANDIDATE_TOP_REFRESH_INTERVAL_SECS,
+            candidate_continuation_secs: DEFAULT_CANDIDATE_CONTINUATION_INTERVAL_SECS,
             enrichment_secs: DEFAULT_ENRICHMENT_INTERVAL_SECS,
         }
     }
@@ -134,29 +143,25 @@ fn run_once_with_schedule(
     let now_ms = repo.database().now_ms();
     let interval_ms = (interval_secs as i64).saturating_mul(1_000);
     let next_run_at_ms = now_ms.saturating_add(interval_ms);
-    let coverage = repo.m3_catalog_coverage()?;
-    let coverage_ratio = if coverage.normalized_multiplayer_candidates > 0 {
-        Some(
-            (coverage.recommendation_ready_profiles as f64
-                / coverage.normalized_multiplayer_candidates as f64)
-                .clamp(0.0, 1.0),
-        )
-    } else {
-        Some(0.0)
-    };
     let previous_status = repo.data_refresh_status()?;
 
     // Local FTS/hash maintenance is derived data and must not compete with a
     // pending or leased Steam ingestion job for SQLite's single writer. Run it
     // before enqueueing this tick's Steam work only when the prior queue is
     // empty; the worker will see newly queued work after this bounded batch.
-    let steam_work_active = ["sync_catalog", "collect_candidates", "enrich_catalog"]
-        .into_iter()
-        .try_fold(false, |active, task_type| {
-            Ok::<_, mpgs_storage::StorageError>(
-                active || repo.has_active_job("steam", task_type, "scheduled")?,
-            )
-        })?;
+    let steam_work_active = [
+        "sync_catalog",
+        "collect_candidates",
+        "collect_candidate_top",
+        "collect_candidate_continuation",
+        "enrich_catalog",
+    ]
+    .into_iter()
+    .try_fold(false, |active, task_type| {
+        Ok::<_, mpgs_storage::StorageError>(
+            active || repo.has_active_job("steam", task_type, "scheduled")?,
+        )
+    })?;
 
     // Telemetry retention is an independent, daily housekeeping task. Keep it
     // on cadence even when ingestion work is queued; only the heavier derived
@@ -167,13 +172,7 @@ fn run_once_with_schedule(
     run_recommendation_telemetry_retention(repo, telemetry_previous, now_ms, next_run_at_ms)?;
 
     if !steam_work_active {
-        run_local_maintenance(
-            repo,
-            &previous_status,
-            coverage_ratio,
-            now_ms,
-            next_run_at_ms,
-        )?;
+        run_local_maintenance(repo, &previous_status, None, now_ms, next_run_at_ms)?;
     } else {
         info!("local data maintenance deferred while Steam ingestion is active");
     }
@@ -192,9 +191,15 @@ fn run_once_with_schedule(
             catalog_sync_enabled,
         ),
         (
-            "candidate_collection",
-            "collect_candidates",
-            task_intervals.candidate_collection_secs,
+            "candidate_top_refresh",
+            "collect_candidate_top",
+            task_intervals.candidate_top_refresh_secs,
+            true,
+        ),
+        (
+            "candidate_continuation",
+            "collect_candidate_continuation",
+            task_intervals.candidate_continuation_secs,
             true,
         ),
         (
@@ -216,7 +221,7 @@ fn run_once_with_schedule(
                 previous,
                 task_next_run_at_ms,
                 Some("auth"),
-                coverage_ratio,
+                None,
             )?;
             continue;
         }
@@ -237,14 +242,7 @@ fn run_once_with_schedule(
             payload_json: None,
             max_attempts: 3,
         })?;
-        update_scheduled_status(
-            repo,
-            task_name,
-            previous,
-            task_next_run_at_ms,
-            None,
-            coverage_ratio,
-        )?;
+        update_scheduled_status(repo, task_name, previous, task_next_run_at_ms, None, None)?;
     }
 
     Ok(())
@@ -257,6 +255,38 @@ fn run_local_maintenance(
     now_ms: i64,
     next_run_at_ms: i64,
 ) -> mpgs_storage::StorageResult<()> {
+    let snapshot_previous = previous_status
+        .iter()
+        .find(|status| status.task_name == "pipeline_snapshot");
+    let snapshot_due = snapshot_previous
+        .and_then(|status| status.next_run_at_ms)
+        .is_none_or(|due_at_ms| due_at_ms <= now_ms);
+    if snapshot_due {
+        let snapshot_next_at_ms =
+            now_ms.saturating_add((PIPELINE_SNAPSHOT_INTERVAL_SECS as i64).saturating_mul(1_000));
+        match repo.refresh_pipeline_status_snapshot_full() {
+            Ok(_) => repo.update_data_refresh_status(
+                "pipeline_snapshot",
+                Some(now_ms),
+                Some(snapshot_next_at_ms),
+                None,
+                None,
+                None,
+            )?,
+            Err(error) => {
+                repo.update_data_refresh_status(
+                    "pipeline_snapshot",
+                    snapshot_previous.and_then(|status| status.last_success_at_ms),
+                    Some(next_run_at_ms),
+                    Some("pipeline_snapshot_failed"),
+                    None,
+                    None,
+                )?;
+                return Err(error);
+            }
+        }
+    }
+
     let quality_previous = previous_status
         .iter()
         .find(|status| status.task_name == "quality_check");
@@ -497,7 +527,7 @@ mod tests {
         assert!(quality.last_success_at_ms.is_some());
         let collection = status
             .iter()
-            .find(|item| item.task_name == "candidate_collection")
+            .find(|item| item.task_name == "candidate_top_refresh")
             .unwrap();
         assert!(collection.last_success_at_ms.is_none());
         assert!(collection.last_error_category.is_none());
@@ -516,7 +546,7 @@ mod tests {
         repo.ensure_runtime_defaults().unwrap();
         repo.seed_demo_if_empty().unwrap();
         repo.update_data_refresh_status(
-            "candidate_collection",
+            "candidate_top_refresh",
             Some(123),
             None,
             None,
@@ -530,7 +560,7 @@ mod tests {
         let status = repo.data_refresh_status().unwrap();
         let collection = status
             .iter()
-            .find(|item| item.task_name == "candidate_collection")
+            .find(|item| item.task_name == "candidate_top_refresh")
             .unwrap();
         assert_eq!(collection.last_success_at_ms, Some(123));
         assert_eq!(collection.cursor_value.as_deref(), Some("cursor"));
@@ -548,18 +578,34 @@ mod tests {
         repo.seed_demo_if_empty().unwrap();
         let task_intervals = TaskIntervals {
             catalog_sync_secs: 60,
-            candidate_collection_secs: 600,
+            candidate_top_refresh_secs: 600,
+            candidate_continuation_secs: 3_600,
             enrichment_secs: 60,
         };
 
         run_once_with_schedule(&repo, 30, false, task_intervals).unwrap();
         assert!(
-            repo.has_active_job("steam", "collect_candidates", "scheduled")
+            repo.has_active_job("steam", "collect_candidate_top", "scheduled")
                 .unwrap()
         );
         assert!(
             repo.has_active_job("steam", "enrich_catalog", "scheduled")
                 .unwrap()
+        );
+        let status = repo.data_refresh_status().unwrap();
+        assert_eq!(
+            status
+                .iter()
+                .find(|item| item.task_name == "candidate_top_refresh")
+                .and_then(|item| item.next_run_at_ms),
+            Some(600_000)
+        );
+        assert_eq!(
+            status
+                .iter()
+                .find(|item| item.task_name == "candidate_continuation")
+                .and_then(|item| item.next_run_at_ms),
+            Some(3_600_000)
         );
 
         clock.advance_ms(60_000);
@@ -577,14 +623,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            scheduled_jobs, 2,
+            scheduled_jobs, 3,
             "due tasks must not accumulate while active"
         );
 
         let jobs = repo
             .lease_jobs("test-worker", 10, 60_000, Some("steam"))
             .unwrap();
-        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs.len(), 3);
         for job in jobs {
             repo.complete_job(job.job_id, "test-worker", &format!("done-{}", job.job_id))
                 .unwrap();
@@ -597,7 +643,7 @@ mod tests {
         );
         assert!(
             !repo
-                .has_active_job("steam", "collect_candidates", "scheduled")
+                .has_active_job("steam", "collect_candidate_top", "scheduled")
                 .unwrap(),
             "candidate collection waits for its longer interval"
         );
@@ -611,7 +657,11 @@ mod tests {
         repo.migrate().unwrap();
         repo.ensure_runtime_defaults().unwrap();
         repo.seed_demo_if_empty().unwrap();
-        for task_name in ["candidate_collection", "enrichment"] {
+        for task_name in [
+            "candidate_top_refresh",
+            "candidate_continuation",
+            "enrichment",
+        ] {
             repo.update_data_refresh_status(task_name, None, Some(60_000), None, None, None)
                 .unwrap();
         }

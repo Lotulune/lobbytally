@@ -50,12 +50,18 @@ function taskLabel(name: string): string {
       return "扫全库名单";
     case "candidate_collection":
       return "找联机游戏";
+    case "candidate_top_refresh":
+      return "刷新新游顶页";
+    case "candidate_continuation":
+      return "推进候选深游标";
     case "enrichment":
       return "补发售日与详情";
     case "quality_check":
       return "质量自检";
     case "retrieval_sync":
       return "更新搜索索引";
+    case "pipeline_snapshot":
+      return "完整覆盖率快照";
     case "recommendation_telemetry_retention":
       return "清理旧日志";
     default:
@@ -166,7 +172,9 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
   const inv = status?.inventory;
   const m7 = status?.m7_coverage;
   const cov = status?.coverage;
+  const dimensions = status?.dimension_coverage;
   const tasks = status?.tasks ?? [];
+  const latestRuns = status?.latest_runs ?? [];
   const pool = inv?.multiplayer_profiles ?? 0;
 
   const sectionBars = useMemo(() => {
@@ -296,26 +304,27 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
             <Stat
               label="排队任务"
               value={inv.jobs_pending + inv.jobs_leased}
-              hint={inv.jobs_dead > 0 ? `失败堆积 ${inv.jobs_dead}` : "待处理 + 进行中"}
-              tone={inv.jobs_dead > 500 ? "warn" : undefined}
+              hint={
+                inv.jobs_dead_recent > 0
+                  ? `近 7 天失败 ${inv.jobs_dead_recent} · 历史 ${inv.jobs_dead}`
+                  : `近 7 天无失败 · 历史 ${inv.jobs_dead}`
+              }
+              tone={inv.jobs_dead_recent > 0 ? "warn" : undefined}
             />
           </div>
 
           <Panel title="资料完整度">
             <div className="bar-list">
-              <Bar name="有玩家评价" value={cov?.with_reviews ?? 0} max={pool} />
-              <Bar name="有在线人数" value={cov?.with_ccu ?? 0} max={pool} />
-              <Bar name="有价格" value={cov?.with_price ?? 0} max={pool} />
-              <Bar name="有平台信息" value={cov?.with_platforms ?? 0} max={pool} />
-              <Bar name="有语言信息" value={cov?.with_languages ?? 0} max={pool} />
+              <Bar name="商店详情" value={dimensions?.store_details ?? 0} max={pool} />
+              <Bar name="有发售日" value={dimensions?.release_date ?? 0} max={pool} />
+              <Bar name="有玩家评价" value={dimensions?.reviews ?? 0} max={pool} />
+              <Bar name="有在线人数" value={dimensions?.ccu ?? 0} max={pool} />
+              <Bar name="有价格" value={dimensions?.price ?? 0} max={pool} />
+              <Bar name="有语言信息" value={dimensions?.languages ?? 0} max={pool} />
+              <Bar name="已建检索索引" value={dimensions?.retrieval_index ?? 0} max={pool} />
               <Bar
                 name="可以正常推荐"
                 value={cov?.recommendation_ready_profiles ?? 0}
-                max={pool}
-              />
-              <Bar
-                name="有发售日"
-                value={m7?.candidates_with_date ?? 0}
                 max={pool}
               />
               <Bar name="有封面图" value={m7?.candidates_with_cover ?? 0} max={pool} />
@@ -342,6 +351,12 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
           <Panel title="后台任务">
             <div className="task-list">
               {tasks.map((task) => {
+                const run = latestRuns.find((item) => {
+                  if (task.task_name === "candidate_continuation") {
+                    return item.task_type === "candidate_discovery";
+                  }
+                  return item.task_type === task.task_name;
+                });
                 const p =
                   task.coverage_ratio == null
                     ? 0
@@ -353,7 +368,12 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
                   <div className="task-card" key={task.task_name}>
                     <div className="task-top">
                       <span className="title">{taskLabel(task.task_name)}</span>
-                      <span className="when">{taskStatusLine(task)}</span>
+                      <span className="when">
+                        {taskStatusLine(task)}
+                        {run
+                          ? ` · 最近批次处理 ${run.success_count} · 请求 ${run.request_count}`
+                          : ""}
+                      </span>
                     </div>
                     <div className="bar-track" aria-hidden="true">
                       <div

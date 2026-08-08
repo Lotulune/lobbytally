@@ -1307,6 +1307,22 @@ fn store_search_candidates_are_auditable_without_fabricated_profiles() {
     assert_eq!(coverage.category_evidence_candidates, 2);
     assert_eq!(coverage.recommendation_ready_profiles, 0);
     assert_eq!(coverage.trusted_familiar_profiles, 0);
+    let evidence_rows = || {
+        repo.database()
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM feature_evidence
+                     WHERE source_type = 'store_search_category'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap()
+    };
+    let first_evidence_rows = evidence_rows();
+    assert_eq!(repo.ingest_store_search_page(&page).unwrap(), 2);
+    assert_eq!(evidence_rows(), first_evidence_rows);
 
     repo.ingest_multiplayer_bool(548430, "online_coop", true, "verified_test", "fixture", 0.8)
         .unwrap();
@@ -1349,6 +1365,49 @@ fn store_search_candidates_are_auditable_without_fabricated_profiles() {
         .unwrap();
     assert_eq!(rotated[0].app_id, 632360);
     assert_eq!(rotated[1].app_id, 548430);
+}
+
+#[test]
+fn unchanged_evidence_is_idempotent_but_fact_changes_keep_history() {
+    let (repo, _) = repo_with_clock(5_000);
+    let insert = |value: serde_json::Value, at: i64| {
+        repo.database()
+            .with_conn_mut(|conn| {
+                crate::curation::insert_feature_evidence(
+                    conn,
+                    4242,
+                    "category_hint",
+                    &value,
+                    "store_search_category",
+                    "page-hash-changed",
+                    0.3,
+                    at,
+                )
+            })
+            .unwrap()
+    };
+    let first = insert(serde_json::json!({"category":"Multi-player"}), 5_000);
+    let same = insert(serde_json::json!({"category":"Multi-player"}), 6_000);
+    assert_eq!(first, same);
+    let changed = insert(
+        serde_json::json!({"category":"Multi-player","filter":"category2=1"}),
+        7_000,
+    );
+    assert_ne!(same, changed);
+    let rows: i64 = repo
+        .database()
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM feature_evidence
+                 WHERE app_id = 4242 AND feature_name = 'category_hint'
+                   AND source_type = 'store_search_category'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap();
+    assert_eq!(rows, 2);
 }
 
 #[test]
