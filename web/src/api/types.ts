@@ -32,6 +32,7 @@ export interface PipelineInventory {
   jobs_pending: number;
   jobs_leased: number;
   jobs_dead: number;
+  jobs_dead_recent: number;
 }
 
 export interface DataRefreshTaskStatus {
@@ -70,6 +71,25 @@ export interface DataStatusResponse {
     trusted_profiles_with_seven_day_reviews: number;
     trusted_profiles_with_seven_day_ccu: number;
   };
+  dimension_coverage: {
+    candidates: number;
+    store_details: number;
+    release_date: number;
+    reviews: number;
+    ccu: number;
+    price: number;
+    languages: number;
+    retrieval_index: number;
+  };
+  latest_runs: Array<{
+    task_type: string;
+    status: string;
+    started_at_ms: number;
+    finished_at_ms: number | null;
+    request_count: number;
+    success_count: number;
+    error_category: string | null;
+  }>;
   inventory?: PipelineInventory;
   generated_at_ms?: number;
   build_git_sha?: string;

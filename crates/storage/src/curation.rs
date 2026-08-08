@@ -270,8 +270,24 @@ pub fn insert_feature_evidence_with_document(
         ));
     }
     catalog::ensure_app_stub(conn, app_id, &format!("app-{app_id}"), now_ms)?;
-    // Deactivate previous active evidence for same feature/source_type pair is optional;
-    // keep history active markers simplified: deactivate older same feature from same source.
+    let value_json = serde_json::to_string(value_json)?;
+    let existing = conn
+        .query_row(
+            "SELECT evidence_id, value_json FROM feature_evidence
+             WHERE app_id = ?1 AND feature_name = ?2 AND source_type = ?3 AND is_active = 1
+             ORDER BY observed_at_ms DESC, evidence_id DESC
+             LIMIT 1",
+            params![app_id, feature_name, source_type],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    if let Some((evidence_id, active_value_json)) = existing
+        && active_value_json == value_json
+    {
+        return Ok(evidence_id);
+    }
+
+    // A changed fact creates one historical row and one new active row.
     conn.execute(
         "UPDATE feature_evidence SET is_active = 0
          WHERE app_id = ?1 AND feature_name = ?2 AND source_type = ?3 AND is_active = 1",
@@ -285,7 +301,7 @@ pub fn insert_feature_evidence_with_document(
         params![
             app_id,
             feature_name,
-            serde_json::to_string(value_json)?,
+            value_json,
             source_type,
             source_ref,
             source_document_id,

@@ -128,10 +128,12 @@ pub fn finish_run(
 pub fn ensure_data_refresh_tasks(conn: &Connection, now_ms: i64) -> StorageResult<()> {
     for task_name in [
         "catalog_sync",
-        "candidate_collection",
+        "candidate_top_refresh",
+        "candidate_continuation",
         "enrichment",
         "quality_check",
         "retrieval_sync",
+        "pipeline_snapshot",
     ] {
         conn.execute(
             "INSERT OR IGNORE INTO data_refresh_state (

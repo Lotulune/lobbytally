@@ -1273,6 +1273,16 @@ impl Repository {
         self.db.with_conn_mut(|conn| {
             crate::users::ensure_algorithm_config(conn, now)?;
             crate::source_state::ensure_data_refresh_tasks(conn, now)?;
+            let empty_snapshot = crate::models::PipelineStatusSnapshot {
+                generated_at_ms: now,
+                ..Default::default()
+            };
+            conn.execute(
+                "INSERT OR IGNORE INTO pipeline_status_snapshot (
+                    snapshot_id, generated_at_ms, snapshot_json
+                 ) VALUES (1, ?1, ?2)",
+                rusqlite::params![now, serde_json::to_string(&empty_snapshot)?],
+            )?;
             Ok(())
         })
     }
@@ -1380,6 +1390,12 @@ impl Repository {
                 [],
                 |row| row.get(0),
             )?;
+            let recent_cutoff_ms = now_ms.saturating_sub(7 * 24 * 60 * 60 * 1_000);
+            let jobs_dead_recent: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'dead' AND updated_at_ms >= ?1",
+                [recent_cutoff_ms],
+                |row| row.get(0),
+            )?;
             Ok(crate::models::PipelineInventory {
                 apps_total,
                 multiplayer_profiles,
@@ -1394,7 +1410,154 @@ impl Repository {
                 jobs_pending,
                 jobs_leased,
                 jobs_dead,
+                jobs_dead_recent,
             })
+        })
+    }
+
+    pub fn multiplayer_candidate_count(&self) -> StorageResult<i64> {
+        self.db.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM multiplayer_profiles", [], |row| {
+                row.get(0)
+            })
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn refresh_pipeline_status_snapshot(
+        &self,
+    ) -> StorageResult<crate::models::PipelineStatusSnapshot> {
+        let generated_at_ms = self.db.now_ms();
+        let inventory = self.pipeline_inventory()?;
+        let mut snapshot = self.pipeline_status_snapshot()?.unwrap_or_default();
+        let dimension_coverage = self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN COALESCE(v.platforms_json, '[]') <> '[]' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN a.release_date IS NOT NULL OR a.release_date_raw IS NOT NULL THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(EXISTS(SELECT 1 FROM latest_review_snapshots r WHERE r.app_id = p.app_id)), 0),
+                        COALESCE(SUM(EXISTS(SELECT 1 FROM player_snapshots c WHERE c.app_id = p.app_id AND c.player_count IS NOT NULL AND c.result_code = 1)), 0),
+                        COALESCE(SUM(EXISTS(SELECT 1 FROM price_snapshots price WHERE price.app_id = p.app_id AND price.final_price_minor IS NOT NULL)), 0),
+                        COALESCE(SUM(CASE WHEN COALESCE(v.languages_json, '[]') <> '[]' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(EXISTS(SELECT 1 FROM game_documents d WHERE d.app_id = p.app_id)), 0),
+                        COALESCE(SUM(CASE WHEN media.capsule_url IS NOT NULL AND TRIM(media.capsule_url) <> '' THEN 1 ELSE 0 END), 0)
+                 FROM multiplayer_profiles p
+                 JOIN apps a ON a.app_id = p.app_id
+                 LEFT JOIN app_availability v ON v.app_id = p.app_id
+                 LEFT JOIN app_media media ON media.app_id = p.app_id",
+                [],
+                |row| {
+                    Ok((
+                        crate::models::PipelineDimensionCoverage {
+                            candidates: row.get(0)?,
+                            store_details: row.get(1)?,
+                            release_date: row.get(2)?,
+                            reviews: row.get(3)?,
+                            ccu: row.get(4)?,
+                            price: row.get(5)?,
+                            languages: row.get(6)?,
+                            retrieval_index: row.get(7)?,
+                        },
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .map_err(Into::into)
+        })?;
+        let latest_runs = self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT task_type, status, started_at_ms, finished_at_ms,
+                        request_count, success_count, error_category
+                 FROM source_runs
+                 WHERE run_id IN (SELECT MAX(run_id) FROM source_runs GROUP BY task_type)
+                 ORDER BY task_type",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(crate::models::PipelineRunStatus {
+                    task_type: row.get(0)?,
+                    status: row.get(1)?,
+                    started_at_ms: row.get(2)?,
+                    finished_at_ms: row.get(3)?,
+                    request_count: row.get(4)?,
+                    success_count: row.get(5)?,
+                    error_category: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })?;
+        snapshot.generated_at_ms = generated_at_ms;
+        snapshot.inventory = inventory;
+        snapshot.dimension_coverage = dimension_coverage.0;
+        snapshot.coverage.normalized_multiplayer_candidates = dimension_coverage.0.candidates;
+        snapshot.coverage.with_platforms = dimension_coverage.0.store_details;
+        snapshot.coverage.with_languages = dimension_coverage.0.languages;
+        snapshot.coverage.with_price = dimension_coverage.0.price;
+        snapshot.coverage.with_reviews = dimension_coverage.0.reviews;
+        snapshot.coverage.with_ccu = dimension_coverage.0.ccu;
+        snapshot.m7_coverage.normalized_multiplayer_candidates = dimension_coverage.0.candidates;
+        snapshot.m7_coverage.candidates_with_date = dimension_coverage.0.release_date;
+        snapshot.m7_coverage.candidates_with_cover = dimension_coverage.1;
+        snapshot.latest_runs = latest_runs;
+        self.store_pipeline_status_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub fn refresh_pipeline_status_snapshot_full(
+        &self,
+    ) -> StorageResult<crate::models::PipelineStatusSnapshot> {
+        let mut snapshot = self.refresh_pipeline_status_snapshot()?;
+        snapshot.coverage = self.m3_catalog_coverage()?;
+        let active = self.active_algorithm_config()?;
+        snapshot.m7_coverage = self.m7_data_coverage(&active.config)?;
+        snapshot.dimension_coverage = crate::models::PipelineDimensionCoverage {
+            candidates: snapshot.coverage.normalized_multiplayer_candidates,
+            store_details: snapshot.coverage.with_platforms,
+            release_date: snapshot.m7_coverage.candidates_with_date,
+            reviews: snapshot.coverage.with_reviews,
+            ccu: snapshot.coverage.with_ccu,
+            price: snapshot.coverage.with_price,
+            languages: snapshot.coverage.with_languages,
+            retrieval_index: snapshot.dimension_coverage.retrieval_index,
+        };
+        self.store_pipeline_status_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn store_pipeline_status_snapshot(
+        &self,
+        snapshot: &crate::models::PipelineStatusSnapshot,
+    ) -> StorageResult<()> {
+        let snapshot_json = serde_json::to_string(&snapshot)?;
+        self.db.with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO pipeline_status_snapshot (snapshot_id, generated_at_ms, snapshot_json)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(snapshot_id) DO UPDATE SET
+                    generated_at_ms = excluded.generated_at_ms,
+                    snapshot_json = excluded.snapshot_json",
+                rusqlite::params![snapshot.generated_at_ms, snapshot_json],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn pipeline_status_snapshot(
+        &self,
+    ) -> StorageResult<Option<crate::models::PipelineStatusSnapshot>> {
+        use rusqlite::OptionalExtension;
+
+        self.db.with_conn(|conn| {
+            let json: Option<String> = conn
+                .query_row(
+                    "SELECT snapshot_json FROM pipeline_status_snapshot WHERE snapshot_id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            json.map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(Into::into)
         })
     }
 

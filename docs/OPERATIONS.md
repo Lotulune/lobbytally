@@ -144,6 +144,8 @@ MPGS_DEPLOY_MODE=full
 
 生产默认保留 `full` 以兼容现有站点。只面向桌面客户端的新安装建议使用 `backend`。切换模式后执行 `deploy/update.sh`；脚本会停止全部旧入口，只拉取并启动该模式所需服务，并在切到 `backend` 时显式移除旧 Web 容器。
 
+以下 Compose 构建命令仅用于开发机，不得在 `ora_proxy` 或其他生产 VPS 执行：
+
 ```bash
 cp deploy/mpgs.env.example deploy/mpgs.env
 mkdir -p deploy/runtime
@@ -153,7 +155,7 @@ docker compose -f deploy/docker-compose.yml exec mpgs-server \
   mpgs-dbtool integrity /var/lib/mpgs/mpgs.db
 ```
 
-直接使用 Compose 开发构建时，可显式选择服务：
+开发机直接使用 Compose 构建时，可显式选择服务：
 
 ```bash
 # 后端，不启动 mpgs-web
@@ -167,7 +169,8 @@ curl http://127.0.0.1:18082/.well-known/mpgs
 
 迁移已有数据库时，先使用 `mpgs-dbtool backup <source> <backup>` 生成一致性副本，再把副本放到 `deploy/runtime/mpgs.db`。worker 默认每 60 秒领取一个任务；单轮富化默认 20 个 App，以免 30 分钟租约在串行任务中失效。没有 `MPGS_STEAM_WEB_API_KEY` 时官方 AppList 同步保持禁用，但候选发现、商店详情、评价和 CCU 富化仍会执行。连续 7 天采集完成前，`m7-data-audit` 返回失败属于预期状态。
 
-正式 VPS 不应在宿主机编译 Rust。CI 的 Web、Rust quality 与 Linux package
+`ora_proxy` 严禁编译 Rust、Node、Docker 镜像或执行上述 `--build` 命令。生产只运行
+`deploy/update.sh` 拉取 GitHub Actions 产出的 GHCR immutable 镜像。CI 的 Web、Rust quality 与 Linux package
 门禁全部通过后，`.github/workflows/container-images.yml` 才会发布成对的
 `mpgs-server:sha-<commit>` / `mpgs-web:sha-<commit>`。两个不可变镜像均存在后，
 工作流最后才移动 `mpgs-server:release-main` 指针；VPS 从该指针读取同一个 commit，

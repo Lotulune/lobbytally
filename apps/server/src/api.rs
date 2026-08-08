@@ -7750,31 +7750,21 @@ async fn data_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         Ok(tasks) => tasks,
         Err(error) => return map_storage_error(error, None),
     };
-    let coverage = match storage_result(repo, |repo| repo.m3_catalog_coverage()).await {
-        Ok(coverage) => coverage,
-        Err(error) => return map_storage_error(error, None),
-    };
-    let m7_coverage = match storage_result(repo, |repo| {
-        let active = repo.active_algorithm_config()?;
-        repo.m7_data_coverage(&active.config)
-    })
-    .await
-    {
-        Ok(coverage) => coverage,
-        Err(error) => return map_storage_error(error, None),
-    };
-    let inventory = match storage_result(repo, |repo| repo.pipeline_inventory()).await {
-        Ok(inventory) => inventory,
+    let snapshot = match storage_result(repo, |repo| repo.pipeline_status_snapshot()).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => mpgs_storage::PipelineStatusSnapshot::default(),
         Err(error) => return map_storage_error(error, None),
     };
     (
         StatusCode::OK,
         Json(json!({
             "tasks": tasks,
-            "coverage": coverage,
-            "m7_coverage": m7_coverage,
-            "inventory": inventory,
-            "generated_at_ms": repo.database().now_ms(),
+            "coverage": snapshot.coverage,
+            "m7_coverage": snapshot.m7_coverage,
+            "dimension_coverage": snapshot.dimension_coverage,
+            "latest_runs": snapshot.latest_runs,
+            "inventory": snapshot.inventory,
+            "generated_at_ms": snapshot.generated_at_ms,
             "build_git_sha": build_git_sha(),
         })),
     )

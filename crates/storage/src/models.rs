@@ -102,7 +102,7 @@ pub enum FeatureOrigin {
     Missing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct M3CatalogCoverage {
     pub normalized_multiplayer_candidates: i64,
     pub category_evidence_candidates: i64,
@@ -120,7 +120,7 @@ pub struct M3CatalogCoverage {
 ///
 /// The section counts use the active recommendation configuration and the
 /// same eligibility rules as the public feed before per-user hard filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct M7DataCoverage {
     pub normalized_multiplayer_candidates: i64,
     pub trusted_friend_multiplayer_profiles: i64,
@@ -302,7 +302,7 @@ pub struct DataRefreshStatus {
 }
 
 /// Operator-facing inventory snapshot for the data pipeline dashboard.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PipelineInventory {
     pub apps_total: i64,
     pub multiplayer_profiles: i64,
@@ -317,4 +317,38 @@ pub struct PipelineInventory {
     pub jobs_pending: i64,
     pub jobs_leased: i64,
     pub jobs_dead: i64,
+    pub jobs_dead_recent: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineDimensionCoverage {
+    pub candidates: i64,
+    pub store_details: i64,
+    pub release_date: i64,
+    pub reviews: i64,
+    pub ccu: i64,
+    pub price: i64,
+    pub languages: i64,
+    pub retrieval_index: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineRunStatus {
+    pub task_type: String,
+    pub status: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub error_category: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PipelineStatusSnapshot {
+    pub generated_at_ms: i64,
+    pub inventory: PipelineInventory,
+    pub coverage: M3CatalogCoverage,
+    pub m7_coverage: M7DataCoverage,
+    pub dimension_coverage: PipelineDimensionCoverage,
+    pub latest_runs: Vec<PipelineRunStatus>,
 }
