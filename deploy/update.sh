@@ -212,15 +212,18 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         "$release_sha" "$branch" "$fetched_sha"
       exit 0
     fi
-    release_compose_file=$(mktemp "${TMPDIR:-/tmp}/mpgs-compose-release.XXXXXX")
-    git show "${release_sha}:deploy/docker-compose.yml" >"$release_compose_file"
-    new_compose_file="$release_compose_file"
     advance_source=1
   else
     printf 'MPGS_RELEASE_SHA is pinned; leaving the source checkout unchanged.\n'
   fi
+  release_compose_file=$(mktemp "${TMPDIR:-/tmp}/mpgs-compose-release.XXXXXX")
+  sh "$script_dir/materialize-release-compose.sh" \
+    "$repo_root" "$release_sha" "$release_compose_file"
+  new_compose_file="$release_compose_file"
 else
-  printf 'Source directory is not a Git checkout; using the packaged deployment files.\n'
+  printf 'Automatic updates require a Git checkout to load Compose from release %s.\n' \
+    "$release_sha" >&2
+  exit 1
 fi
 
 new_server_image="${server_repository}:sha-${release_sha}"
@@ -232,9 +235,6 @@ if [ "$mode" = "full" ]; then
 fi
 
 old_server_container=$(old_compose ps -q mpgs-server 2>/dev/null || true)
-old_worker_container=$(old_compose ps -q mpgs-worker 2>/dev/null || true)
-old_web_container=$(old_compose ps -q mpgs-web 2>/dev/null || true)
-any_web_container=$(old_compose ps -q --all mpgs-web 2>/dev/null || true)
 old_server_image_id=
 old_worker_image_id=
 old_web_image_id=
@@ -243,12 +243,26 @@ old_web_image=
 old_release_sha=
 old_web_release_sha=
 if [ -n "$old_server_container" ]; then
-  old_server_image_id=$(docker inspect --format '{{.Image}}' "$old_server_container")
   old_release_sha=$(
     docker inspect \
       --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
       "$old_server_container" 2>/dev/null || true
   )
+fi
+old_release_sha=$(printf '%s' "$old_release_sha" | tr '[:upper:]' '[:lower:]')
+if validate_release_sha "$old_release_sha" >/dev/null 2>&1; then
+  # A successful pin deliberately leaves the checkout unchanged. Build the
+  # rollback runner from the revision actually serving traffic.
+  sh "$script_dir/materialize-release-compose.sh" \
+    "$repo_root" "$old_release_sha" "$old_compose_file"
+  old_server_container=$(old_compose ps -q mpgs-server 2>/dev/null || true)
+fi
+
+old_worker_container=$(old_compose ps -q mpgs-worker 2>/dev/null || true)
+old_web_container=$(old_compose ps -q mpgs-web 2>/dev/null || true)
+any_web_container=$(old_compose ps -q --all mpgs-web 2>/dev/null || true)
+if [ -n "$old_server_container" ]; then
+  old_server_image_id=$(docker inspect --format '{{.Image}}' "$old_server_container")
 fi
 if [ -n "$old_worker_container" ]; then
   old_worker_image_id=$(docker inspect --format '{{.Image}}' "$old_worker_container")
@@ -261,6 +275,7 @@ if [ -n "$old_web_container" ]; then
       "$old_web_container" 2>/dev/null || true
   )
 fi
+old_web_release_sha=$(printf '%s' "$old_web_release_sha" | tr '[:upper:]' '[:lower:]')
 
 deployment_healthcheck() {
   compose_runner=$1
@@ -331,8 +346,6 @@ advance_source_checkout() {
   return "$transition_result"
 }
 
-old_release_sha=$(printf '%s' "$old_release_sha" | tr '[:upper:]' '[:lower:]')
-old_web_release_sha=$(printf '%s' "$old_web_release_sha" | tr '[:upper:]' '[:lower:]')
 mode_matches=0
 case "$mode" in
   backend)
