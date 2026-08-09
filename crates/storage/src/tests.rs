@@ -2504,6 +2504,35 @@ fn starting_a_new_source_run_finalizes_an_interrupted_predecessor() {
 }
 
 #[test]
+fn running_source_progress_is_available_before_completion() {
+    let (repo, _) = repo_with_clock(9_000);
+    let run_id = repo
+        .start_source_run("steam", "candidate_enrichment", "v1", Some("starting"))
+        .unwrap();
+
+    repo.update_source_run_progress(
+        run_id,
+        7,
+        6,
+        "phase=enrichment;apps_attempted=3;apps_total=20",
+    )
+    .unwrap();
+
+    let runs = repo.latest_source_runs().unwrap();
+    let run = runs
+        .iter()
+        .find(|run| run.task_type == "candidate_enrichment")
+        .unwrap();
+    assert_eq!(run.status, "running");
+    assert_eq!(run.request_count, 7);
+    assert_eq!(run.success_count, 6);
+    assert_eq!(
+        run.notes.as_deref(),
+        Some("phase=enrichment;apps_attempted=3;apps_total=20")
+    );
+}
+
+#[test]
 fn pipeline_inventory_counts_basic_rows() {
     let (repo, _) = repo_with_clock(1_785_830_400_000);
     assert!(repo.seed_demo_if_empty().unwrap() > 0);

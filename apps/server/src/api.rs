@@ -7755,6 +7755,10 @@ async fn data_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         Ok(None) => mpgs_storage::PipelineStatusSnapshot::default(),
         Err(error) => return map_storage_error(error, None),
     };
+    let latest_runs = match storage_result(repo, |repo| repo.latest_source_runs()).await {
+        Ok(runs) => runs,
+        Err(error) => return map_storage_error(error, None),
+    };
     (
         StatusCode::OK,
         Json(json!({
@@ -7762,7 +7766,7 @@ async fn data_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             "coverage": snapshot.coverage,
             "m7_coverage": snapshot.m7_coverage,
             "dimension_coverage": snapshot.dimension_coverage,
-            "latest_runs": snapshot.latest_runs,
+            "latest_runs": latest_runs,
             "integrated_ingestion": snapshot.integrated_ingestion,
             "inventory": snapshot.inventory,
             "generated_at_ms": snapshot.generated_at_ms,

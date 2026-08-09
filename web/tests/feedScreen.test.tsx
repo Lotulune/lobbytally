@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const runtime = vi.hoisted(() => ({
   goToPage: vi.fn(),
   subscribeRankingChanged: vi.fn(() => () => undefined),
+  gameCardProps: [] as Array<{ recommendationContext?: boolean }>,
 }));
 
 vi.mock("../src/app/runtime", () => ({
@@ -29,7 +30,10 @@ vi.mock("../src/app/useFeed", () => ({
 }));
 
 vi.mock("../src/screens/GameCard", () => ({
-  GameCard: () => <article className="card">Test Game</article>,
+  GameCard: (props: { recommendationContext?: boolean }) => {
+    runtime.gameCardProps.push(props);
+    return <article className="card">Test Game</article>;
+  },
 }));
 
 import { FeedScreen } from "../src/screens/FeedScreen";
@@ -40,6 +44,7 @@ describe("FeedScreen", () => {
   afterEach(() => {
     runtime.goToPage.mockReset();
     runtime.subscribeRankingChanged.mockClear();
+    runtime.gameCardProps.length = 0;
   });
 
   it("scrolls the actual main container to the top after pagination", () => {
@@ -74,6 +79,7 @@ describe("FeedScreen", () => {
       act(() => root.render(<FeedScreen section="recent_release" onOpenGame={() => undefined} />));
 
       expect(main.querySelector('[aria-label*="当前降序"]')).toBeNull();
+      expect(runtime.gameCardProps.at(-1)?.recommendationContext).toBe(true);
 
       const ccu = Array.from(main.querySelectorAll("button")).find(
         (button) => button.textContent?.trim() === "在线人数",
@@ -81,6 +87,7 @@ describe("FeedScreen", () => {
       act(() => ccu?.click());
 
       expect(main.querySelector('[aria-label*="当前降序"]')).not.toBeNull();
+      expect(runtime.gameCardProps.at(-1)?.recommendationContext).toBe(false);
     } finally {
       act(() => root.unmount());
       main.remove();

@@ -37,10 +37,12 @@ export function GameCard({
   item,
   onOpen,
   recommendationRunId = null,
+  recommendationContext = true,
 }: {
   item: FeedItem;
   onOpen: (appId: number, recommendationRunId?: string | null) => void;
   recommendationRunId?: string | null;
+  recommendationContext?: boolean;
 }) {
   const { fireAction } = useTheme();
   const toast = useToast();
@@ -135,6 +137,8 @@ export function GameCard({
   const hasPendingFeedback = [active.sentiment, active.ownership, ...active.reasons]
     .filter((entry): entry is PendingFeedback => entry !== null)
     .some((entry) => entry.feedbackId === null || entry.syncError !== null);
+  const showRecommendationBadge =
+    recommendationContext && typeof item.rank === "number" && item.rank >= 1 && item.rank <= 5;
 
   return (
     <article
@@ -157,12 +161,14 @@ export function GameCard({
       <div className="card-body">
         <div className="card-title">
           <h3>{item.name}</h3>
-          <ScoreBadge
-            rank={item.rank}
-            recommendationIndex={item.recommendation_index}
-            dataConfidence={item.data_confidence}
-            fitBand={item.fit_band}
-          />
+          {showRecommendationBadge ? (
+            <ScoreBadge
+              rank={item.rank}
+              recommendationIndex={item.recommendation_index}
+              dataConfidence={item.data_confidence}
+              fitBand={item.fit_band}
+            />
+          ) : null}
         </div>
         <div className="card-meta">
           {slotReasonLabel && <Chip>{slotReasonLabel}</Chip>}

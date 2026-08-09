@@ -89,6 +89,7 @@ export interface DataStatusResponse {
     request_count: number;
     success_count: number;
     error_category: string | null;
+    notes?: string | null;
   }>;
   integrated_ingestion?: {
     pending: number;
