@@ -4,6 +4,7 @@ use crate::error::{StorageError, StorageResult};
 use crate::models::GameIngestionTask;
 
 pub const INITIAL_STAGE: &str = "store_details";
+const LANE_NAME: &str = "integrated_game_ingestion";
 const DETERMINISTIC_FAILURE_LIMIT: i64 = 3;
 const TRANSIENT_FAILURE_LIMIT: i64 = 8;
 const MAX_ERROR_SUMMARY_CHARS: usize = 512;
@@ -64,6 +65,18 @@ pub fn claim_tasks(
 ) -> StorageResult<Vec<GameIngestionTask>> {
     validate_lease(owner, limit, lease_ms)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let lane_paused: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM game_ingestion_lane_state
+             WHERE lane = ?1 AND pause_until_ms > ?2
+         )",
+        params![LANE_NAME, now_ms],
+        |row| row.get(0),
+    )?;
+    if lane_paused {
+        tx.commit()?;
+        return Ok(Vec::new());
+    }
     let mut statement = tx.prepare(
         "SELECT app_id
          FROM game_ingestion_queue
@@ -212,21 +225,51 @@ pub fn pause_lane(
             "only auth/config failures may pause an ingestion lane",
         ));
     }
-    conn.execute(
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let requested_pause_until_ms = now_ms.saturating_add(retry_delay_ms);
+    tx.execute(
+        "INSERT INTO game_ingestion_lane_state(
+             lane, pause_until_ms, last_error_category, last_error_summary,
+             paused_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(lane) DO UPDATE SET
+             pause_until_ms = MAX(
+                 game_ingestion_lane_state.pause_until_ms,
+                 excluded.pause_until_ms
+             ),
+             last_error_category = excluded.last_error_category,
+             last_error_summary = excluded.last_error_summary,
+             paused_at_ms = excluded.paused_at_ms,
+             updated_at_ms = excluded.updated_at_ms",
+        params![
+            LANE_NAME,
+            requested_pause_until_ms,
+            error_category,
+            bounded_summary(error_summary),
+            now_ms
+        ],
+    )?;
+    let effective_pause_until_ms: i64 = tx.query_row(
+        "SELECT pause_until_ms FROM game_ingestion_lane_state WHERE lane = ?1",
+        [LANE_NAME],
+        |row| row.get(0),
+    )?;
+    let paused_tasks = tx.execute(
         "UPDATE game_ingestion_queue
          SET status = 'retry', next_attempt_at_ms = ?1,
              last_error_category = ?2, last_error_summary = ?3,
              lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?4
          WHERE lease_owner = ?5",
         params![
-            now_ms.saturating_add(retry_delay_ms),
+            effective_pause_until_ms,
             error_category,
             bounded_summary(error_summary),
             now_ms,
             owner
         ],
-    )
-    .map_err(Into::into)
+    )?;
+    tx.commit()?;
+    Ok(paused_tasks)
 }
 
 pub fn requeue_dead_task(

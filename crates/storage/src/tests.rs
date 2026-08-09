@@ -1655,7 +1655,7 @@ fn ingestion_failures_become_dead_and_requeue_is_scoped_audited_and_idempotent()
 }
 
 #[test]
-fn global_ingestion_failure_pauses_owned_lane_without_consuming_failure_budget() {
+fn global_ingestion_failure_blocks_all_claims_until_lane_pause_expires() {
     let (repo, clock) = repo_with_clock(20_000);
     repo.ingest_store_search_page_and_queue_new_games(&StoreSearchPage {
         candidates: vec![
@@ -1676,35 +1676,78 @@ fn global_ingestion_failure_pauses_owned_lane_without_consuming_failure_budget()
     })
     .unwrap();
     assert_eq!(
-        repo.claim_game_ingestion_tasks("worker-a", 2, 30_000)
+        repo.claim_game_ingestion_tasks("worker-a", 1, 30_000)
             .unwrap()
             .len(),
-        2
+        1
     );
     assert_eq!(
         repo.pause_game_ingestion_lane("worker-a", "auth", "bad key", 60_000)
             .unwrap(),
-        2
+        1
     );
+
+    repo.ingest_store_search_page_and_queue_new_games(&StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 30,
+            name: "Discovered While Paused".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "global-pause-new-app-fixture".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
     repo.database()
         .with_conn(|conn| {
-            let state: (i64, i64, i64) = conn.query_row(
-                "SELECT SUM(status = 'retry'), SUM(stage_failure_attempts),
+            let state: (i64, i64, i64, i64, i64) = conn.query_row(
+                "SELECT SUM(status = 'retry'), SUM(status = 'pending'),
+                        SUM(stage_failure_attempts), SUM(total_failure_attempts),
                         SUM(lease_owner IS NOT NULL)
                  FROM game_ingestion_queue",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )?;
-            assert_eq!(state, (2, 0, 0));
+            assert_eq!(state, (1, 2, 0, 0, 0));
+            let lane: (i64, String) = conn.query_row(
+                "SELECT pause_until_ms, last_error_category
+                 FROM game_ingestion_lane_state
+                 WHERE lane = 'integrated_game_ingestion'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(lane, (80_000, "auth".into()));
             Ok(())
         })
         .unwrap();
-    clock.advance_ms(60_000);
+
+    assert!(
+        repo.claim_game_ingestion_tasks("worker-b", 3, 30_000)
+            .unwrap()
+            .is_empty()
+    );
+    clock.advance_ms(59_999);
+    assert!(
+        repo.claim_game_ingestion_tasks("worker-b", 3, 30_000)
+            .unwrap()
+            .is_empty()
+    );
+    clock.advance_ms(1);
     assert_eq!(
-        repo.claim_game_ingestion_tasks("worker-b", 2, 30_000)
+        repo.claim_game_ingestion_tasks("worker-b", 3, 30_000)
             .unwrap()
             .len(),
-        2
+        3
     );
 }
 
