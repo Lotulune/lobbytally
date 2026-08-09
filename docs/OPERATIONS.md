@@ -251,6 +251,9 @@ worker 的未过期 Steam 任务租约恢复为待处理，避免部署后等待
 回滚记录在 `journalctl -u mpgs-update.service`；失败数据库副本不会自动删除，升级前
 备份按上述保留策略清理，应持续监控磁盘容量。
 
+已运行同一 SHA 时，更新器会对 readiness、revision 和 worker health 做 5 次有界重试；
+只有连续失败才进入受控重建，并在日志中记录具体失败项。
+
 ### 3.6 密钥轮换
 
 1. 生成新 `MPGS_ADMIN_TOKEN`。
