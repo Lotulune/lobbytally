@@ -423,8 +423,8 @@ fn run() -> Result<(), String> {
             let db = Database::open(&db_path).map_err(err)?;
             let schema_version = db.schema_version().map_err(err)?;
             let repo = Repository::new(db);
-            let recovered = repo.recover_leased_jobs(Some("steam")).map_err(err)?;
-            let recovered_game_ingestion = repo.recover_game_ingestion_leases().map_err(err)?;
+            let (recovered, recovered_game_ingestion) =
+                recover_controlled_deploy_leases(&repo).map_err(err)?;
             println!("path={}", db_path.display());
             println!("schema_version={schema_version}");
             println!("steam_leases_recovered={recovered}");
@@ -1045,6 +1045,29 @@ fn run() -> Result<(), String> {
         }
         other => Err(format!("unknown command '{other}'\n{}", usage())),
     }
+}
+
+fn recover_controlled_deploy_leases(repo: &Repository) -> StorageResult<(usize, usize)> {
+    // The target image runs this before migrations, so it must also support the
+    // immediately preceding schema where the integrated queue does not exist.
+    let has_game_ingestion_queue = repo.database().with_conn(|conn| {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'game_ingestion_queue'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(Into::into)
+    })?;
+    let recovered = repo.recover_leased_jobs(Some("steam"))?;
+    let recovered_game_ingestion = if has_game_ingestion_queue {
+        repo.recover_game_ingestion_leases()?
+    } else {
+        0
+    };
+    Ok((recovered, recovered_game_ingestion))
 }
 
 fn required_path(arg: Option<String>, label: &str) -> Result<PathBuf, String> {
@@ -3584,6 +3607,20 @@ fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_deploy_lease_recovery_supports_the_pre_queue_schema() {
+        let db = Database::open_in_memory().unwrap();
+        db.with_conn_mut(|conn| {
+            mpgs_storage::migrate::migrate_to(conn, 24, 1_000)?;
+            Ok(())
+        })
+        .unwrap();
+        let repo = Repository::new(db);
+
+        assert_eq!(recover_controlled_deploy_leases(&repo).unwrap(), (0, 0));
+        assert_eq!(repo.database().schema_version().unwrap(), 24);
+    }
 
     #[test]
     fn integrated_ingestion_runs_stages_in_order_and_retries_only_the_failed_stage() {
