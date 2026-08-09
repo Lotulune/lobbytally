@@ -343,15 +343,35 @@ pub struct PipelineRunStatus {
     pub error_category: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameIngestionQueueStatus {
     pub pending: i64,
     pub retry: i64,
     pub leased: i64,
+    pub dead: i64,
     pub store_details: i64,
     pub review_summary: i64,
     pub popular_reviews: i64,
     pub ccu: i64,
+    pub oldest_dead_at_ms: Option<i64>,
+    pub dead_by_stage: Vec<GameIngestionDeadCount>,
+    pub dead_by_category: Vec<GameIngestionDeadCount>,
+    pub recent_dead: Vec<GameIngestionDeadSample>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameIngestionDeadCount {
+    pub key: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameIngestionDeadSample {
+    pub app_id: u32,
+    pub stage: String,
+    pub error_category: Option<String>,
+    pub error_summary: Option<String>,
+    pub dead_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -378,10 +398,15 @@ pub struct GameIngestionTask {
     pub priority: i64,
     pub stage: String,
     pub status: String,
-    pub stage_attempts: i64,
-    pub total_attempts: i64,
+    pub stage_failure_attempts: i64,
+    pub total_failure_attempts: i64,
+    pub lease_count: i64,
     pub next_attempt_at_ms: i64,
     pub last_error_category: Option<String>,
+    pub last_error_summary: Option<String>,
     pub lease_owner: Option<String>,
     pub lease_expires_at_ms: Option<i64>,
+    pub enrichment_profile: String,
+    pub profile_version: i64,
+    pub dead_at_ms: Option<i64>,
 }

@@ -233,13 +233,20 @@ impl Repository {
         self.db.with_conn_mut(|conn| {
             conn.execute(
                 "INSERT INTO store_detail_refresh_state(
-                    app_id, country_code, language, captured_at_ms, status, source, checked_empty
-                 ) VALUES (?1, ?2, ?3, ?4, 'not_found', 'steam_store_appdetails', 1)
+                    app_id, country_code, language, captured_at_ms, status, source,
+                    checked_empty, store_core_empty, price_empty,
+                    store_checked_at_ms, price_checked_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'not_found', 'steam_store_appdetails',
+                           1, 1, 1, ?4, ?4)
                  ON CONFLICT(app_id, country_code, language) DO UPDATE SET
                     captured_at_ms = excluded.captured_at_ms,
                     status = excluded.status,
                     source = excluded.source,
-                    checked_empty = excluded.checked_empty",
+                    checked_empty = excluded.checked_empty,
+                    store_core_empty = excluded.store_core_empty,
+                    price_empty = excluded.price_empty,
+                    store_checked_at_ms = excluded.store_checked_at_ms,
+                    price_checked_at_ms = excluded.price_checked_at_ms",
                 rusqlite::params![app_id, country_code, language, now],
             )?;
             Ok(())
@@ -345,6 +352,7 @@ impl Repository {
         app_id: u32,
         owner: &str,
         error_category: &str,
+        error_summary: &str,
         retry_delay_ms: i64,
     ) -> StorageResult<crate::models::GameIngestionTask> {
         let now = self.db.now_ms();
@@ -354,9 +362,43 @@ impl Repository {
                 app_id,
                 owner,
                 error_category,
+                error_summary,
                 retry_delay_ms,
                 now,
             )
+        })
+    }
+
+    pub fn pause_game_ingestion_lane(
+        &self,
+        owner: &str,
+        error_category: &str,
+        error_summary: &str,
+        retry_delay_ms: i64,
+    ) -> StorageResult<usize> {
+        let now = self.db.now_ms();
+        self.db.with_conn_mut(|conn| {
+            crate::game_ingestion::pause_lane(
+                conn,
+                owner,
+                error_category,
+                error_summary,
+                retry_delay_ms,
+                now,
+            )
+        })
+    }
+
+    pub fn requeue_dead_game_ingestion_task(
+        &self,
+        app_id: u32,
+        stage: &str,
+        operator: &str,
+        reason: &str,
+    ) -> StorageResult<bool> {
+        let now = self.db.now_ms();
+        self.db.with_conn_mut(|conn| {
+            crate::game_ingestion::requeue_dead_task(conn, app_id, stage, operator, reason, now)
         })
     }
 
@@ -566,9 +608,10 @@ impl Repository {
                  ), due AS (
                      SELECT
                          candidates.app_id,
-                         CASE WHEN (
-                                    COALESCE(v.platforms_json, '[]') = '[]'
-                                    OR COALESCE(v.languages_json, '[]') = '[]'
+                          CASE WHEN (
+                                     a.release_state IN ('upcoming', 'coming_soon')
+                                     OR COALESCE(v.platforms_json, '[]') = '[]'
+                                     OR COALESCE(v.languages_json, '[]') = '[]'
                                     OR NOT EXISTS (
                                         SELECT 1 FROM app_localizations localization
                                         WHERE localization.app_id = candidates.app_id
@@ -580,8 +623,11 @@ impl Repository {
                                         AND refresh.country_code = ?5
                                         AND refresh.language = ?7
                                         AND refresh.status IN ('succeeded', 'not_found')
-                                        AND refresh.captured_at_ms >= CASE
-                                            WHEN refresh.checked_empty = 1 THEN ?18 ELSE ?4 END
+                                         AND refresh.store_checked_at_ms >= CASE
+                                             WHEN a.release_state IN ('upcoming', 'coming_soon') THEN ?4
+                                             WHEN refresh.store_core_empty = 1 THEN ?18
+                                             ELSE ?4
+                                         END
                                   )
                               THEN 1 ELSE 0 END AS needs_store_details,
                          CASE WHEN NOT EXISTS (
@@ -611,8 +657,8 @@ impl Repository {
                                AND refresh.country_code = ?5
                                         AND refresh.language = ?7
                                         AND refresh.status IN ('succeeded', 'not_found')
-                                        AND refresh.captured_at_ms >= CASE
-                                            WHEN refresh.checked_empty = 1 THEN ?18 ELSE ?4 END
+                                         AND refresh.price_checked_at_ms >= CASE
+                                             WHEN refresh.price_empty = 1 THEN ?18 ELSE ?4 END
                          ) THEN 1 ELSE 0 END AS needs_price,
                          CASE WHEN ?13 = 1
                                    AND NOT EXISTS (
@@ -643,6 +689,7 @@ impl Repository {
                                    )
                               THEN 1 ELSE 0 END AS needs_english_name
                      FROM candidates
+                     JOIN apps a ON a.app_id = candidates.app_id
                      LEFT JOIN app_availability v ON v.app_id = candidates.app_id
                      LEFT JOIN app_media_backfill_state backfill
                          ON backfill.app_id = candidates.app_id
@@ -891,8 +938,8 @@ impl Repository {
         self.db.with_conn(|conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM store_detail_refresh_state
-                 WHERE app_id = ?1 AND country_code = ?2 AND language = ?3
-                   AND captured_at_ms >= ?4",
+                  WHERE app_id = ?1 AND country_code = ?2 AND language = ?3
+                    AND store_checked_at_ms >= ?4",
                 rusqlite::params![app_id, country_code, language, cutoff],
                 |row| row.get(0),
             )?;
@@ -913,13 +960,17 @@ impl Repository {
         self.db.with_conn_mut(|conn| {
             conn.execute(
                 "INSERT INTO store_detail_refresh_state(
-                     app_id, country_code, language, captured_at_ms, status, source, checked_empty
-                 ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, 0)
+                     app_id, country_code, language, captured_at_ms, status, source,
+                     checked_empty, store_core_empty, price_empty,
+                     store_checked_at_ms, price_checked_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, 0, 0, 0, ?4, 0)
                  ON CONFLICT(app_id, country_code, language) DO UPDATE SET
                      captured_at_ms = excluded.captured_at_ms,
                      status = excluded.status,
                      source = excluded.source,
-                     checked_empty = excluded.checked_empty",
+                     checked_empty = excluded.checked_empty,
+                     store_core_empty = excluded.store_core_empty,
+                     store_checked_at_ms = excluded.store_checked_at_ms",
                 rusqlite::params![app_id, country_code, language, now, source],
             )?;
             Ok(())
@@ -1609,15 +1660,17 @@ impl Repository {
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })?;
         let integrated_ingestion = self.db.with_conn(|conn| {
-            conn.query_row(
+            let mut status = conn.query_row(
                 "SELECT
                     COALESCE(SUM(status = 'pending' AND lease_owner IS NULL), 0),
                     COALESCE(SUM(status = 'retry' AND lease_owner IS NULL), 0),
                     COALESCE(SUM(lease_owner IS NOT NULL), 0),
-                    COALESCE(SUM(stage = 'store_details' AND status != 'complete'), 0),
-                    COALESCE(SUM(stage = 'review_summary' AND status != 'complete'), 0),
-                    COALESCE(SUM(stage = 'popular_reviews' AND status != 'complete'), 0),
-                    COALESCE(SUM(stage = 'ccu' AND status != 'complete'), 0)
+                    COALESCE(SUM(status = 'dead'), 0),
+                    COALESCE(SUM(stage = 'store_details' AND status NOT IN ('complete', 'dead')), 0),
+                    COALESCE(SUM(stage = 'review_summary' AND status NOT IN ('complete', 'dead')), 0),
+                    COALESCE(SUM(stage = 'popular_reviews' AND status NOT IN ('complete', 'dead')), 0),
+                    COALESCE(SUM(stage = 'ccu' AND status NOT IN ('complete', 'dead')), 0),
+                    MIN(CASE WHEN status = 'dead' THEN dead_at_ms END)
                  FROM game_ingestion_queue",
                 [],
                 |row| {
@@ -1625,14 +1678,51 @@ impl Repository {
                         pending: row.get(0)?,
                         retry: row.get(1)?,
                         leased: row.get(2)?,
-                        store_details: row.get(3)?,
-                        review_summary: row.get(4)?,
-                        popular_reviews: row.get(5)?,
-                        ccu: row.get(6)?,
+                        dead: row.get(3)?,
+                        store_details: row.get(4)?,
+                        review_summary: row.get(5)?,
+                        popular_reviews: row.get(6)?,
+                        ccu: row.get(7)?,
+                        oldest_dead_at_ms: row.get(8)?,
+                        ..crate::models::GameIngestionQueueStatus::default()
                     })
                 },
-            )
-            .map_err(Into::into)
+            )?;
+            for (grouping, target) in [
+                ("stage", &mut status.dead_by_stage),
+                ("last_error_category", &mut status.dead_by_category),
+            ] {
+                let sql = format!(
+                    "SELECT COALESCE({grouping}, 'unknown'), COUNT(*)
+                     FROM game_ingestion_queue WHERE status = 'dead'
+                     GROUP BY {grouping} ORDER BY COUNT(*) DESC, {grouping}"
+                );
+                let mut statement = conn.prepare(&sql)?;
+                let rows = statement.query_map([], |row| {
+                    Ok(crate::models::GameIngestionDeadCount {
+                        key: row.get(0)?,
+                        count: row.get(1)?,
+                    })
+                })?;
+                *target = rows.collect::<Result<Vec<_>, _>>()?;
+            }
+            let mut statement = conn.prepare(
+                "SELECT app_id, stage, last_error_category, last_error_summary, dead_at_ms
+                 FROM game_ingestion_queue WHERE status = 'dead'
+                 ORDER BY dead_at_ms DESC, app_id LIMIT 10",
+            )?;
+            status.recent_dead = statement
+                .query_map([], |row| {
+                    Ok(crate::models::GameIngestionDeadSample {
+                        app_id: row.get(0)?,
+                        stage: row.get(1)?,
+                        error_category: row.get(2)?,
+                        error_summary: row.get(3)?,
+                        dead_at_ms: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(status)
         })?;
         snapshot.generated_at_ms = generated_at_ms;
         snapshot.inventory = inventory;

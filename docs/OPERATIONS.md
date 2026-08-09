@@ -247,13 +247,26 @@ systemctl status mpgs-update.timer --no-pager
 worker 的未过期 Steam 任务租约恢复为待处理，避免部署后等待 30 分钟租约自然过期。
 不得在 worker 仍运行时手工执行该命令。
 
+一体化入库达到 dead 上限后，只能按 App 和阶段显式恢复，并要求记录操作者与原因：
+
+```bash
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml run --rm \
+  --entrypoint /usr/local/bin/mpgs-dbtool mpgs-server \
+  requeue-game-ingestion /var/lib/mpgs/mpgs.db 632360 review_summary operator@example "adapter fixed"
+```
+
+重复执行同一条已恢复任务会返回 `requeued=false`，不会新增重复审计记录；没有全量 requeue
+命令。
+
 定时器只在成对发布指针前移后部署；指针未变化时 Compose 不重建容器。失败与自动
 回滚记录在 `journalctl -u mpgs-update.service`；失败数据库副本不会自动删除，升级前
 备份按上述保留策略清理，应持续监控磁盘容量。
 
-已运行同一 SHA 时，更新器会对 readiness、revision 和 worker health 做 5 次有界重试；
-Server readiness 或 revision 连续失败才进入受控重建。若只有 worker health 因长任务暂时
-过期，更新器记录告警并保持容器不动，不能为恢复 worker 健康而触发全库备份。
+已运行同一 SHA 时，更新器会对 readiness、revision 和 worker health 做 5 次有界重试。
+Worker 父循环独立维护 heartbeat，并在单轮超过硬 watchdog 后终止子进程、退出并由容器
+运行时重启。只有合法 v2 健康文件处于短暂 heartbeat grace 时才视为软过期并保持同 SHA
+容器；缺文件、坏文件、`error`、子进程消失或超过 watchdog 都会触发受控重建。新 SHA
+部署必须达到完全健康，软过期不能作为发布成功条件。
 
 ### 3.6 密钥轮换
 
