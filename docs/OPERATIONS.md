@@ -241,7 +241,7 @@ sudo systemctl start mpgs-update.service
 systemctl status mpgs-update.timer --no-pager
 ```
 
-大库的在线备份、外键检查和完整性检查可能超过 10 分钟，仓库单元预留 30 分钟；若服务因旧版超时进入 `failed` 且 timer 不再活动，更新单元后需重新执行 `daemon-reload` 与 `enable --now`。
+大库的在线备份、外键检查和完整性检查可能超过 10 分钟，仓库单元预留 60 分钟；若服务因旧版超时进入 `failed` 且 timer 不再活动，更新单元后需重新执行 `daemon-reload` 与 `enable --now`。
 
 自动更新会在全部应用写入者停止后、备份开始前执行 `recover-steam-leases`，把被停止
 worker 的未过期 Steam 任务租约恢复为待处理，避免部署后等待 30 分钟租约自然过期。

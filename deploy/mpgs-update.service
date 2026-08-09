@@ -9,4 +9,4 @@ Type=oneshot
 User=ubuntu
 WorkingDirectory=/home/ubuntu/mpgs/src
 ExecStart=/home/ubuntu/mpgs/src/deploy/update.sh
-TimeoutStartSec=30min
+TimeoutStartSec=60min
