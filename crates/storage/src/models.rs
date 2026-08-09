@@ -344,6 +344,7 @@ pub struct PipelineRunStatus {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GameIngestionQueueStatus {
     pub pending: i64,
     pub retry: i64,
