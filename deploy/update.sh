@@ -304,7 +304,7 @@ deployment_healthcheck() {
   if ! "$compose_runner" exec -T mpgs-worker \
     /usr/local/bin/mpgs-worker-loop --healthcheck >/dev/null 2>&1; then
     deployment_health_detail="worker healthcheck failed"
-    return 1
+    return 3
   fi
   deployment_health_detail="healthy"
   return 0
@@ -396,6 +396,11 @@ if [ "$mode_matches" -eq 1 ] \
       printf 'Warning: could not prune old pre-update backups.\n' >&2
     fi
     printf 'MPGS %s deployment is already healthy at %s\n' "$mode" "$release_sha"
+    exit 0
+  fi
+  if [ "$existing_health_result" -eq 3 ]; then
+    printf 'MPGS %s deployment already serves %s, but worker health remained stale; leaving containers unchanged.\n' \
+      "$mode" "$release_sha" >&2
     exit 0
   fi
   printf 'Existing containers match release %s but remained unhealthy; performing a controlled redeploy.\n' \
