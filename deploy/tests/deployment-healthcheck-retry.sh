@@ -42,4 +42,15 @@ fi
 test "$result" -eq 1
 test "$attempts" -eq 3
 
+attempts=0
+results="3 3 3"
+if retry_deployment_healthcheck fixture 3 0; then
+  printf 'stale worker health unexpectedly passed\n' >&2
+  exit 1
+else
+  result=$?
+fi
+test "$result" -eq 3
+test "$attempts" -eq 3
+
 printf 'deployment healthcheck retry tests passed\n'

@@ -252,7 +252,8 @@ worker 的未过期 Steam 任务租约恢复为待处理，避免部署后等待
 备份按上述保留策略清理，应持续监控磁盘容量。
 
 已运行同一 SHA 时，更新器会对 readiness、revision 和 worker health 做 5 次有界重试；
-只有连续失败才进入受控重建，并在日志中记录具体失败项。
+Server readiness 或 revision 连续失败才进入受控重建。若只有 worker health 因长任务暂时
+过期，更新器记录告警并保持容器不动，不能为恢复 worker 健康而触发全库备份。
 
 ### 3.6 密钥轮换
 

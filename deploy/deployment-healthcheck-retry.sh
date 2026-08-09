@@ -5,9 +5,11 @@ retry_deployment_healthcheck() {
   max_attempts=$2
   delay_secs=$3
   attempt=1
+  last_health_result=1
   while [ "$attempt" -le "$max_attempts" ]; do
     health_result=0
     deployment_healthcheck "$compose_runner" || health_result=$?
+    last_health_result=$health_result
     if [ "$health_result" -eq 0 ]; then
       return 0
     fi
@@ -21,5 +23,5 @@ retry_deployment_healthcheck() {
     fi
     attempt=$((attempt + 1))
   done
-  return 1
+  return "$last_health_result"
 }
