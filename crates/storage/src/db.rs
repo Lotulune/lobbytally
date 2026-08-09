@@ -325,6 +325,12 @@ const KEY_SCHEMA_PROBES: &[(&str, &str)] = &[
                 idempotency_key, created_at_ms, expires_at_ms
          FROM recommendation_events LIMIT 0",
     ),
+    (
+        "game_ingestion_lane_state",
+        "SELECT lane, pause_until_ms, last_error_category, last_error_summary,
+                paused_at_ms, updated_at_ms
+         FROM game_ingestion_lane_state LIMIT 0",
+    ),
 ];
 
 const REQUIRED_PRIMARY_KEYS: &[(&str, &str)] = &[
@@ -341,6 +347,7 @@ const REQUIRED_PRIMARY_KEYS: &[(&str, &str)] = &[
     ("recommendation_items", "recommendation_run_id"),
     ("recommendation_items", "app_id"),
     ("recommendation_events", "recommendation_event_id"),
+    ("game_ingestion_lane_state", "lane"),
 ];
 
 const REQUIRED_UNIQUE_KEYS: &[(&str, &[&str])] = &[
