@@ -33,6 +33,26 @@ fn empty_database_migrates_to_latest() {
 }
 
 #[test]
+fn legacy_pipeline_snapshot_defaults_new_ingestion_reliability_fields() {
+    let legacy = serde_json::json!({
+        "pending": 2,
+        "retry": 1,
+        "leased": 0,
+        "store_details": 2,
+        "review_summary": 1,
+        "popular_reviews": 0,
+        "ccu": 0
+    });
+    let status: crate::models::GameIngestionQueueStatus = serde_json::from_value(legacy).unwrap();
+    assert_eq!(status.pending, 2);
+    assert_eq!(status.retry, 1);
+    assert_eq!(status.dead, 0);
+    assert!(status.dead_by_stage.is_empty());
+    assert!(status.dead_by_category.is_empty());
+    assert!(status.recent_dead.is_empty());
+}
+
+#[test]
 fn demo_seed_includes_capsules_for_known_steam_apps() {
     let (repo, _) = repo_with_clock(1_000);
     assert!(repo.seed_demo_if_empty().unwrap() > 0);
