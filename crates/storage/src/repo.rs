@@ -1322,6 +1322,28 @@ impl Repository {
         })
     }
 
+    pub fn update_source_run_progress(
+        &self,
+        run_id: i64,
+        request_count: i64,
+        success_count: i64,
+        notes: &str,
+    ) -> StorageResult<()> {
+        self.db.with_conn_mut(|conn| {
+            crate::source_state::update_run_progress(
+                conn,
+                run_id,
+                request_count,
+                success_count,
+                notes,
+            )
+        })
+    }
+
+    pub fn latest_source_runs(&self) -> StorageResult<Vec<crate::models::PipelineRunStatus>> {
+        self.db.with_conn(crate::source_state::latest_runs)
+    }
+
     pub fn create_override(
         &self,
         app_id: u32,
@@ -1638,27 +1660,7 @@ impl Repository {
             )
             .map_err(Into::into)
         })?;
-        let latest_runs = self.db.with_conn(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT task_type, status, started_at_ms, finished_at_ms,
-                        request_count, success_count, error_category
-                 FROM source_runs
-                 WHERE run_id IN (SELECT MAX(run_id) FROM source_runs GROUP BY task_type)
-                 ORDER BY task_type",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok(crate::models::PipelineRunStatus {
-                    task_type: row.get(0)?,
-                    status: row.get(1)?,
-                    started_at_ms: row.get(2)?,
-                    finished_at_ms: row.get(3)?,
-                    request_count: row.get(4)?,
-                    success_count: row.get(5)?,
-                    error_category: row.get(6)?,
-                })
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        })?;
+        let latest_runs = self.latest_source_runs()?;
         let integrated_ingestion = self.db.with_conn(|conn| {
             let mut status = conn.query_row(
                 "SELECT

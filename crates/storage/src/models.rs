@@ -341,6 +341,8 @@ pub struct PipelineRunStatus {
     pub request_count: i64,
     pub success_count: i64,
     pub error_category: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

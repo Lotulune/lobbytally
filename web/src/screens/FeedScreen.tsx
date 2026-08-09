@@ -143,6 +143,7 @@ function RankedFeedPanel({
                 item={item}
                 onOpen={onOpenGame}
                 recommendationRunId={feed.recommendationRunId}
+                recommendationContext={sort === "recommended"}
               />
             ))}
           </div>

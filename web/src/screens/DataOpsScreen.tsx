@@ -10,6 +10,7 @@ import { Panel } from "../components/Panel";
 import { Skeleton } from "../components/Skeleton";
 
 const ADMIN_TOKEN_KEY = "mpgs.admin_token.v1";
+const LIVE_REFRESH_MS = 5_000;
 
 function readToken(): string {
   try {
@@ -51,11 +52,14 @@ function taskLabel(name: string): string {
     case "candidate_collection":
       return "找联机游戏";
     case "candidate_top_refresh":
-      return "刷新新游顶页";
+      return "刷新候选顶页";
     case "candidate_continuation":
       return "推进候选深游标";
     case "enrichment":
+    case "candidate_enrichment":
       return "补发售日与详情";
+    case "candidate_discovery":
+      return "推进候选发现";
     case "quality_check":
       return "质量自检";
     case "retrieval_sync":
@@ -67,6 +71,28 @@ function taskLabel(name: string): string {
     default:
       return name;
   }
+}
+
+function runProgress(notes: string | null | undefined): { current: number; total: number } | null {
+  if (!notes) return null;
+  const fields = new Map(
+    notes.split(";").map((part) => {
+      const split = part.indexOf("=");
+      return split < 0 ? [part, ""] : [part.slice(0, split), part.slice(split + 1)];
+    }),
+  );
+  const current = Number(fields.get("apps_attempted"));
+  const total = Number(fields.get("apps_total"));
+  if (!Number.isFinite(current) || !Number.isFinite(total) || total <= 0) return null;
+  return { current: Math.max(0, current), total: Math.max(1, total) };
+}
+
+function nextRunLabel(nextRunAtMs: number | null, nowMs: number): string {
+  if (nextRunAtMs == null) return "未安排下次运行";
+  const remaining = nextRunAtMs - nowMs;
+  if (remaining <= 0) return "等待调度";
+  if (remaining < 60_000) return `${Math.ceil(remaining / 1_000)} 秒后`;
+  return `${Math.ceil(remaining / 60_000)} 分钟后`;
 }
 
 /** Prefer plain status over raw engine names. */
@@ -137,6 +163,7 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
   const [status, setStatus] = useState<DataStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [lastRefreshAt, setLastRefreshAt] = useState<number | null>(null);
   const [lookup, setLookup] = useState("");
   const [presence, setPresence] = useState<PipelineAppPresence | null>(null);
   const [lookupError, setLookupError] = useState<string | null>(null);
@@ -147,27 +174,33 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
     setToken(next);
   };
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (silent = false) => {
     if (!token) {
       setError("请先保存管理密钥。");
       setStatus(null);
       return;
     }
-    setLoading(true);
+    if (!silent) setLoading(true);
     setError(null);
     try {
       setStatus(await apiClient.adminDataStatus(token));
+      setLastRefreshAt(Date.now());
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
-      setStatus(null);
+      if (!silent) setStatus(null);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [token]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    void load(false);
+    if (!token) return;
+    const interval = window.setInterval(() => {
+      if (document.visibilityState === "visible") void load(true);
+    }, LIVE_REFRESH_MS);
+    return () => window.clearInterval(interval);
+  }, [load, token]);
 
   const inv = status?.inventory;
   const m7 = status?.m7_coverage;
@@ -178,25 +211,21 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
   const integrated = status?.integrated_ingestion;
   const pool = inv?.multiplayer_profiles ?? 0;
 
-  const sectionBars = useMemo(() => {
+  const sectionStats = useMemo(() => {
     if (!m7) return [];
-    const total =
-      m7.recent_release_candidates +
-      m7.upcoming_candidates +
-      m7.popular_legacy_candidates +
-      m7.classic_legacy_candidates;
     return [
-      { name: "最近正式发售", value: m7.recent_release_candidates, max: Math.max(total, 1) },
+      { name: "最近正式发售", value: m7.recent_release_candidates },
       {
         name: "即将发售（有日期）",
         value: m7.upcoming_candidates,
-        max: Math.max(total, 1),
         tone: m7.upcoming_candidates <= 2 ? ("bad" as const) : undefined,
       },
-      { name: "人气老游戏", value: m7.popular_legacy_candidates, max: Math.max(total, 1) },
-      { name: "经典联机", value: m7.classic_legacy_candidates, max: Math.max(total, 1) },
+      { name: "人气老游戏", value: m7.popular_legacy_candidates },
+      { name: "经典联机", value: m7.classic_legacy_candidates },
     ];
   }, [m7]);
+  const activeRun = latestRuns.find((run) => run.status === "running") ?? null;
+  const activeProgress = runProgress(activeRun?.notes);
 
   const runLookup = async () => {
     setLookupError(null);
@@ -260,10 +289,16 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
           <Button size="small" onClick={saveToken}>
             保存
           </Button>
-          <Button size="small" onClick={() => void load()} disabled={loading}>
+          <Button size="small" onClick={() => void load(false)} disabled={loading}>
             {loading ? "…" : "刷新"}
           </Button>
         </div>
+        {token && status ? (
+          <span className="data-ops-live" aria-live="polite">
+            <span className="live-dot" />
+            每 5 秒更新{lastRefreshAt ? ` · ${new Date(lastRefreshAt).toLocaleTimeString()}` : ""}
+          </span>
+        ) : null}
       </header>
 
       {error ? (
@@ -334,6 +369,58 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
             />
           </div>
 
+          <Panel title="Worker 实时状态">
+            <div className="worker-live" data-running={activeRun ? "true" : "false"}>
+              <div className="worker-live-head">
+                <span className="worker-state-dot" />
+                <div>
+                  <strong>{activeRun ? taskLabel(activeRun.task_type) : "当前空闲"}</strong>
+                  <span>
+                    {activeRun
+                      ? `开始于 ${ago(activeRun.started_at_ms)}`
+                      : "队列有任务时会自动领取"}
+                  </span>
+                </div>
+                <span className="worker-requests">
+                  {activeRun
+                    ? `请求 ${activeRun.request_count} · 成功 ${activeRun.success_count}`
+                    : `待领取 ${inv.jobs_pending} · 已租约 ${inv.jobs_leased}`}
+                </span>
+              </div>
+              {activeRun && activeProgress ? (
+                <div className="worker-progress">
+                  <div className="bar-meta">
+                    <span className="name">当前批次</span>
+                    <span className="nums">
+                      {activeProgress.current.toLocaleString()} / {activeProgress.total.toLocaleString()} 款
+                    </span>
+                  </div>
+                  <div
+                    className="bar-track"
+                    role="progressbar"
+                    aria-valuemin={0}
+                    aria-valuemax={activeProgress.total}
+                    aria-valuenow={activeProgress.current}
+                  >
+                    <div
+                      className="bar-fill"
+                      data-tone="ok"
+                      style={{ width: `${pct(activeProgress.current, activeProgress.total)}%` }}
+                    />
+                  </div>
+                </div>
+              ) : null}
+              <div className="worker-queue-line">
+                <span>新游待处理 {integrated?.pending ?? 0}</span>
+                <span>重试 {integrated?.retry ?? 0}</span>
+                <span>处理中 {integrated?.leased ?? 0}</span>
+                <span data-tone={(integrated?.dead ?? 0) > 0 ? "bad" : "ok"}>
+                  Dead {integrated?.dead ?? 0}
+                </span>
+              </div>
+            </div>
+          </Panel>
+
           {(integrated?.dead ?? 0) > 0 ? (
             <Panel title="新游入库 Dead 明细">
               <div className="task-list">
@@ -390,18 +477,15 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
             </div>
           </Panel>
 
-          {sectionBars.length > 0 ? (
+          {sectionStats.length > 0 ? (
             <Panel title="首页各列表体量">
-              <div className="bar-list">
-                {sectionBars.map((row) => (
-                  <Bar
-                    key={row.name}
-                    name={row.name}
-                    value={row.value}
-                    max={row.max}
-                    suffix={` 款`}
-                    tone={row.tone}
-                  />
+              <div className="section-metrics">
+                {sectionStats.map((row) => (
+                  <div className="section-metric" data-tone={row.tone} key={row.name}>
+                    <span>{row.name}</span>
+                    <strong>{row.value.toLocaleString()}</strong>
+                    <small>款</small>
+                  </div>
                 ))}
               </div>
             </Panel>
@@ -416,33 +500,19 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
                   }
                   return item.task_type === task.task_name;
                 });
-                const p =
-                  task.coverage_ratio == null
-                    ? 0
-                    : Math.max(0, Math.min(100, task.coverage_ratio * 100));
-                const tone = task.last_error_category
-                  ? "bad"
-                  : toneForPct(p || (task.last_success_at_ms ? 100 : 0));
+                const running = run?.status === "running";
+                const tone = task.last_error_category ? "bad" : running ? "running" : "ok";
                 return (
-                  <div className="task-card" key={task.task_name}>
-                    <div className="task-top">
-                      <span className="title">{taskLabel(task.task_name)}</span>
-                      <span className="when">
-                        {taskStatusLine(task)}
-                        {run
-                          ? ` · 最近批次处理 ${run.success_count} · 请求 ${run.request_count}`
-                          : ""}
-                      </span>
+                  <div className="task-row" data-tone={tone} key={task.task_name}>
+                    <span className="task-state-dot" />
+                    <div className="task-copy">
+                      <strong>{taskLabel(task.task_name)}</strong>
+                      <span>{running ? "正在运行" : taskStatusLine(task)}</span>
                     </div>
-                    <div className="bar-track" aria-hidden="true">
-                      <div
-                        className="bar-fill"
-                        data-tone={tone}
-                        style={{
-                          width: `${task.coverage_ratio == null ? (task.last_success_at_ms ? 100 : 8) : p}%`,
-                        }}
-                      />
-                    </div>
+                    <span className="task-run-count">
+                      {run ? `处理 ${run.success_count} · 请求 ${run.request_count}` : "暂无批次"}
+                    </span>
+                    <span className="task-next">{nextRunLabel(task.next_run_at_ms, Date.now())}</span>
                   </div>
                 );
               })}

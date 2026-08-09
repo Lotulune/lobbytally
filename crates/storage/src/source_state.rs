@@ -125,6 +125,55 @@ pub fn finish_run(
     Ok(())
 }
 
+pub fn update_run_progress(
+    conn: &Connection,
+    run_id: i64,
+    request_count: i64,
+    success_count: i64,
+    notes: &str,
+) -> StorageResult<()> {
+    if request_count < 0 || success_count < 0 {
+        return Err(StorageError::validation(
+            "source run counters must be non-negative",
+        ));
+    }
+    let changed = conn.execute(
+        "UPDATE source_runs
+         SET request_count = ?1, success_count = ?2, notes = ?3
+         WHERE run_id = ?4 AND status = 'running'",
+        params![request_count, success_count, notes, run_id],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::conflict(format!(
+            "source run {run_id} is missing or already finalized"
+        )));
+    }
+    Ok(())
+}
+
+pub fn latest_runs(conn: &Connection) -> StorageResult<Vec<crate::models::PipelineRunStatus>> {
+    let mut statement = conn.prepare(
+        "SELECT task_type, status, started_at_ms, finished_at_ms,
+                request_count, success_count, error_category, notes
+         FROM source_runs
+         WHERE run_id IN (SELECT MAX(run_id) FROM source_runs GROUP BY task_type)
+         ORDER BY task_type",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(crate::models::PipelineRunStatus {
+            task_type: row.get(0)?,
+            status: row.get(1)?,
+            started_at_ms: row.get(2)?,
+            finished_at_ms: row.get(3)?,
+            request_count: row.get(4)?,
+            success_count: row.get(5)?,
+            error_category: row.get(6)?,
+            notes: row.get(7)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 pub fn ensure_data_refresh_tasks(conn: &Connection, now_ms: i64) -> StorageResult<()> {
     for task_name in [
         "catalog_sync",

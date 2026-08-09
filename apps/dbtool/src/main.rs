@@ -257,6 +257,36 @@ fn list_enrichment_targets_with_quotas(
                 .or_insert(target);
         }
     }
+    if merged.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
+        // Empty dimensions must not waste their share of the batch. Preserve
+        // the fair quota picks, then fill remaining slots from any due
+        // dimension without raising the configured per-run app limit.
+        let fill_targets = repo.list_enrichment_targets_after_filtered_with_media(
+            limit,
+            Some(after_app_id),
+            country_code,
+            language,
+            filter,
+            media_policy,
+        )?;
+        for target in fill_targets {
+            let target = target.filtered(filter);
+            if !target.needs_any() {
+                continue;
+            }
+            if let Some(current) = merged.get_mut(&target.app_id) {
+                current.needs_store_details |= target.needs_store_details;
+                current.needs_reviews |= target.needs_reviews;
+                current.needs_review_excerpts |= target.needs_review_excerpts;
+                current.needs_ccu |= target.needs_ccu;
+                current.needs_price |= target.needs_price;
+                current.needs_media_backfill |= target.needs_media_backfill;
+                current.needs_english_name |= target.needs_english_name;
+            } else if merged.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
+                merged.insert(target.app_id, target);
+            }
+        }
+    }
     let mut targets = merged.into_values().collect::<Vec<_>>();
     targets.sort_by_key(|target| (target.app_id <= after_app_id, target.app_id));
     Ok(targets)
@@ -777,7 +807,8 @@ fn run() -> Result<(), String> {
                 needs_media_backfill: false,
                 needs_english_name: false,
             };
-            match enrich_steam_candidates(&repo, &[target], &country_code, &language) {
+            match enrich_steam_candidates(&repo, &[target], &country_code, &language, Some(run_id))
+            {
                 Ok(stats) => {
                     let not_found = stats.store_ok == 0 && stats.store_not_found > 0;
                     let failed = not_found || stats.error_count > 0 || stats.store_ok == 0;
@@ -883,7 +914,7 @@ fn run() -> Result<(), String> {
                     )),
                 )
                 .map_err(err)?;
-            match enrich_steam_candidates(&repo, &targets, &country_code, &language) {
+            match enrich_steam_candidates(&repo, &targets, &country_code, &language, Some(run_id)) {
                 Ok(stats) => {
                     let next_cursor = EnrichmentCursor {
                         after_app_id: targets
@@ -1728,7 +1759,7 @@ fn run_enrichment_worker_task(
             repo.finish_source_run(run_id, "succeeded", 0, 0, None, Some("no targets due"))
         });
     }
-    match enrich_steam_candidates(repo, &targets, &country_code, &language) {
+    match enrich_steam_candidates(repo, &targets, &country_code, &language, Some(run_id)) {
         Ok(stats) => {
             let next_cursor = EnrichmentCursor {
                 after_app_id: targets
@@ -2638,6 +2669,7 @@ fn enrich_steam_candidates(
     targets: &[mpgs_storage::EnrichmentTarget],
     country_code: &str,
     language: &str,
+    run_id: Option<i64>,
 ) -> Result<EnrichStats, CollectionError> {
     let store_only = env_flag("MPGS_ENRICH_STORE_ONLY");
     let skip_reviews = store_only || env_flag("MPGS_ENRICH_SKIP_REVIEWS");
@@ -2658,6 +2690,7 @@ fn enrich_steam_candidates(
 
     let mut stats = EnrichStats::default();
     let total = targets.len();
+    record_enrichment_progress(repo, run_id, 0, total, &stats);
     for (index, target) in targets.iter().enumerate() {
         stats.apps_attempted = stats.apps_attempted.saturating_add(1);
         let mut app_ok = 0_i64;
@@ -2805,6 +2838,7 @@ fn enrich_steam_candidates(
         }
 
         stats.success_count = stats.success_count.saturating_add(app_ok);
+        record_enrichment_progress(repo, run_id, index + 1, total, &stats);
         if (index + 1) % 10 == 0 || index + 1 == total {
             // stderr so progress is visible when stdout is piped/fully buffered.
             eprintln!(
@@ -2822,6 +2856,27 @@ fn enrich_steam_candidates(
         }
     }
     Ok(stats)
+}
+
+fn record_enrichment_progress(
+    repo: &Repository,
+    run_id: Option<i64>,
+    current: usize,
+    total: usize,
+    stats: &EnrichStats,
+) {
+    let Some(run_id) = run_id else {
+        return;
+    };
+    let notes = format!(
+        "phase=enrichment;apps_attempted={current};apps_total={total};store={};reviews={};popular_reviews={};ccu={};errors={}",
+        stats.store_ok, stats.reviews_ok, stats.popular_reviews_ok, stats.ccu_ok, stats.error_count
+    );
+    if let Err(error) =
+        repo.update_source_run_progress(run_id, stats.request_count, stats.success_count, &notes)
+    {
+        eprintln!("warn source_run={run_id} progress update failed: {error}");
+    }
 }
 
 #[derive(Debug)]

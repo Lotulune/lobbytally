@@ -149,6 +149,31 @@ describe("GameCard recommendation semantics", () => {
     }
   });
 
+  it("only marks the first five items in recommendation context", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    try {
+      act(() => root.render(<GameCard item={item({ rank: 6 })} onOpen={() => undefined} />));
+      expect(host.querySelector(".score-badge")).toBeNull();
+      expect(host.textContent).not.toContain("第 6 推荐");
+
+      act(() =>
+        root.render(
+          <GameCard
+            item={item({ rank: 2 })}
+            onOpen={() => undefined}
+            recommendationContext={false}
+          />,
+        ),
+      );
+      expect(host.querySelector(".score-badge")).toBeNull();
+    } finally {
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
   it("withholds the index and warns when data confidence is low", () => {
     const host = document.createElement("div");
     document.body.append(host);

@@ -19,6 +19,30 @@
   font-size: 1.25rem;
 }
 
+.data-ops .data-ops-live {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-ops .live-dot,
+.data-ops .worker-state-dot,
+.data-ops .task-state-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--ok, #3d9a6a);
+}
+
+.data-ops .live-dot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok, #3d9a6a) 16%, transparent);
+}
+
 .data-ops .data-ops-token {
   display: flex;
   flex-wrap: wrap;
@@ -55,7 +79,7 @@
 .data-ops .data-ops-stat {
   padding: 12px 14px;
   border: var(--bw) solid var(--border);
-  border-radius: 12px;
+  border-radius: 8px;
   background: var(--surface);
   display: grid;
   gap: 4px;
@@ -69,7 +93,7 @@
 .data-ops .data-ops-stat .value {
   font-size: 1.45rem;
   font-weight: 650;
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   font-variant-numeric: tabular-nums;
 }
 
@@ -122,7 +146,7 @@
 
 .data-ops .bar-track {
   height: 10px;
-  border-radius: 999px;
+  border-radius: 4px;
   background: var(--surface-2, color-mix(in srgb, var(--surface) 70%, var(--border)));
   overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
@@ -131,25 +155,181 @@
 .data-ops .bar-fill {
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(
-    90deg,
-    color-mix(in srgb, var(--accent, #5b8def) 78%, #fff),
-    var(--accent, #5b8def)
-  );
+  background: var(--accent, #5b8def);
   min-width: 0;
   transition: width 0.35s ease;
 }
 
 .data-ops .bar-fill[data-tone="warn"] {
-  background: linear-gradient(90deg, #d4b04a, #c9a227);
+  background: var(--warn, #c9a227);
 }
 
 .data-ops .bar-fill[data-tone="bad"] {
-  background: linear-gradient(90deg, #e07a7a, #d35454);
+  background: var(--danger, #d35454);
 }
 
 .data-ops .bar-fill[data-tone="ok"] {
-  background: linear-gradient(90deg, #5cb88a, #3d9a6a);
+  background: var(--ok, #3d9a6a);
+}
+
+.data-ops .worker-live {
+  display: grid;
+  gap: 14px;
+}
+
+.data-ops .worker-live-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.data-ops .worker-live-head > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.data-ops .worker-live-head strong {
+  font-size: 14px;
+}
+
+.data-ops .worker-live-head div span,
+.data-ops .worker-requests {
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-ops .worker-live[data-running="false"] .worker-state-dot {
+  background: var(--ink-muted);
+  box-shadow: none;
+}
+
+.data-ops .worker-live[data-running="true"] .worker-state-dot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok, #3d9a6a) 16%, transparent);
+  animation: data-ops-pulse 1.8s ease-in-out infinite;
+}
+
+.data-ops .worker-progress {
+  display: grid;
+  gap: 6px;
+}
+
+.data-ops .worker-queue-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-ops .worker-queue-line [data-tone="bad"] {
+  color: var(--danger, #d35454);
+}
+
+.data-ops .worker-queue-line [data-tone="ok"] {
+  color: var(--ok, #3d9a6a);
+}
+
+.data-ops .section-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.data-ops .section-metric {
+  min-width: 0;
+  padding: 13px 14px;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.data-ops .section-metric:last-child {
+  border-right: 0;
+}
+
+.data-ops .section-metric span {
+  display: block;
+  min-height: 34px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.data-ops .section-metric strong {
+  font-size: 1.45rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-ops .section-metric small {
+  margin-left: 4px;
+  color: var(--ink-muted);
+}
+
+.data-ops .section-metric[data-tone="bad"] {
+  box-shadow: inset 0 3px 0 var(--danger, #d35454);
+}
+
+.data-ops .task-row {
+  display: grid;
+  grid-template-columns: auto minmax(150px, 1fr) minmax(130px, auto) minmax(80px, auto);
+  align-items: center;
+  gap: 10px;
+  min-height: 46px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.data-ops .task-row:last-child {
+  border-bottom: 0;
+}
+
+.data-ops .task-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.data-ops .task-copy strong {
+  font-size: 13px;
+}
+
+.data-ops .task-copy span,
+.data-ops .task-run-count,
+.data-ops .task-next {
+  color: var(--ink-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.data-ops .task-run-count,
+.data-ops .task-next {
+  text-align: right;
+}
+
+.data-ops .task-row[data-tone="running"] .task-state-dot {
+  animation: data-ops-pulse 1.8s ease-in-out infinite;
+}
+
+.data-ops .task-row[data-tone="bad"] .task-state-dot {
+  background: var(--danger, #d35454);
+}
+
+@keyframes data-ops-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
 }
 
 .data-ops .task-list {
@@ -160,7 +340,7 @@
 .data-ops .task-card {
   padding: 12px 14px;
   border: var(--bw) solid var(--border);
-  border-radius: 12px;
+  border-radius: 8px;
   background: var(--surface);
   display: grid;
   gap: 8px;
@@ -242,4 +422,52 @@
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+@media (max-width: 760px) {
+  .data-ops .section-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .data-ops .section-metric:nth-child(2) {
+    border-right: 0;
+  }
+
+  .data-ops .section-metric:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .data-ops .task-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .data-ops .task-run-count {
+    display: none;
+  }
+}
+
+@media (max-width: 500px) {
+  .data-ops .worker-live-head {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .data-ops .worker-requests {
+    grid-column: 2;
+  }
+
+  .data-ops .task-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .data-ops .task-next {
+    grid-column: 2;
+    text-align: left;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .data-ops .worker-live[data-running="true"] .worker-state-dot,
+  .data-ops .task-row[data-tone="running"] .task-state-dot {
+    animation: none;
+  }
 }
