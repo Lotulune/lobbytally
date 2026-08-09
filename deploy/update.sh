@@ -14,6 +14,7 @@ fi
 
 script_dir=${MPGS_UPDATE_SCRIPT_DIR:?missing original update script directory}
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+. "$script_dir/deployment-healthcheck-retry.sh"
 env_file="$script_dir/.env"
 source_compose_file="$script_dir/docker-compose.yml"
 runtime_dir="$script_dir/runtime"
@@ -279,23 +280,34 @@ old_web_release_sha=$(printf '%s' "$old_web_release_sha" | tr '[:upper:]' '[:low
 
 deployment_healthcheck() {
   compose_runner=$1
+  deployment_health_detail=
   meta=
-  curl --fail --silent --show-error \
-      "http://127.0.0.1:${health_port}/health/ready" >/dev/null 2>&1 \
-    || return 1
-  meta=$(curl --fail --silent --show-error \
-    "http://127.0.0.1:${health_port}/v1/meta" 2>/dev/null) \
-    || return 1
+  if ! curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+    "http://127.0.0.1:${health_port}/health/ready" >/dev/null 2>&1; then
+    deployment_health_detail="readiness endpoint failed on port ${health_port}"
+    return 1
+  fi
+  if ! meta=$(curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+    "http://127.0.0.1:${health_port}/v1/meta" 2>/dev/null); then
+    deployment_health_detail="metadata endpoint failed on port ${health_port}"
+    return 1
+  fi
   if ! printf '%s' "$meta" \
     | grep -F "\"build_git_sha\":\"$release_sha\"" >/dev/null; then
     # The old service set has already been stopped before the replacement is
     # started, so a responsive endpoint with another immutable revision cannot
     # become the requested release by waiting. Distinguish this fatal mismatch
     # from temporary startup/worker-health failures.
+    deployment_health_detail="metadata does not report target revision ${release_sha}"
     return 2
   fi
-  "$compose_runner" exec -T mpgs-worker \
-    /usr/local/bin/mpgs-worker-loop --healthcheck >/dev/null 2>&1
+  if ! "$compose_runner" exec -T mpgs-worker \
+    /usr/local/bin/mpgs-worker-loop --healthcheck >/dev/null 2>&1; then
+    deployment_health_detail="worker healthcheck failed"
+    return 1
+  fi
+  deployment_health_detail="healthy"
+  return 0
 }
 
 prune_pre_update_backups() {
@@ -368,21 +380,26 @@ esac
 if [ "$mode_matches" -eq 1 ] \
   && [ "$old_release_sha" = "$release_sha" ] \
   && [ "$old_worker_image_id" = "$old_server_image_id" ] \
-  && { [ -z "$old_source_sha" ] || [ "$old_source_sha" = "$release_sha" ]; } \
-  && deployment_healthcheck old_compose; then
-  if ! advance_source_checkout; then
-    printf 'Healthy containers are at %s, but the source fast-forward failed.\n' \
-      "$release_sha" >&2
-    exit 1
+  && { [ -z "$old_source_sha" ] || [ "$old_source_sha" = "$release_sha" ]; }; then
+  existing_health_result=0
+  retry_deployment_healthcheck old_compose 5 2 || existing_health_result=$?
+  if [ "$existing_health_result" -eq 0 ]; then
+    if ! advance_source_checkout; then
+      printf 'Healthy containers are at %s, but the source fast-forward failed.\n' \
+        "$release_sha" >&2
+      exit 1
+    fi
+    if pruned_count=$(prune_pre_update_backups "$old_server_container"); then
+      printf 'Pruned %s old pre-update backup(s); retaining the newest %s.\n' \
+        "$pruned_count" "$backup_retention_count"
+    else
+      printf 'Warning: could not prune old pre-update backups.\n' >&2
+    fi
+    printf 'MPGS %s deployment is already healthy at %s\n' "$mode" "$release_sha"
+    exit 0
   fi
-  if pruned_count=$(prune_pre_update_backups "$old_server_container"); then
-    printf 'Pruned %s old pre-update backup(s); retaining the newest %s.\n' \
-      "$pruned_count" "$backup_retention_count"
-  else
-    printf 'Warning: could not prune old pre-update backups.\n' >&2
-  fi
-  printf 'MPGS %s deployment is already healthy at %s\n' "$mode" "$release_sha"
-  exit 0
+  printf 'Existing containers match release %s but remained unhealthy; performing a controlled redeploy.\n' \
+    "$release_sha" >&2
 fi
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -579,14 +596,16 @@ validate_deployment() {
     case "$health_result" in
       0) return 0 ;;
       2)
-        printf 'Deployment reports a build revision other than %s; refusing to retry it.\n' \
-          "$release_sha" >&2
+        printf 'Deployment reports a build revision other than %s: %s\n' \
+          "$release_sha" "$deployment_health_detail" >&2
         return 1
         ;;
     esac
     sleep 2
     attempt=$((attempt + 1))
   done
+  printf 'Deployment did not become healthy after %s attempts: %s\n' \
+    "$max_attempts" "${deployment_health_detail:-unknown failure}" >&2
   return 1
 }
 
