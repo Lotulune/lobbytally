@@ -4,6 +4,20 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$script_dir/deployment-healthcheck-retry.sh"
 
+classify_worker_health_result 0
+if classify_worker_health_result 3; then
+  printf 'soft-stale worker health unexpectedly passed\n' >&2
+  exit 1
+else
+  test "$?" -eq 3
+fi
+if classify_worker_health_result 7; then
+  printf 'hard-unhealthy worker health unexpectedly passed\n' >&2
+  exit 1
+else
+  test "$?" -eq 1
+fi
+
 attempts=0
 results="1 1 0"
 deployment_healthcheck() {

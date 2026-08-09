@@ -322,7 +322,55 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
               }
               tone={(integrated?.retry ?? 0) > 0 ? "warn" : undefined}
             />
+            <Stat
+              label="新游入库 Dead"
+              value={integrated?.dead ?? 0}
+              hint={
+                integrated?.oldest_dead_at_ms
+                  ? `最早一条 ${ago(integrated.oldest_dead_at_ms)}`
+                  : "没有待人工处理的条目"
+              }
+              tone={(integrated?.dead ?? 0) > 0 ? "bad" : "ok"}
+            />
           </div>
+
+          {(integrated?.dead ?? 0) > 0 ? (
+            <Panel title="新游入库 Dead 明细">
+              <div className="task-list">
+                <div className="task-card">
+                  <div className="task-top">
+                    <span className="title">按阶段</span>
+                    <span className="when">
+                      {integrated?.dead_by_stage
+                        .map((item) => `${item.key} ${item.count}`)
+                        .join(" · ")}
+                    </span>
+                  </div>
+                  <div className="task-top">
+                    <span className="title">按错误类型</span>
+                    <span className="when">
+                      {integrated?.dead_by_category
+                        .map((item) => `${item.key} ${item.count}`)
+                        .join(" · ")}
+                    </span>
+                  </div>
+                </div>
+                {integrated?.recent_dead.map((item) => (
+                  <div className="task-card" key={`${item.app_id}-${item.stage}`}>
+                    <div className="task-top">
+                      <span className="title">
+                        App {item.app_id} · {item.stage}
+                      </span>
+                      <span className="when">
+                        {item.error_category ?? "unknown"} · {ago(item.dead_at_ms)}
+                      </span>
+                    </div>
+                    {item.error_summary ? <span className="when">{item.error_summary}</span> : null}
+                  </div>
+                ))}
+              </div>
+            </Panel>
+          ) : null}
 
           <Panel title="资料完整度">
             <div className="bar-list">

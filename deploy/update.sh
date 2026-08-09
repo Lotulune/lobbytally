@@ -301,11 +301,22 @@ deployment_healthcheck() {
     deployment_health_detail="metadata does not report target revision ${release_sha}"
     return 2
   fi
-  if ! "$compose_runner" exec -T mpgs-worker \
-    /usr/local/bin/mpgs-worker-loop --healthcheck >/dev/null 2>&1; then
-    deployment_health_detail="worker healthcheck failed"
-    return 3
-  fi
+  worker_health_result=0
+  "$compose_runner" exec -T mpgs-worker \
+    /usr/local/bin/mpgs-worker-loop --healthcheck >/dev/null 2>&1 \
+    || worker_health_result=$?
+  classify_worker_health_result "$worker_health_result" || worker_health_result=$?
+  case "$worker_health_result" in
+    0) ;;
+    3)
+      deployment_health_detail="worker heartbeat is briefly stale"
+      return 3
+      ;;
+    *)
+      deployment_health_detail="worker is hard-unhealthy"
+      return 1
+      ;;
+  esac
   deployment_health_detail="healthy"
   return 0
 }

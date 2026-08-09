@@ -259,29 +259,37 @@ pub fn ingest_store_details(
         None,
         now_ms,
     )?;
-    let checked_empty = details.name.as_deref().is_none_or(str::is_empty)
+    let store_core_empty = details.name.as_deref().is_none_or(str::is_empty)
         || details.platforms.as_ref().is_none_or(Vec::is_empty)
         || details
             .supported_languages
             .as_ref()
-            .is_none_or(Vec::is_empty)
-        || details.price.is_none();
+            .is_none_or(Vec::is_empty);
+    let price_empty = details.price.is_none();
     conn.execute(
         "INSERT INTO store_detail_refresh_state(
-             app_id, country_code, language, captured_at_ms, status, source, checked_empty
-         ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, ?6)
+             app_id, country_code, language, captured_at_ms, status, source,
+             checked_empty, store_core_empty, price_empty,
+             store_checked_at_ms, price_checked_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, ?6, ?7, ?8, ?4, ?4)
          ON CONFLICT(app_id, country_code, language) DO UPDATE SET
              captured_at_ms = excluded.captured_at_ms,
              status = excluded.status,
              source = excluded.source,
-             checked_empty = excluded.checked_empty",
+             checked_empty = excluded.checked_empty,
+             store_core_empty = excluded.store_core_empty,
+             price_empty = excluded.price_empty,
+             store_checked_at_ms = excluded.store_checked_at_ms,
+             price_checked_at_ms = excluded.price_checked_at_ms",
         params![
             details.app_id,
             details.country_code.trim().to_ascii_uppercase(),
             details.language.trim().to_ascii_lowercase(),
             now_ms,
             details.source,
-            i64::from(checked_empty)
+            i64::from(store_core_empty || price_empty),
+            i64::from(store_core_empty),
+            i64::from(price_empty)
         ],
     )?;
     catalog::upsert_app_localization(

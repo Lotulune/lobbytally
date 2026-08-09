@@ -68,6 +68,7 @@ jobs:
         run: |
           sh deploy/tests/materialize-release-compose.sh
           sh deploy/tests/deployment-healthcheck-retry.sh
+          sh deploy/tests/worker-health-v2.sh
 
       - name: Install Rust 1.97.0
         run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy

@@ -1467,7 +1467,7 @@ fn integrated_game_ingestion_resumes_current_stage_after_exit_and_network_retry(
     assert_eq!(resumed.len(), 1);
     assert_eq!(resumed[0].stage, "review_summary");
 
-    repo.retry_game_ingestion_stage(632360, "worker-b", "network", 5_000)
+    repo.retry_game_ingestion_stage(632360, "worker-b", "network", "fixture timeout", 5_000)
         .unwrap();
     assert!(
         repo.claim_game_ingestion_tasks("worker-c", 1, 30_000)
@@ -1480,8 +1480,212 @@ fn integrated_game_ingestion_resumes_current_stage_after_exit_and_network_retry(
         .unwrap();
     assert_eq!(retried.len(), 1);
     assert_eq!(retried[0].stage, "review_summary");
-    assert_eq!(retried[0].stage_attempts, 2);
-    assert_eq!(retried[0].total_attempts, 3);
+    assert_eq!(retried[0].stage_failure_attempts, 1);
+    assert_eq!(retried[0].total_failure_attempts, 1);
+    assert_eq!(retried[0].lease_count, 3);
+}
+
+#[test]
+fn pipeline_reliability_migration_preserves_queue_and_rechecks_ambiguous_empty_state() {
+    let db = Database::open_in_memory().unwrap();
+    db.with_conn_mut(|conn| {
+        migrate::migrate_to(conn, 25, 1_000)?;
+        conn.execute(
+            "INSERT INTO apps(
+                 app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+             ) VALUES (42, 'game', 'Migration Fixture', 'released', 1, 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO store_detail_refresh_state(
+                 app_id, country_code, language, captured_at_ms, status, source, checked_empty
+             ) VALUES (42, 'CN', 'schinese', 900, 'succeeded', 'fixture', 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO game_ingestion_queue(
+                 app_id, source, priority, stage, status, stage_attempts, total_attempts,
+                 next_attempt_at_ms, discovered_at_ms, updated_at_ms
+             ) VALUES (42, 'fixture', 7, 'review_summary', 'retry', 2, 5, 2_000, 1, 1)",
+            [],
+        )?;
+        migrate::migrate_to(conn, latest_version(), 2_000)?;
+        Ok(())
+    })
+    .unwrap();
+
+    db.with_conn(|conn| {
+        let refresh: (i64, i64, i64, i64) = conn.query_row(
+            "SELECT store_core_empty, price_empty, store_checked_at_ms, price_checked_at_ms
+             FROM store_detail_refresh_state WHERE app_id = 42",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(refresh, (0, 0, 0, 0));
+        let queue: (String, String, i64, i64, i64) = conn.query_row(
+            "SELECT stage, status, stage_failure_attempts, total_failure_attempts, lease_count
+             FROM game_ingestion_queue WHERE app_id = 42",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(queue, ("review_summary".into(), "retry".into(), 0, 0, 5));
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn ingestion_failures_become_dead_and_requeue_is_scoped_audited_and_idempotent() {
+    let (repo, clock) = repo_with_clock(10_000);
+    repo.ingest_store_search_page_and_queue_new_games(&StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 632360,
+            name: "Risk of Rain 2".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "dead-ingestion-fixture".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
+    for attempt in 1..=3 {
+        let claimed = repo
+            .claim_game_ingestion_tasks("worker-a", 1, 30_000)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let result = repo
+            .retry_game_ingestion_stage(632360, "worker-a", "parse_changed", &"x".repeat(600), 1)
+            .unwrap();
+        assert_eq!(result.stage_failure_attempts, attempt);
+        assert_eq!(result.status == "dead", attempt == 3);
+        clock.advance_ms(1);
+    }
+
+    assert!(
+        repo.claim_game_ingestion_tasks("worker-b", 1, 30_000)
+            .unwrap()
+            .is_empty()
+    );
+    let snapshot = repo.refresh_pipeline_status_snapshot().unwrap();
+    assert_eq!(snapshot.integrated_ingestion.dead, 1);
+    assert_eq!(
+        snapshot.integrated_ingestion.dead_by_stage[0].key,
+        "store_details"
+    );
+    assert_eq!(
+        snapshot.integrated_ingestion.dead_by_category[0].key,
+        "parse_changed"
+    );
+    assert_eq!(
+        snapshot.integrated_ingestion.recent_dead[0]
+            .error_summary
+            .as_ref()
+            .unwrap()
+            .chars()
+            .count(),
+        512
+    );
+
+    assert!(
+        repo.requeue_dead_game_ingestion_task(
+            632360,
+            "store_details",
+            "operator@example",
+            "adapter fixed"
+        )
+        .unwrap()
+    );
+    assert!(
+        !repo
+            .requeue_dead_game_ingestion_task(
+                632360,
+                "store_details",
+                "operator@example",
+                "duplicate command"
+            )
+            .unwrap()
+    );
+    let requeued = repo
+        .claim_game_ingestion_tasks("worker-b", 1, 30_000)
+        .unwrap();
+    assert_eq!(requeued[0].stage_failure_attempts, 0);
+    assert_eq!(requeued[0].total_failure_attempts, 3);
+    assert_eq!(requeued[0].lease_count, 4);
+    repo.database()
+        .with_conn(|conn| {
+            let audits: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM game_ingestion_requeue_audit WHERE app_id = 632360",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(audits, 1);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn global_ingestion_failure_pauses_owned_lane_without_consuming_failure_budget() {
+    let (repo, clock) = repo_with_clock(20_000);
+    repo.ingest_store_search_page_and_queue_new_games(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 10,
+                name: "First".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 20,
+                name: "Second".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "global-pause-fixture".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+    assert_eq!(
+        repo.claim_game_ingestion_tasks("worker-a", 2, 30_000)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        repo.pause_game_ingestion_lane("worker-a", "auth", "bad key", 60_000)
+            .unwrap(),
+        2
+    );
+    repo.database()
+        .with_conn(|conn| {
+            let state: (i64, i64, i64) = conn.query_row(
+                "SELECT SUM(status = 'retry'), SUM(stage_failure_attempts),
+                        SUM(lease_owner IS NOT NULL)
+                 FROM game_ingestion_queue",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(state, (2, 0, 0));
+            Ok(())
+        })
+        .unwrap();
+    clock.advance_ms(60_000);
+    assert_eq!(
+        repo.claim_game_ingestion_tasks("worker-b", 2, 30_000)
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -2051,6 +2255,51 @@ fn enrichment_targets_refresh_dynamic_dimensions_by_age() {
     let empty_retry_due = repo.list_enrichment_targets(10).unwrap();
     assert!(empty_retry_due[0].needs_store_details);
     assert!(empty_retry_due[0].needs_price);
+}
+
+#[test]
+fn empty_price_backoff_does_not_freeze_upcoming_store_refresh() {
+    use crate::repo::PRICE_REFRESH_INTERVAL_MS;
+
+    let (repo, clock) = repo_with_clock(10 * PRICE_REFRESH_INTERVAL_MS);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 42,
+            name: "Upcoming Fixture".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "upcoming-empty-price".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+    let raw = RawResponse::validate(
+        200,
+        br#"{"42":{"success":true,"data":{"steam_appid":42,"type":"game","name":"Upcoming Fixture","release_date":{"coming_soon":true,"date":"Coming soon"}}}}"#
+            .to_vec(),
+        Some("application/json".into()),
+        4096,
+    )
+    .unwrap();
+    let parsed = parse_store_details(
+        &StoreDetailsRequest::with_locale(42, "CN", "schinese").unwrap(),
+        &raw,
+    )
+    .unwrap();
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+
+    let immediate = repo.list_enrichment_targets(10).unwrap();
+    let immediate = immediate.iter().find(|target| target.app_id == 42).unwrap();
+    assert!(!immediate.needs_store_details);
+    assert!(!immediate.needs_price);
+
+    clock.advance_ms(PRICE_REFRESH_INTERVAL_MS + 1);
+    let due = repo.list_enrichment_targets(10).unwrap();
+    let due = due.iter().find(|target| target.app_id == 42).unwrap();
+    assert!(due.needs_store_details);
+    assert!(!due.needs_price);
 }
 
 #[test]

@@ -371,6 +371,7 @@ struct IntegratedIngestionStats {
     claimed_apps: usize,
     completed_apps: usize,
     retried_apps: usize,
+    dead_apps: usize,
 }
 
 fn main() -> ExitCode {
@@ -429,6 +430,30 @@ fn run() -> Result<(), String> {
             println!("schema_version={schema_version}");
             println!("steam_leases_recovered={recovered}");
             println!("game_ingestion_leases_recovered={recovered_game_ingestion}");
+            Ok(())
+        }
+        "requeue-game-ingestion" => {
+            let db_path = required_path(args.next(), "--db path")?;
+            let app_id = required_app_id(args.next())?;
+            let stage = args.next().ok_or("stage is required")?;
+            let operator = args.next().ok_or("operator is required")?;
+            let reason = args.next().ok_or("reason is required")?;
+            if args.next().is_some() {
+                return Err(
+                    "requeue-game-ingestion accepts db-path, app-id, stage, operator, and reason only"
+                        .into(),
+                );
+            }
+            let db = Database::open(&db_path).map_err(err)?;
+            db.migrate().map_err(err)?;
+            let repo = Repository::new(db);
+            let changed = repo
+                .requeue_dead_game_ingestion_task(app_id, &stage, &operator, &reason)
+                .map_err(err)?;
+            println!("path={}", db_path.display());
+            println!("app_id={app_id}");
+            println!("stage={stage}");
+            println!("requeued={changed}");
             Ok(())
         }
         "m3-audit" => {
@@ -1270,7 +1295,7 @@ fn integrated_ingestion_retry_delay_ms(category: &str, stage_attempts: i64) -> i
     if category == "rate_limited" {
         return i64::try_from(ENRICH_RATE_LIMIT_COOLDOWN_MS).unwrap_or(i64::MAX);
     }
-    let exponent = u32::try_from(stage_attempts.saturating_sub(1).clamp(0, 6)).unwrap_or(0);
+    let exponent = u32::try_from(stage_attempts.clamp(0, 6)).unwrap_or(0);
     WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent)
 }
 
@@ -1313,13 +1338,31 @@ fn process_integrated_game_ingestion_with(
                     })?;
                 }
                 Err(failure) => {
-                    let retry_delay_ms =
-                        integrated_ingestion_retry_delay_ms(failure.category, task.stage_attempts);
-                    worker_storage_with_retry(|| {
+                    let retry_delay_ms = integrated_ingestion_retry_delay_ms(
+                        failure.category,
+                        task.stage_failure_attempts,
+                    );
+                    if matches!(failure.category, "auth" | "config") {
+                        worker_storage_with_retry(|| {
+                            repo.pause_game_ingestion_lane(
+                                owner,
+                                failure.category,
+                                &failure.message,
+                                retry_delay_ms,
+                            )
+                        })?;
+                        eprintln!(
+                            "error integrated ingestion lane paused category={} message={}",
+                            failure.category, failure.message
+                        );
+                        return Err(worker_task_error(failure.category, failure.message));
+                    }
+                    let retried = worker_storage_with_retry(|| {
                         repo.retry_game_ingestion_stage(
                             task.app_id,
                             owner,
                             failure.category,
+                            &failure.message,
                             retry_delay_ms,
                         )
                     })?;
@@ -1327,7 +1370,11 @@ fn process_integrated_game_ingestion_with(
                         "warn app_id={} integrated_stage={} category={} message={}",
                         task.app_id, task.stage, failure.category, failure.message
                     );
-                    stats.retried_apps = stats.retried_apps.saturating_add(1);
+                    if retried.status == "dead" {
+                        stats.dead_apps = stats.dead_apps.saturating_add(1);
+                    } else {
+                        stats.retried_apps = stats.retried_apps.saturating_add(1);
+                    }
                     break;
                 }
             }
@@ -2566,7 +2613,8 @@ fn source_error_category(error: &SourceError) -> &'static str {
         SourceError::JsonParse { .. }
         | SourceError::InvalidStructure { .. }
         | SourceError::InvalidUtf8 => "parse_changed",
-        SourceError::Config { .. } | SourceError::Permanent { .. } => "invalid_payload",
+        SourceError::Config { .. } => "config",
+        SourceError::Permanent { .. } => "invalid_payload",
         SourceError::ResponseTooLarge { .. } => "response_too_large",
         SourceError::HttpStatus { .. } | SourceError::Temporary { .. } => "network",
     }
@@ -3219,6 +3267,7 @@ fn usage() -> &'static str {
        feature-evidence-retention <db-path> [retention-ms] [--apply --confirm --backup path]\n\
        pipeline-retention <db-path> [retention-ms] [--batch-limit N] [--apply --confirm --backup path]\n\
        recover-steam-leases <db-path>\n\
+       requeue-game-ingestion <db-path> <app-id> <stage> <operator> <reason>\n\
        m3-audit <db-path>\n\
        m7-data-audit <db-path> [--allow-upcoming-shortfall=<reason>]\n\
        sync-retrieval <db-path> [limit=5000] [after_app_id=0]\n\

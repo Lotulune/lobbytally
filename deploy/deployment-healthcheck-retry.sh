@@ -1,5 +1,13 @@
 #!/bin/sh
 
+classify_worker_health_result() {
+  case "$1" in
+    0) return 0 ;;
+    3) return 3 ;;
+    *) return 1 ;;
+  esac
+}
+
 retry_deployment_healthcheck() {
   compose_runner=$1
   max_attempts=$2

@@ -94,10 +94,21 @@ export interface DataStatusResponse {
     pending: number;
     retry: number;
     leased: number;
+    dead: number;
     store_details: number;
     review_summary: number;
     popular_reviews: number;
     ccu: number;
+    oldest_dead_at_ms: number | null;
+    dead_by_stage: Array<{ key: string; count: number }>;
+    dead_by_category: Array<{ key: string; count: number }>;
+    recent_dead: Array<{
+      app_id: number;
+      stage: string;
+      error_category: string | null;
+      error_summary: string | null;
+      dead_at_ms: number;
+    }>;
   };
   inventory?: PipelineInventory;
   generated_at_ms?: number;
