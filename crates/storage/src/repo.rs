@@ -27,6 +27,7 @@ use std::{
 pub const REVIEW_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const CCU_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
 pub const PRICE_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
+pub const STORE_EMPTY_RETRY_INTERVAL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 pub const ENGLISH_NAME_RETRY_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const MEDIA_BACKFILL_CLAIM_TIMEOUT_MS: i64 = 5 * 60 * 1_000;
 const MAX_READ_CACHE_ENTRIES: usize = 4;
@@ -232,12 +233,13 @@ impl Repository {
         self.db.with_conn_mut(|conn| {
             conn.execute(
                 "INSERT INTO store_detail_refresh_state(
-                    app_id, country_code, language, captured_at_ms, status, source
-                 ) VALUES (?1, ?2, ?3, ?4, 'not_found', 'steam_store_appdetails')
+                    app_id, country_code, language, captured_at_ms, status, source, checked_empty
+                 ) VALUES (?1, ?2, ?3, ?4, 'not_found', 'steam_store_appdetails', 1)
                  ON CONFLICT(app_id, country_code, language) DO UPDATE SET
                     captured_at_ms = excluded.captured_at_ms,
                     status = excluded.status,
-                    source = excluded.source",
+                    source = excluded.source,
+                    checked_empty = excluded.checked_empty",
                 rusqlite::params![app_id, country_code, language, now],
             )?;
             Ok(())
@@ -245,12 +247,128 @@ impl Repository {
     }
 
     pub fn ingest_store_search_page(&self, page: &StoreSearchPage) -> StorageResult<usize> {
+        Ok(self
+            .ingest_store_search_page_and_queue_new_games(page)?
+            .ingested_candidates)
+    }
+
+    pub fn ingest_store_search_page_and_queue_new_games(
+        &self,
+        page: &StoreSearchPage,
+    ) -> StorageResult<crate::models::StoreSearchIngestOutcome> {
         let now = self.db.now_ms();
         self.db.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
+            let mut new_app_ids = Vec::new();
+            for candidate in &page.candidates {
+                let already_candidate = tx.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM feature_evidence evidence
+                         WHERE evidence.app_id = ?1
+                           AND evidence.feature_name = 'category_hint'
+                           AND evidence.is_active = 1
+                           AND evidence.confidence >= 0.3
+                     ) OR EXISTS (
+                         SELECT 1 FROM multiplayer_profiles profile
+                         WHERE profile.app_id = ?1
+                           AND (
+                               profile.dominant_mode IS NOT NULL
+                               OR profile.private_session IS NOT NULL
+                               OR profile.online_coop IS NOT NULL
+                               OR profile.self_hosted_server IS NOT NULL
+                               OR profile.drop_in_out IS NOT NULL
+                               OR profile.crossplay IS NOT NULL
+                               OR profile.recommended_max_players IS NOT NULL
+                           )
+                     )",
+                    [candidate.app_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !already_candidate {
+                    new_app_ids.push(candidate.app_id);
+                }
+            }
             let ingested = ingest::ingest_store_search_page(&tx, page, now)?;
+            let mut queued_new_app_ids = Vec::with_capacity(new_app_ids.len());
+            for app_id in new_app_ids {
+                if crate::game_ingestion::queue_new_app(
+                    &tx,
+                    app_id,
+                    mpgs_steam_source::STORE_SEARCH_SOURCE_NAME,
+                    now,
+                )? {
+                    queued_new_app_ids.push(app_id);
+                }
+            }
             tx.commit()?;
-            Ok(ingested)
+            Ok(crate::models::StoreSearchIngestOutcome {
+                ingested_candidates: ingested,
+                queued_new_app_ids,
+            })
+        })
+    }
+
+    pub fn pending_game_ingestion_app_ids(&self) -> StorageResult<Vec<u32>> {
+        self.db.with_conn(crate::game_ingestion::pending_app_ids)
+    }
+
+    pub fn recover_game_ingestion_leases(&self) -> StorageResult<usize> {
+        let now = self.db.now_ms();
+        self.db
+            .with_conn_mut(|conn| crate::game_ingestion::recover_leases(conn, now))
+    }
+
+    pub fn claim_game_ingestion_tasks(
+        &self,
+        owner: &str,
+        limit: i64,
+        lease_ms: i64,
+    ) -> StorageResult<Vec<crate::models::GameIngestionTask>> {
+        let now = self.db.now_ms();
+        self.db.with_conn_mut(|conn| {
+            crate::game_ingestion::claim_tasks(conn, owner, limit, lease_ms, now)
+        })
+    }
+
+    pub fn advance_game_ingestion_stage(
+        &self,
+        app_id: u32,
+        owner: &str,
+    ) -> StorageResult<crate::models::GameIngestionTask> {
+        let now = self.db.now_ms();
+        self.db
+            .with_conn_mut(|conn| crate::game_ingestion::advance_stage(conn, app_id, owner, now))
+    }
+
+    pub fn retry_game_ingestion_stage(
+        &self,
+        app_id: u32,
+        owner: &str,
+        error_category: &str,
+        retry_delay_ms: i64,
+    ) -> StorageResult<crate::models::GameIngestionTask> {
+        let now = self.db.now_ms();
+        self.db.with_conn_mut(|conn| {
+            crate::game_ingestion::retry_stage(
+                conn,
+                app_id,
+                owner,
+                error_category,
+                retry_delay_ms,
+                now,
+            )
+        })
+    }
+
+    pub fn game_ingestion_stage_observed(
+        &self,
+        app_id: u32,
+        stage: &str,
+        country_code: &str,
+        language: &str,
+    ) -> StorageResult<bool> {
+        self.db.with_conn(|conn| {
+            crate::game_ingestion::stage_observed(conn, app_id, stage, country_code, language)
         })
     }
 
@@ -389,6 +507,7 @@ impl Repository {
         let review_cutoff = now.saturating_sub(REVIEW_REFRESH_INTERVAL_MS);
         let ccu_cutoff = now.saturating_sub(CCU_REFRESH_INTERVAL_MS);
         let price_cutoff = now.saturating_sub(PRICE_REFRESH_INTERVAL_MS);
+        let store_empty_cutoff = now.saturating_sub(STORE_EMPTY_RETRY_INTERVAL_MS);
         let english_name_cutoff = now.saturating_sub(ENGLISH_NAME_RETRY_INTERVAL_MS);
         let after_app_id = i64::from(after_app_id.unwrap_or(0));
         let country_code = country_code.trim().to_ascii_uppercase();
@@ -461,7 +580,8 @@ impl Repository {
                                         AND refresh.country_code = ?5
                                         AND refresh.language = ?7
                                         AND refresh.status IN ('succeeded', 'not_found')
-                                        AND refresh.captured_at_ms >= ?4
+                                        AND refresh.captured_at_ms >= CASE
+                                            WHEN refresh.checked_empty = 1 THEN ?18 ELSE ?4 END
                                   )
                               THEN 1 ELSE 0 END AS needs_store_details,
                          CASE WHEN NOT EXISTS (
@@ -489,9 +609,10 @@ impl Repository {
                              SELECT 1 FROM store_detail_refresh_state refresh
                              WHERE refresh.app_id = candidates.app_id
                                AND refresh.country_code = ?5
-                               AND refresh.language = ?7
-                               AND refresh.status IN ('succeeded', 'not_found')
-                               AND refresh.captured_at_ms >= ?4
+                                        AND refresh.language = ?7
+                                        AND refresh.status IN ('succeeded', 'not_found')
+                                        AND refresh.captured_at_ms >= CASE
+                                            WHEN refresh.checked_empty = 1 THEN ?18 ELSE ?4 END
                          ) THEN 1 ELSE 0 END AS needs_price,
                          CASE WHEN ?13 = 1
                                    AND NOT EXISTS (
@@ -570,6 +691,7 @@ impl Repository {
                     media_cooldown_cutoff,
                     want_english_name,
                     english_name_cutoff,
+                    store_empty_cutoff,
                 ],
                 |row| {
                     Ok(EnrichmentTarget {
@@ -791,12 +913,13 @@ impl Repository {
         self.db.with_conn_mut(|conn| {
             conn.execute(
                 "INSERT INTO store_detail_refresh_state(
-                     app_id, country_code, language, captured_at_ms, status, source
-                 ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5)
+                     app_id, country_code, language, captured_at_ms, status, source, checked_empty
+                 ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, 0)
                  ON CONFLICT(app_id, country_code, language) DO UPDATE SET
                      captured_at_ms = excluded.captured_at_ms,
                      status = excluded.status,
-                     source = excluded.source",
+                     source = excluded.source,
+                     checked_empty = excluded.checked_empty",
                 rusqlite::params![app_id, country_code, language, now, source],
             )?;
             Ok(())
@@ -1485,6 +1608,32 @@ impl Repository {
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })?;
+        let integrated_ingestion = self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT
+                    COALESCE(SUM(status = 'pending' AND lease_owner IS NULL), 0),
+                    COALESCE(SUM(status = 'retry' AND lease_owner IS NULL), 0),
+                    COALESCE(SUM(lease_owner IS NOT NULL), 0),
+                    COALESCE(SUM(stage = 'store_details' AND status != 'complete'), 0),
+                    COALESCE(SUM(stage = 'review_summary' AND status != 'complete'), 0),
+                    COALESCE(SUM(stage = 'popular_reviews' AND status != 'complete'), 0),
+                    COALESCE(SUM(stage = 'ccu' AND status != 'complete'), 0)
+                 FROM game_ingestion_queue",
+                [],
+                |row| {
+                    Ok(crate::models::GameIngestionQueueStatus {
+                        pending: row.get(0)?,
+                        retry: row.get(1)?,
+                        leased: row.get(2)?,
+                        store_details: row.get(3)?,
+                        review_summary: row.get(4)?,
+                        popular_reviews: row.get(5)?,
+                        ccu: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+        })?;
         snapshot.generated_at_ms = generated_at_ms;
         snapshot.inventory = inventory;
         snapshot.dimension_coverage = dimension_coverage.0;
@@ -1498,6 +1647,7 @@ impl Repository {
         snapshot.m7_coverage.candidates_with_date = dimension_coverage.0.release_date;
         snapshot.m7_coverage.candidates_with_cover = dimension_coverage.1;
         snapshot.latest_runs = latest_runs;
+        snapshot.integrated_ingestion = integrated_ingestion;
         self.store_pipeline_status_snapshot(&snapshot)?;
         Ok(snapshot)
     }
@@ -1618,8 +1768,15 @@ impl Repository {
 
     pub fn resolve_account_access_token(&self, token: &str) -> StorageResult<String> {
         let now = self.db.now_ms();
-        self.db
-            .with_conn_mut(|conn| crate::accounts::resolve_account_user_id(conn, token, now))
+        let (user_id, touch_due) = self
+            .db
+            .with_conn(|conn| crate::accounts::resolve_account_user_id_read(conn, token, now))?;
+        if touch_due {
+            let _ = self.db.with_conn_mut(|conn| {
+                crate::accounts::touch_account_last_active(conn, &user_id, now)
+            });
+        }
+        Ok(user_id)
     }
 
     pub fn resolve_anonymous_access_token(&self, token: &str) -> StorageResult<String> {

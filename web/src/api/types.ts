@@ -90,6 +90,15 @@ export interface DataStatusResponse {
     success_count: number;
     error_category: string | null;
   }>;
+  integrated_ingestion?: {
+    pending: number;
+    retry: number;
+    leased: number;
+    store_details: number;
+    review_summary: number;
+    popular_reviews: number;
+    ccu: number;
+  };
   inventory?: PipelineInventory;
   generated_at_ms?: number;
   build_git_sha?: string;

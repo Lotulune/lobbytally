@@ -7763,6 +7763,7 @@ async fn data_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
             "m7_coverage": snapshot.m7_coverage,
             "dimension_coverage": snapshot.dimension_coverage,
             "latest_runs": snapshot.latest_runs,
+            "integrated_ingestion": snapshot.integrated_ingestion,
             "inventory": snapshot.inventory,
             "generated_at_ms": snapshot.generated_at_ms,
             "build_git_sha": build_git_sha(),

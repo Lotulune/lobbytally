@@ -200,6 +200,23 @@ fast-forward 到同一 SHA。更新器从临时副本运行，因此源码切换
 `MPGS_BACKUP_RETENTION_COUNT` 调整（范围 `1..100`）。`MPGS_DEPLOY_HEALTH_TIMEOUT_SECS`
 默认 600 秒，用于低配主机上的一次性迁移/索引构建；它不会改变 systemd 的总超时。
 
+PR 2 镜像部署并稳定观察新游入库至少 24 小时后，先保持所有应用 writer 停止并验证
+最新备份，再从同一 immutable server 镜像运行存量清理 dry-run：
+
+```bash
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml run --rm \
+  --entrypoint mpgs-dbtool mpgs-server \
+  pipeline-retention /var/lib/mpgs/mpgs.db
+```
+
+dry-run 会分别报告重复 inactive evidence、非候选检索文档/embedding/FTS、历史
+completed/dead job 及预计 payload 字节数。实际删除必须额外提供
+`--apply --confirm --backup /var/lib/mpgs/backups/<validated>.db`，并可用
+`--batch-limit` 限制单批；该命令始终输出 `compact=false`，不会执行 `VACUUM` 或替换
+数据库文件。删除后先核对完整性、名称搜索和覆盖率，再在独立维护窗口决定是否 compact。
+只有 compact 完成且备份恢复验证通过后，才可把 `MPGS_BACKUP_RETENTION_COUNT` 从 3
+显式调整为 2；不得仅为释放磁盘提前减少可恢复备份。
+
 紧急固定某个已发布版本时，可在 `deploy/.env` 临时设置完整的 40 位
 `MPGS_RELEASE_SHA`。无论跟随发布指针还是使用 pin，更新器都从目标 SHA 提取同版本
 Compose；本地缺少 pinned commit 时只从 `origin` 获取该对象，不推进当前 checkout。

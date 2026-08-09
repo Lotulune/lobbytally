@@ -171,7 +171,7 @@ pub fn recover_leased_jobs(
     let changed = if let Some(source) = source_filter {
         tx.execute(
             "UPDATE jobs
-             SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+             SET status = 'pending', attempts = MAX(attempts - 1, 0),
                  lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
              WHERE status = 'leased' AND source = ?2",
             params![now_ms, source],
@@ -179,7 +179,7 @@ pub fn recover_leased_jobs(
     } else {
         tx.execute(
             "UPDATE jobs
-             SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+             SET status = 'pending', attempts = MAX(attempts - 1, 0),
                  lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
              WHERE status = 'leased'",
             params![now_ms],
@@ -486,14 +486,15 @@ mod tests {
             let other = get_job(conn, other_job)?.expect("other job");
             let final_attempt = get_job(conn, final_job)?.expect("final job");
             assert_eq!(steam.status, "pending");
-            assert_eq!(steam.attempts, 1);
+            assert_eq!(steam.attempts, 0);
             assert_eq!(other.status, "leased");
-            assert_eq!(final_attempt.status, "dead");
+            assert_eq!(final_attempt.status, "pending");
+            assert_eq!(final_attempt.attempts, 0);
 
             let recovered = lease_jobs(conn, "worker-b", 1, 10_000, 1, Some("steam"))?;
             assert_eq!(recovered.len(), 1);
             assert_eq!(recovered[0].job_id, steam_job);
-            assert_eq!(recovered[0].attempts, 2);
+            assert_eq!(recovered[0].attempts, 1);
             Ok(())
         })
         .unwrap();

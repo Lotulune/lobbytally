@@ -408,25 +408,49 @@ pub fn resolve_account_user_id(
     access_token: &str,
     now_ms: i64,
 ) -> StorageResult<String> {
+    let (user_id, touch_due) = resolve_account_user_id_read(conn, access_token, now_ms)?;
+    if touch_due {
+        touch_account_last_active(conn, &user_id, now_ms)?;
+    }
+    Ok(user_id)
+}
+
+pub fn resolve_account_user_id_read(
+    conn: &Connection,
+    access_token: &str,
+    now_ms: i64,
+) -> StorageResult<(String, bool)> {
     let access_hash = token_hash(access_token);
-    let user_id = conn
+    let (user_id, last_active_at_ms) = conn
         .query_row(
-            "SELECT s.user_id
+            "SELECT s.user_id, anonymous.last_active_at_ms
              FROM account_sessions AS s
              JOIN user_accounts AS a ON a.user_id = s.user_id
+             JOIN anonymous_users AS anonymous ON anonymous.user_id = s.user_id
              WHERE s.access_token_hash = ?1 AND s.expires_at_ms > ?2
                AND s.revoked_at_ms IS NULL AND a.status = 'active'",
             params![access_hash, now_ms],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?
         .ok_or_else(|| StorageError::not_found("account session"))?;
+    Ok((
+        user_id,
+        last_active_at_ms <= now_ms.saturating_sub(5 * 60 * 1000),
+    ))
+}
+
+pub fn touch_account_last_active(
+    conn: &Connection,
+    user_id: &str,
+    now_ms: i64,
+) -> StorageResult<()> {
     conn.execute(
         "UPDATE anonymous_users SET last_active_at_ms = ?1
          WHERE user_id = ?2 AND last_active_at_ms <= ?3",
         params![now_ms, user_id, now_ms.saturating_sub(5 * 60 * 1000)],
     )?;
-    Ok(user_id)
+    Ok(())
 }
 
 pub fn resolve_anonymous_user_id(

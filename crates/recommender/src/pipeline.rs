@@ -176,14 +176,14 @@ pub fn rank_feed_configured_with_constraints_and_tie_seed(
 /// three-point lift. A zero legacy weight/saturation still disables the signal.
 fn play_intent_boost(count: u32, weight: f64, saturation: u32) -> f64 {
     const MIN_VOTERS: u32 = 5;
-    const HALF_LIFT_EXCESS_VOTERS: f64 = 20.0;
     const MAX_LIFT: f64 = 0.03;
 
     if count <= MIN_VOTERS || saturation == 0 || weight <= 0.0 {
         return 0.0;
     }
     let excess = f64::from(count - MIN_VOTERS);
-    let norm = excess / (excess + HALF_LIFT_EXCESS_VOTERS);
+    let half_lift_excess = f64::from(saturation.saturating_sub(MIN_VOTERS).max(1));
+    let norm = excess / (excess + half_lift_excess);
     crate::unit(weight).min(MAX_LIFT) * norm
 }
 
@@ -280,25 +280,34 @@ fn ensure_fresh_release_quota(items: &mut [RankedCandidate], window: usize, quot
         .filter(|item| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
         .count();
     let missing = quota.min(window).saturating_sub(current);
-    let destinations = items[..window]
-        .iter()
-        .enumerate()
-        .rev()
-        .filter(|(_, item)| item.score.freshness < FRESH_RELEASE_MIN_FRESHNESS)
-        .map(|(index, _)| index)
-        .take(missing)
-        .collect::<Vec<_>>();
     let sources = items[window..]
         .iter()
         .enumerate()
         .filter(|(_, item)| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
         .map(|(index, _)| index + window)
-        .take(missing)
         .collect::<Vec<_>>();
 
-    for (destination, source) in destinations.into_iter().zip(sources) {
-        items.swap(destination, source);
-        items[destination].slot_reason = SlotReason::Explore;
+    let mut promoted = 0;
+    for source in sources {
+        if promoted >= missing {
+            break;
+        }
+        let destinations = items[..window]
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, item)| item.score.freshness < FRESH_RELEASE_MIN_FRESHNESS)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for destination in destinations {
+            items.swap(destination, source);
+            if crate::mmr::respects_mode_guardrail(items) {
+                items[destination].slot_reason = SlotReason::Explore;
+                promoted += 1;
+                break;
+            }
+            items.swap(destination, source);
+        }
     }
 }
 
@@ -306,7 +315,16 @@ fn ensure_fresh_release_quota(items: &mut [RankedCandidate], window: usize, quot
 mod tests {
     use super::{
         FRESH_RELEASE_MIN_FRESHNESS, RankedCandidate, SlotReason, ensure_fresh_release_quota,
+        play_intent_boost,
     };
+
+    #[test]
+    fn play_intent_saturation_controls_the_half_lift_vote_count() {
+        let half_lift = play_intent_boost(8, 1.0, 8);
+        assert!((half_lift - 0.015).abs() < 1e-12);
+        assert!(play_intent_boost(8, 1.0, 100) < half_lift);
+        assert!(play_intent_boost(100, 1.0, 8) > half_lift);
+    }
     use crate::{Explanation, ScoreBreakdown};
 
     fn ranked(app_id: u32, freshness: f64) -> RankedCandidate {
@@ -382,6 +400,39 @@ mod tests {
                 .iter()
                 .filter(|item| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
                 .all(|item| item.slot_reason == SlotReason::Explore)
+        );
+    }
+
+    #[test]
+    fn fresh_release_quota_preserves_mmr_mode_diversity() {
+        let mut items = (0..30)
+            .map(|app_id| {
+                let mut item = ranked(app_id, if app_id >= 25 { 1.0 } else { 0.5 });
+                item.dominant_mode = Some(
+                    match app_id {
+                        0..=11 | 20..=29 => "coop",
+                        12..=15 => "pvp",
+                        _ => "self_hosted",
+                    }
+                    .into(),
+                );
+                item
+            })
+            .collect::<Vec<_>>();
+
+        ensure_fresh_release_quota(&mut items, 20, 4);
+
+        let coop_count = items[..20]
+            .iter()
+            .filter(|item| item.dominant_mode.as_deref() == Some("coop"))
+            .count();
+        assert!(coop_count <= 12);
+        assert_eq!(
+            items[..20]
+                .iter()
+                .filter(|item| item.score.freshness >= FRESH_RELEASE_MIN_FRESHNESS)
+                .count(),
+            4
         );
     }
 }

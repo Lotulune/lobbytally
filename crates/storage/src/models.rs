@@ -343,6 +343,17 @@ pub struct PipelineRunStatus {
     pub error_category: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameIngestionQueueStatus {
+    pub pending: i64,
+    pub retry: i64,
+    pub leased: i64,
+    pub store_details: i64,
+    pub review_summary: i64,
+    pub popular_reviews: i64,
+    pub ccu: i64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PipelineStatusSnapshot {
     pub generated_at_ms: i64,
@@ -351,4 +362,26 @@ pub struct PipelineStatusSnapshot {
     pub m7_coverage: M7DataCoverage,
     pub dimension_coverage: PipelineDimensionCoverage,
     pub latest_runs: Vec<PipelineRunStatus>,
+    #[serde(default)]
+    pub integrated_ingestion: GameIngestionQueueStatus,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreSearchIngestOutcome {
+    pub ingested_candidates: usize,
+    pub queued_new_app_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameIngestionTask {
+    pub app_id: u32,
+    pub source: String,
+    pub priority: i64,
+    pub stage: String,
+    pub status: String,
+    pub stage_attempts: i64,
+    pub total_attempts: i64,
+    pub next_attempt_at_ms: i64,
+    pub last_error_category: Option<String>,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at_ms: Option<i64>,
 }

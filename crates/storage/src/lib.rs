@@ -15,6 +15,7 @@ pub mod curation;
 pub mod db;
 pub mod error;
 pub mod feedback;
+pub mod game_ingestion;
 pub mod ingest;
 pub mod jobs;
 pub mod migrate;
