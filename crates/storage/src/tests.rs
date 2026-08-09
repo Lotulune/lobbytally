@@ -1368,6 +1368,123 @@ fn store_search_candidates_are_auditable_without_fabricated_profiles() {
 }
 
 #[test]
+fn store_search_atomically_queues_only_new_games_for_integrated_ingestion() {
+    let (repo, _) = repo_with_clock(5_000);
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO apps (
+                    app_id, app_type, canonical_name, release_state,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (548430, 'game', 'Deep Rock Galactic', 'released', 1, 1)",
+                [],
+            )?;
+            crate::curation::insert_feature_evidence(
+                conn,
+                548430,
+                "category_hint",
+                &serde_json::json!({"category":"Multi-player"}),
+                "existing_candidate_fixture",
+                "fixture",
+                0.3,
+                1,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let page = StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 548430,
+                name: "Deep Rock Galactic".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 632360,
+                name: "Risk of Rain 2".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "integrated-ingestion-fixture".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    };
+
+    let first = repo
+        .ingest_store_search_page_and_queue_new_games(&page)
+        .unwrap();
+    assert_eq!(first.ingested_candidates, 2);
+    assert_eq!(first.queued_new_app_ids, vec![632360]);
+    assert_eq!(repo.pending_game_ingestion_app_ids().unwrap(), vec![632360]);
+
+    let second = repo
+        .ingest_store_search_page_and_queue_new_games(&page)
+        .unwrap();
+    assert_eq!(second.ingested_candidates, 2);
+    assert!(second.queued_new_app_ids.is_empty());
+    assert_eq!(repo.pending_game_ingestion_app_ids().unwrap(), vec![632360]);
+}
+
+#[test]
+fn integrated_game_ingestion_resumes_current_stage_after_exit_and_network_retry() {
+    let (repo, clock) = repo_with_clock(10_000);
+    let page = StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 632360,
+            name: "Risk of Rain 2".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "recoverable-ingestion-fixture".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    };
+    repo.ingest_store_search_page_and_queue_new_games(&page)
+        .unwrap();
+    let queued_snapshot = repo.refresh_pipeline_status_snapshot().unwrap();
+    assert_eq!(queued_snapshot.integrated_ingestion.pending, 1);
+    assert_eq!(queued_snapshot.integrated_ingestion.store_details, 1);
+
+    let first = repo
+        .claim_game_ingestion_tasks("worker-a", 1, 30_000)
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].app_id, 632360);
+    assert_eq!(first[0].stage, "store_details");
+    let leased_snapshot = repo.refresh_pipeline_status_snapshot().unwrap();
+    assert_eq!(leased_snapshot.integrated_ingestion.leased, 1);
+
+    let review = repo
+        .advance_game_ingestion_stage(632360, "worker-a")
+        .unwrap();
+    assert_eq!(review.stage, "review_summary");
+
+    clock.advance_ms(30_001);
+    let resumed = repo
+        .claim_game_ingestion_tasks("worker-b", 1, 30_000)
+        .unwrap();
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].stage, "review_summary");
+
+    repo.retry_game_ingestion_stage(632360, "worker-b", "network", 5_000)
+        .unwrap();
+    assert!(
+        repo.claim_game_ingestion_tasks("worker-c", 1, 30_000)
+            .unwrap()
+            .is_empty()
+    );
+    clock.advance_ms(5_000);
+    let retried = repo
+        .claim_game_ingestion_tasks("worker-c", 1, 30_000)
+        .unwrap();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].stage, "review_summary");
+    assert_eq!(retried[0].stage_attempts, 2);
+    assert_eq!(retried[0].total_attempts, 3);
+}
+
+#[test]
 fn unchanged_evidence_is_idempotent_but_fact_changes_keep_history() {
     let (repo, _) = repo_with_clock(5_000);
     let insert = |value: serde_json::Value, at: i64| {
@@ -1751,7 +1868,9 @@ fn golden_profile_import_raises_recommendation_ready_coverage() {
 
 #[test]
 fn enrichment_targets_refresh_dynamic_dimensions_by_age() {
-    use crate::repo::{CCU_REFRESH_INTERVAL_MS, PRICE_REFRESH_INTERVAL_MS};
+    use crate::repo::{
+        CCU_REFRESH_INTERVAL_MS, PRICE_REFRESH_INTERVAL_MS, STORE_EMPTY_RETRY_INTERVAL_MS,
+    };
 
     let day_ms = 24 * 60 * 60 * 1_000;
     let (repo, clock) = repo_with_clock(10 * day_ms);
@@ -1923,7 +2042,15 @@ fn enrichment_targets_refresh_dynamic_dimensions_by_age() {
     let daily_due = repo.list_enrichment_targets(10).unwrap();
     assert!(daily_due[0].needs_reviews);
     assert!(daily_due[0].needs_review_excerpts);
-    assert!(daily_due[0].needs_price);
+    assert!(
+        !daily_due[0].needs_price,
+        "checked-empty store fields must use the longer retry interval"
+    );
+
+    clock.advance_ms(STORE_EMPTY_RETRY_INTERVAL_MS - PRICE_REFRESH_INTERVAL_MS + 1);
+    let empty_retry_due = repo.list_enrichment_targets(10).unwrap();
+    assert!(empty_retry_due[0].needs_store_details);
+    assert!(empty_retry_due[0].needs_price);
 }
 
 #[test]
@@ -2277,6 +2404,67 @@ fn search_matches_chinese_and_english_localization_names() {
     )
     .unwrap();
     assert!(repo.search_games("ディープ", 10).unwrap().is_empty());
+}
+
+#[test]
+fn retrieval_sync_indexes_only_multiplayer_scope_without_hiding_name_search() {
+    let (repo, _) = repo_with_clock(50_000);
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO apps (
+                     app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+                 ) VALUES (1245620, 'game', '艾尔登法环', 'released', 1, 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    repo.upsert_app_localization(1245620, "english", Some("ELDEN RING"), None, "test")
+        .unwrap();
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 548430,
+            name: "Deep Rock Galactic".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "retrieval-scope-fixture".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
+    repo.sync_retrieval_from_catalog(100, 0, true).unwrap();
+    let document_counts = |app_id| {
+        repo.database()
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM game_documents WHERE app_id = ?1",
+                    [app_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Into::into)
+            })
+            .unwrap()
+    };
+    assert!(document_counts(548430) > 0);
+    assert_eq!(document_counts(1245620), 0);
+    assert_eq!(repo.search_games("ELDEN", 10).unwrap()[0].app_id, 1245620);
+
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE feature_evidence
+                 SET is_active = 0
+                 WHERE app_id = 548430 AND feature_name = 'category_hint'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    repo.sync_retrieval_from_catalog(100, 0, true).unwrap();
+    assert_eq!(document_counts(548430), 0);
 }
 
 #[test]

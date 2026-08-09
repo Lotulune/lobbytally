@@ -431,7 +431,8 @@ mod tests {
         assert_eq!(relevance_for(5), baseline);
 
         let first_lift = relevance_for(6) - baseline;
-        assert!((first_lift - 0.03 / 21.0).abs() < 1e-12);
+        assert!((first_lift - 0.03 / 4.0).abs() < 1e-12);
+        assert!((relevance_for(8) - baseline - 0.015).abs() < 1e-12);
 
         let maximum_lift = relevance_for(u32::MAX) - baseline;
         assert!(maximum_lift > first_lift);

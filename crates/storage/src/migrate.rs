@@ -124,6 +124,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0024_pipeline_observability",
         include_str!("../../../migrations/0024_pipeline_observability.sql"),
     ),
+    (
+        25,
+        "0025_integrated_game_ingestion",
+        include_str!("../../../migrations/0025_integrated_game_ingestion.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {

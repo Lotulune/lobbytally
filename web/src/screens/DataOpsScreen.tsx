@@ -175,6 +175,7 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
   const dimensions = status?.dimension_coverage;
   const tasks = status?.tasks ?? [];
   const latestRuns = status?.latest_runs ?? [];
+  const integrated = status?.integrated_ingestion;
   const pool = inv?.multiplayer_profiles ?? 0;
 
   const sectionBars = useMemo(() => {
@@ -310,6 +311,16 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
                   : `近 7 天无失败 · 历史 ${inv.jobs_dead}`
               }
               tone={inv.jobs_dead_recent > 0 ? "warn" : undefined}
+            />
+            <Stat
+              label="新游入库队列"
+              value={(integrated?.pending ?? 0) + (integrated?.retry ?? 0) + (integrated?.leased ?? 0)}
+              hint={
+                integrated
+                  ? `商店 ${integrated.store_details} · 评价 ${integrated.review_summary} · 热评 ${integrated.popular_reviews} · 在线 ${integrated.ccu}`
+                  : undefined
+              }
+              tone={(integrated?.retry ?? 0) > 0 ? "warn" : undefined}
             />
           </div>
 

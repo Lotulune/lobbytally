@@ -16,6 +16,7 @@ const DEFAULT_CANDIDATE_CONTINUATION_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_ENRICHMENT_INTERVAL_SECS: u64 = 5 * 60;
 const RECOMMENDATION_TELEMETRY_RETENTION_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const PIPELINE_SNAPSHOT_INTERVAL_SECS: u64 = 6 * 60 * 60;
+const LOCAL_MAINTENANCE_MAX_DEFERRAL_SECS: u64 = 30 * 60;
 const DEFAULT_RETRIEVAL_SYNC_BATCH_SIZE: u32 = 20;
 const RETRIEVAL_SYNC_BATCH_SIZE_MIN: u32 = 10;
 const RETRIEVAL_SYNC_BATCH_SIZE_MAX: u32 = 10_000;
@@ -171,7 +172,15 @@ fn run_once_with_schedule(
         .find(|status| status.task_name == TELEMETRY_RETENTION_TASK);
     run_recommendation_telemetry_retention(repo, telemetry_previous, now_ms, next_run_at_ms)?;
 
-    if !steam_work_active {
+    let local_maintenance_starved = previous_status
+        .iter()
+        .find(|status| status.task_name == "retrieval_sync")
+        .map(|status| status.last_success_at_ms.unwrap_or(status.updated_at_ms))
+        .is_some_and(|last_run_ms| {
+            now_ms.saturating_sub(last_run_ms)
+                >= (LOCAL_MAINTENANCE_MAX_DEFERRAL_SECS as i64).saturating_mul(1_000)
+        });
+    if !steam_work_active || local_maintenance_starved {
         run_local_maintenance(repo, &previous_status, None, now_ms, next_run_at_ms)?;
     } else {
         info!("local data maintenance deferred while Steam ingestion is active");
@@ -702,6 +711,42 @@ mod tests {
             .find(|status| status.task_name == "quality_check")
             .unwrap();
         assert_eq!(completed.last_success_at_ms, Some(0));
+    }
+
+    #[test]
+    fn runs_local_maintenance_after_maximum_deferral_with_steam_work_active() {
+        let clock = Arc::new(FakeClock::new(0));
+        let db = Database::open_in_memory_with_clock(clock.clone()).unwrap();
+        let repo = Repository::new(db);
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        repo.seed_demo_if_empty().unwrap();
+        repo.enqueue_job(&EnqueueJob {
+            source: "steam".into(),
+            task_type: "enrich_catalog".into(),
+            entity_key: "scheduled".into(),
+            priority: 50,
+            due_at_ms: 0,
+            idempotency_key: "active-steam-starvation-bound".into(),
+            payload_json: None,
+            max_attempts: 3,
+        })
+        .unwrap();
+
+        run_once_with_catalog_sync(&repo, DEFAULT_INTERVAL_SECS, false).unwrap();
+        clock.advance_ms((LOCAL_MAINTENANCE_MAX_DEFERRAL_SECS as i64) * 1_000);
+        run_once_with_catalog_sync(&repo, DEFAULT_INTERVAL_SECS, false).unwrap();
+
+        let retrieval = repo
+            .data_refresh_status()
+            .unwrap()
+            .into_iter()
+            .find(|status| status.task_name == "retrieval_sync")
+            .unwrap();
+        assert_eq!(
+            retrieval.last_success_at_ms,
+            Some((LOCAL_MAINTENANCE_MAX_DEFERRAL_SECS as i64) * 1_000)
+        );
     }
 
     #[test]

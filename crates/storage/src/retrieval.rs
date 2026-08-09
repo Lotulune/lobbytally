@@ -554,7 +554,35 @@ impl Repository {
                                          WHEN 'catalog_taxonomy' THEN 0 ELSE 1 END,
                                      evidence.observed_at_ms DESC, evidence.evidence_id DESC
                             LIMIT 1
-                        ), '[]')
+                        ), '[]'),
+                        CASE WHEN (
+                            a.app_type IN ('game', 'demo', 'playtest')
+                            AND (
+                                EXISTS (
+                                    SELECT 1 FROM feature_evidence scope_evidence
+                                    WHERE scope_evidence.app_id = a.app_id
+                                      AND scope_evidence.feature_name = 'category_hint'
+                                      AND scope_evidence.is_active = 1
+                                      AND scope_evidence.confidence >= 0.3
+                                )
+                                OR p.dominant_mode IS NOT NULL
+                                OR p.private_session IS NOT NULL
+                                OR p.online_coop IS NOT NULL
+                                OR p.self_hosted_server IS NOT NULL
+                                OR p.drop_in_out IS NOT NULL
+                                OR p.crossplay IS NOT NULL
+                                OR p.recommended_max_players IS NOT NULL
+                            )
+                        ) OR EXISTS (
+                            SELECT 1 FROM curation_overrides attention
+                            WHERE attention.app_id = a.app_id
+                              AND attention.revoked_at_ms IS NULL
+                        ) OR EXISTS (
+                            SELECT 1 FROM feature_evidence human_evidence
+                            WHERE human_evidence.app_id = a.app_id
+                              AND human_evidence.source_type = 'human_golden'
+                              AND human_evidence.is_active = 1
+                        ) THEN 1 ELSE 0 END
                  FROM apps a
                  LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
                  LEFT JOIN app_availability v ON v.app_id = a.app_id
@@ -595,6 +623,7 @@ impl Repository {
                         localized_name: row.get(12)?,
                         short_description: row.get(13)?,
                         catalog_taxonomy_json: row.get(14)?,
+                        eligible: row.get::<_, i64>(15)? != 0,
                     })
                 },
             )?;
@@ -602,8 +631,46 @@ impl Repository {
             for row in mapped {
                 out.push(row?);
             }
-            let catalog_apps =
-                conn.query_row("SELECT COUNT(*) FROM apps", [], |row| row.get::<_, i64>(0))?;
+            let catalog_apps = conn.query_row(
+                "SELECT COUNT(*)
+                 FROM apps a
+                 WHERE (
+                     a.app_type IN ('game', 'demo', 'playtest')
+                     AND (
+                         EXISTS (
+                             SELECT 1 FROM feature_evidence scope_evidence
+                             WHERE scope_evidence.app_id = a.app_id
+                               AND scope_evidence.feature_name = 'category_hint'
+                               AND scope_evidence.is_active = 1
+                               AND scope_evidence.confidence >= 0.3
+                         )
+                         OR EXISTS (
+                             SELECT 1 FROM multiplayer_profiles profile
+                             WHERE profile.app_id = a.app_id
+                               AND (
+                                   profile.dominant_mode IS NOT NULL
+                                   OR profile.private_session IS NOT NULL
+                                   OR profile.online_coop IS NOT NULL
+                                   OR profile.self_hosted_server IS NOT NULL
+                                   OR profile.drop_in_out IS NOT NULL
+                                   OR profile.crossplay IS NOT NULL
+                                   OR profile.recommended_max_players IS NOT NULL
+                               )
+                         )
+                     )
+                 ) OR EXISTS (
+                     SELECT 1 FROM curation_overrides attention
+                     WHERE attention.app_id = a.app_id
+                       AND attention.revoked_at_ms IS NULL
+                 ) OR EXISTS (
+                     SELECT 1 FROM feature_evidence human_evidence
+                     WHERE human_evidence.app_id = a.app_id
+                       AND human_evidence.source_type = 'human_golden'
+                       AND human_evidence.is_active = 1
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
             Ok((out, u32::try_from(catalog_apps).unwrap_or(u32::MAX)))
         })?;
 
@@ -964,10 +1031,14 @@ struct CatalogDocSource {
     localized_name: String,
     short_description: String,
     catalog_taxonomy_json: String,
+    eligible: bool,
 }
 
 impl CatalogDocSource {
     fn build_documents(&self) -> Vec<UpsertGameDocument> {
+        if !self.eligible {
+            return Vec::new();
+        }
         let mut docs = Vec::new();
         let alias = self.localized_name.trim();
         let platforms = self.platforms_json.trim();

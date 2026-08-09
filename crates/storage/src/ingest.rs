@@ -259,20 +259,29 @@ pub fn ingest_store_details(
         None,
         now_ms,
     )?;
+    let checked_empty = details.name.as_deref().is_none_or(str::is_empty)
+        || details.platforms.as_ref().is_none_or(Vec::is_empty)
+        || details
+            .supported_languages
+            .as_ref()
+            .is_none_or(Vec::is_empty)
+        || details.price.is_none();
     conn.execute(
         "INSERT INTO store_detail_refresh_state(
-             app_id, country_code, language, captured_at_ms, status, source
-         ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5)
+             app_id, country_code, language, captured_at_ms, status, source, checked_empty
+         ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, ?6)
          ON CONFLICT(app_id, country_code, language) DO UPDATE SET
              captured_at_ms = excluded.captured_at_ms,
              status = excluded.status,
-             source = excluded.source",
+             source = excluded.source,
+             checked_empty = excluded.checked_empty",
         params![
             details.app_id,
             details.country_code.trim().to_ascii_uppercase(),
             details.language.trim().to_ascii_lowercase(),
             now_ms,
-            details.source
+            details.source,
+            i64::from(checked_empty)
         ],
     )?;
     catalog::upsert_app_localization(

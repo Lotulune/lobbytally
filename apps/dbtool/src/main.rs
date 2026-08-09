@@ -3,6 +3,7 @@
 mod golden_evaluation;
 mod recommendation_audit;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -57,6 +58,7 @@ const ENRICH_LIMIT_MAX: u32 = 5_000;
 const ENRICH_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ENRICH_INTER_REQUEST_MS: u64 = 2_500;
 const ENRICH_RATE_LIMIT_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
+const INTEGRATED_INGESTION_LIMIT: i64 = 10;
 const STORAGE_WRITE_RETRIES: u64 = 5;
 
 fn env_flag(name: &str) -> bool {
@@ -141,18 +143,123 @@ fn configured_enrichment_need_filter(media_enabled: bool) -> EnrichmentNeedFilte
     }
 }
 
-fn store_first_filter(filter: EnrichmentNeedFilter) -> EnrichmentNeedFilter {
-    EnrichmentNeedFilter {
-        store: filter.store,
+#[derive(Debug, Clone, Copy)]
+struct EnrichmentQuota {
+    filter: EnrichmentNeedFilter,
+    limit: u32,
+}
+
+fn enrichment_quota_plan(
+    limit: u32,
+    filter: EnrichmentNeedFilter,
+    rotation: u32,
+) -> Vec<EnrichmentQuota> {
+    let disabled = EnrichmentNeedFilter {
+        store: false,
         reviews: false,
         review_excerpts: false,
         ccu: false,
-        price: filter.price,
-        // Media and dual-name backfills must not hold reviews/CCU behind a large
-        // optional backlog. The first phase is only for release/calendar facts.
+        price: false,
         media_backfill: false,
         english_name: false,
+    };
+    let mut groups = Vec::new();
+    if filter.store || filter.price {
+        groups.push(EnrichmentNeedFilter {
+            store: filter.store,
+            price: filter.price,
+            ..disabled
+        });
     }
+    if filter.reviews || filter.review_excerpts {
+        groups.push(EnrichmentNeedFilter {
+            reviews: filter.reviews,
+            review_excerpts: filter.review_excerpts,
+            ..disabled
+        });
+    }
+    if filter.ccu {
+        groups.push(EnrichmentNeedFilter {
+            ccu: true,
+            ..disabled
+        });
+    }
+    if filter.english_name {
+        groups.push(EnrichmentNeedFilter {
+            english_name: true,
+            ..disabled
+        });
+    }
+    if filter.media_backfill {
+        groups.push(EnrichmentNeedFilter {
+            media_backfill: true,
+            ..disabled
+        });
+    }
+    if groups.is_empty() {
+        return Vec::new();
+    }
+
+    let group_count_usize = groups.len();
+    let group_count = u32::try_from(group_count_usize).unwrap_or(u32::MAX);
+    let base = limit / group_count;
+    let remainder = limit % group_count;
+    let start = usize::try_from(rotation % group_count).unwrap_or(0);
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, filter)| {
+            let rotated = (index + group_count_usize - start) % group_count_usize;
+            EnrichmentQuota {
+                filter,
+                limit: base + u32::from(rotated < usize::try_from(remainder).unwrap_or(0)),
+            }
+        })
+        .filter(|entry| entry.limit > 0)
+        .collect()
+}
+
+fn list_enrichment_targets_with_quotas(
+    repo: &Repository,
+    limit: u32,
+    after_app_id: u32,
+    country_code: &str,
+    language: &str,
+    filter: EnrichmentNeedFilter,
+    media_policy: mpgs_storage::MediaBackfillPolicy,
+) -> StorageResult<Vec<mpgs_storage::EnrichmentTarget>> {
+    let mut merged = BTreeMap::<u32, mpgs_storage::EnrichmentTarget>::new();
+    for quota in enrichment_quota_plan(limit, filter, after_app_id) {
+        let targets = repo.list_enrichment_targets_after_filtered_with_media(
+            quota.limit,
+            Some(after_app_id),
+            country_code,
+            language,
+            quota.filter,
+            media_policy,
+        )?;
+        for target in targets {
+            let target = target.filtered(quota.filter);
+            if !target.needs_any() {
+                continue;
+            }
+            merged
+                .entry(target.app_id)
+                .and_modify(|current| {
+                    current.needs_store_details |= target.needs_store_details;
+                    current.needs_reviews |= target.needs_reviews;
+                    current.needs_review_excerpts |= target.needs_review_excerpts;
+                    current.needs_ccu |= target.needs_ccu;
+                    current.needs_price |= target.needs_price;
+                    current.needs_media_backfill |= target.needs_media_backfill;
+                    current.needs_english_name |= target.needs_english_name;
+                })
+                .or_insert(target);
+        }
+    }
+    let mut targets = merged.into_values().collect::<Vec<_>>();
+    targets.sort_by_key(|target| (target.app_id <= after_app_id, target.app_id));
+    Ok(targets)
 }
 
 /// Continuation pages consumed per scheduled candidate-discovery channel.
@@ -259,6 +366,13 @@ struct WorkerTaskError {
     category: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct IntegratedIngestionStats {
+    claimed_apps: usize,
+    completed_apps: usize,
+    retried_apps: usize,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -298,6 +412,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "feature-evidence-retention" => run_feature_evidence_retention(args),
+        "pipeline-retention" => run_pipeline_retention(args),
         "recover-steam-leases" => {
             let db_path = required_path(args.next(), "--db path")?;
             if args.next().is_some() {
@@ -309,9 +424,11 @@ fn run() -> Result<(), String> {
             let schema_version = db.schema_version().map_err(err)?;
             let repo = Repository::new(db);
             let recovered = repo.recover_leased_jobs(Some("steam")).map_err(err)?;
+            let recovered_game_ingestion = repo.recover_game_ingestion_leases().map_err(err)?;
             println!("path={}", db_path.display());
             println!("schema_version={schema_version}");
             println!("steam_leases_recovered={recovered}");
+            println!("game_ingestion_leases_recovered={recovered_game_ingestion}");
             Ok(())
         }
         "m3-audit" => {
@@ -1126,6 +1243,117 @@ fn worker_completion_key(owner: &str, job_id: i64) -> String {
     format!("worker:{owner}:{job_id}")
 }
 
+fn integrated_ingestion_retry_delay_ms(category: &str, stage_attempts: i64) -> i64 {
+    if category == "rate_limited" {
+        return i64::try_from(ENRICH_RATE_LIMIT_COOLDOWN_MS).unwrap_or(i64::MAX);
+    }
+    let exponent = u32::try_from(stage_attempts.saturating_sub(1).clamp(0, 6)).unwrap_or(0);
+    WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent)
+}
+
+fn process_integrated_game_ingestion_with(
+    repo: &Repository,
+    owner: &str,
+    limit: i64,
+    mut run_stage: impl FnMut(u32, &str) -> Result<(), SoftEnrichError>,
+) -> Result<IntegratedIngestionStats, WorkerTaskError> {
+    let (country_code, language) = configured_store_locale()
+        .map_err(|_| worker_task_error("invalid_payload", "invalid Steam store locale"))?;
+    let claimed = worker_storage_with_retry(|| {
+        repo.claim_game_ingestion_tasks(owner, limit, WORKER_LEASE_MS)
+    })?;
+    let mut stats = IntegratedIngestionStats {
+        claimed_apps: claimed.len(),
+        ..IntegratedIngestionStats::default()
+    };
+
+    for mut task in claimed {
+        loop {
+            if task.stage == "complete" {
+                stats.completed_apps = stats.completed_apps.saturating_add(1);
+                break;
+            }
+            let observed = repo
+                .game_ingestion_stage_observed(task.app_id, &task.stage, &country_code, &language)
+                .map_err(worker_storage_error)?;
+            if observed {
+                task = worker_storage_with_retry(|| {
+                    repo.advance_game_ingestion_stage(task.app_id, owner)
+                })?;
+                continue;
+            }
+
+            match run_stage(task.app_id, &task.stage) {
+                Ok(()) => {
+                    task = worker_storage_with_retry(|| {
+                        repo.advance_game_ingestion_stage(task.app_id, owner)
+                    })?;
+                }
+                Err(failure) => {
+                    let retry_delay_ms =
+                        integrated_ingestion_retry_delay_ms(failure.category, task.stage_attempts);
+                    worker_storage_with_retry(|| {
+                        repo.retry_game_ingestion_stage(
+                            task.app_id,
+                            owner,
+                            failure.category,
+                            retry_delay_ms,
+                        )
+                    })?;
+                    eprintln!(
+                        "warn app_id={} integrated_stage={} category={} message={}",
+                        task.app_id, task.stage, failure.category, failure.message
+                    );
+                    stats.retried_apps = stats.retried_apps.saturating_add(1);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
+fn process_integrated_game_ingestion(
+    repo: &Repository,
+    owner: &str,
+    limit: i64,
+) -> Result<IntegratedIngestionStats, WorkerTaskError> {
+    let (country_code, language) = configured_store_locale()
+        .map_err(|_| worker_task_error("invalid_payload", "invalid Steam store locale"))?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+        .map_err(|error| worker_task_error("network", error.to_string()))?;
+    let mut enrich_stats = EnrichStats::default();
+    let inter_request_ms = enrich_inter_request_ms();
+
+    process_integrated_game_ingestion_with(repo, owner, limit, |app_id, stage| {
+        let result = match stage {
+            "store_details" => enrich_store_details(
+                &client,
+                repo,
+                app_id,
+                &country_code,
+                &language,
+                &mut enrich_stats,
+            )
+            .map(|_| ()),
+            "review_summary" => enrich_reviews(&client, repo, app_id, &mut enrich_stats),
+            "popular_reviews" => enrich_popular_reviews(&client, repo, app_id, &mut enrich_stats),
+            "ccu" => enrich_ccu(&client, repo, app_id, &mut enrich_stats),
+            _ => Err(SoftEnrichError {
+                category: "invalid_payload",
+                message: format!("unknown integrated ingestion stage {stage}"),
+            }),
+        };
+        thread::sleep(Duration::from_millis(inter_request_ms));
+        result
+    })
+}
+
 fn run_steam_worker_once(
     repo: &Repository,
     owner: &str,
@@ -1150,10 +1378,10 @@ fn run_steam_worker_once(
                     "MPGS_STEAM_WEB_API_KEY is not configured for the worker",
                 )),
             },
-            "collect_candidates" => run_candidate_worker_task(repo),
-            "collect_candidate_top" => run_candidate_top_worker_task(repo),
-            "collect_candidate_continuation" => run_candidate_worker_task(repo),
-            "enrich_catalog" => run_enrichment_worker_task(repo, enrich_limit),
+            "collect_candidates" => run_candidate_worker_task(repo, owner),
+            "collect_candidate_top" => run_candidate_top_worker_task(repo, owner),
+            "collect_candidate_continuation" => run_candidate_worker_task(repo, owner),
+            "enrich_catalog" => run_enrichment_worker_task(repo, owner, enrich_limit),
             _ => Err(worker_task_error(
                 "invalid_payload",
                 "unsupported Steam job type",
@@ -1273,7 +1501,7 @@ fn run_catalog_worker_task(repo: &Repository, api_key: &str) -> Result<(), Worke
     }
 }
 
-fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
+fn run_candidate_worker_task(repo: &Repository, owner: &str) -> Result<(), WorkerTaskError> {
     let run_id = worker_storage_with_retry(|| {
         repo.start_source_run(
             STORE_SEARCH_SOURCE_NAME,
@@ -1285,16 +1513,24 @@ fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
         )
     })?;
     match collect_steam_candidates(repo, STORE_SEARCH_TARGET_DEFAULT) {
-        Ok(stats) => worker_storage_with_retry(|| {
-            repo.finish_source_run(
-                run_id,
-                "succeeded",
-                stats.request_count,
-                stats.success_count,
-                None,
-                Some("target reached or bounded refresh completed"),
-            )
-        }),
+        Ok(stats) => {
+            let integrated =
+                process_integrated_game_ingestion(repo, owner, INTEGRATED_INGESTION_LIMIT)?;
+            let notes = format!(
+                "target reached or bounded refresh completed;integrated_claimed={};integrated_completed={};integrated_retried={}",
+                integrated.claimed_apps, integrated.completed_apps, integrated.retried_apps
+            );
+            worker_storage_with_retry(|| {
+                repo.finish_source_run(
+                    run_id,
+                    "succeeded",
+                    stats.request_count,
+                    stats.success_count,
+                    None,
+                    Some(&notes),
+                )
+            })
+        }
         Err(failure) => {
             let status = if failure.stats.success_count > 0 {
                 "partial"
@@ -1316,7 +1552,7 @@ fn run_candidate_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
     }
 }
 
-fn run_candidate_top_worker_task(repo: &Repository) -> Result<(), WorkerTaskError> {
+fn run_candidate_top_worker_task(repo: &Repository, owner: &str) -> Result<(), WorkerTaskError> {
     let run_id = worker_storage_with_retry(|| {
         repo.start_source_run(
             STORE_SEARCH_SOURCE_NAME,
@@ -1326,16 +1562,24 @@ fn run_candidate_top_worker_task(repo: &Repository) -> Result<(), WorkerTaskErro
         )
     })?;
     match collect_steam_candidate_top_pages(repo) {
-        Ok(stats) => worker_storage_with_retry(|| {
-            repo.finish_source_run(
-                run_id,
-                "succeeded",
-                stats.request_count,
-                stats.success_count,
-                None,
-                Some("top pages refreshed"),
-            )
-        }),
+        Ok(stats) => {
+            let integrated =
+                process_integrated_game_ingestion(repo, owner, INTEGRATED_INGESTION_LIMIT)?;
+            let notes = format!(
+                "top pages refreshed;integrated_claimed={};integrated_completed={};integrated_retried={}",
+                integrated.claimed_apps, integrated.completed_apps, integrated.retried_apps
+            );
+            worker_storage_with_retry(|| {
+                repo.finish_source_run(
+                    run_id,
+                    "succeeded",
+                    stats.request_count,
+                    stats.success_count,
+                    None,
+                    Some(&notes),
+                )
+            })
+        }
         Err(failure) => {
             let status = if failure.stats.success_count > 0 {
                 "partial"
@@ -1357,9 +1601,19 @@ fn run_candidate_top_worker_task(repo: &Repository) -> Result<(), WorkerTaskErro
     }
 }
 
-fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), WorkerTaskError> {
+fn run_enrichment_worker_task(
+    repo: &Repository,
+    owner: &str,
+    limit: u32,
+) -> Result<(), WorkerTaskError> {
     let (country_code, language) = configured_store_locale()
         .map_err(|_| worker_task_error("invalid_payload", "invalid Steam store locale"))?;
+    let integrated_limit = i64::from(limit).min(INTEGRATED_INGESTION_LIMIT);
+    let integrated = process_integrated_game_ingestion(repo, owner, integrated_limit)?;
+    let limit = limit.saturating_sub(u32::try_from(integrated.claimed_apps).unwrap_or(limit));
+    if limit == 0 {
+        return Ok(());
+    }
     let cursor = repo
         .source_cursor(ENRICH_CURSOR_KEY)
         .map_err(worker_storage_error)?
@@ -1369,50 +1623,27 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
         .unwrap_or_default();
     let media_policy = configured_media_backfill_policy();
     let need_filter = configured_enrichment_need_filter(media_policy.enabled);
-    let store_filter = store_first_filter(need_filter);
-    let mut phase = "all";
-    let mut selected_filter = need_filter;
-    let mut targets = if store_filter.any() {
-        repo.list_enrichment_targets_after_filtered_with_media(
-            limit,
-            Some(cursor.after_app_id),
-            &country_code,
-            &language,
-            store_filter,
-            mpgs_storage::MediaBackfillPolicy::DISABLED,
-        )
-        .map_err(worker_storage_error)?
-    } else {
-        Vec::new()
-    };
-    if !targets.is_empty() {
-        phase = "store_first";
-        selected_filter = store_filter;
-    } else {
-        targets = repo
-            .list_enrichment_targets_after_filtered_with_media(
-                limit,
-                Some(cursor.after_app_id),
-                &country_code,
-                &language,
-                need_filter,
-                media_policy,
-            )
-            .map_err(worker_storage_error)?;
-    }
-    targets = targets
-        .into_iter()
-        .map(|target| target.filtered(selected_filter))
-        .filter(|target| target.needs_any())
-        .collect();
+    let targets = list_enrichment_targets_with_quotas(
+        repo,
+        limit,
+        cursor.after_app_id,
+        &country_code,
+        &language,
+        need_filter,
+        media_policy,
+    )
+    .map_err(worker_storage_error)?;
     let coverage = repo.media_coverage_stats().map_err(worker_storage_error)?;
     let run_notes = format!(
-        "worker=true;phase={phase};limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{}",
+        "worker=true;phase=quota;limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{};integrated_claimed={};integrated_completed={};integrated_retried={}",
         targets.len(),
         cursor.after_app_id,
         coverage.coverage_ratio,
         coverage.apps_with_media,
-        coverage.candidate_apps
+        coverage.candidate_apps,
+        integrated.claimed_apps,
+        integrated.completed_apps,
+        integrated.retried_apps
     );
     let run_id = worker_storage_with_retry(|| {
         repo.start_source_run(
@@ -1466,14 +1697,11 @@ fn run_enrichment_worker_task(repo: &Repository, limit: u32) -> Result<(), Worke
                     Some(&notes),
                 )
             })?;
-            if stats.error_count > 0 {
-                Err(worker_task_error(
-                    "network",
-                    "one or more enrichment requests failed",
-                ))
-            } else {
-                Ok(())
-            }
+            // Missing dimensions remain due in storage and are selected again
+            // by a later quota pass. Treat per-app partial failures as a
+            // completed scheduler batch so unrelated apps do not consume the
+            // same global job retry budget.
+            Ok(())
         }
         Err(failure) => {
             let _ = worker_storage_with_retry(|| {
@@ -2208,14 +2436,13 @@ fn ingest_candidate_page(
     page: &StoreSearchPage,
     stats: &mut CollectionStats,
 ) -> Result<i64, CollectionError> {
-    let ingested =
-        storage_write_with_retry(|| repo.ingest_store_search_page(page)).map_err(|error| {
-            CollectionError {
+    let outcome =
+        storage_write_with_retry(|| repo.ingest_store_search_page_and_queue_new_games(page))
+            .map_err(|error| CollectionError {
                 category: error.category,
                 message: error.message,
                 stats: *stats,
-            }
-        })?;
+            })?;
     let app_ids = page
         .candidates
         .iter()
@@ -2228,7 +2455,16 @@ fn ingest_candidate_page(
                 message: error.message,
                 stats: *stats,
             })?;
-    stats.success_count = stats.success_count.saturating_add(ingested as i64);
+    if !outcome.queued_new_app_ids.is_empty() {
+        eprintln!(
+            "progress queued_new_apps={} first_app_id={}",
+            outcome.queued_new_app_ids.len(),
+            outcome.queued_new_app_ids[0]
+        );
+    }
+    stats.success_count = stats
+        .success_count
+        .saturating_add(outcome.ingested_candidates as i64);
     repo.multiplayer_candidate_count()
         .map_err(|error| CollectionError {
             category: "storage",
@@ -2958,6 +3194,7 @@ fn usage() -> &'static str {
        migrate <db-path>\n\
        integrity <db-path>\n\
        feature-evidence-retention <db-path> [retention-ms] [--apply --confirm --backup path]\n\
+       pipeline-retention <db-path> [retention-ms] [--batch-limit N] [--apply --confirm --backup path]\n\
        recover-steam-leases <db-path>\n\
        m3-audit <db-path>\n\
        m7-data-audit <db-path> [--allow-upcoming-shortfall=<reason>]\n\
@@ -2979,6 +3216,294 @@ fn usage() -> &'static str {
        MPGS_STEAM_WORKER_ID (optional stable lease owner name)\n\
        MPGS_STEAM_COUNTRY (default cn)\n\
        MPGS_STEAM_LANGUAGE (default schinese)\n"
+}
+
+const RETRIEVAL_ELIGIBILITY_SQL: &str = "(
+    a.app_type IN ('game', 'demo', 'playtest')
+    AND (
+        EXISTS (
+            SELECT 1 FROM feature_evidence scope_evidence
+            WHERE scope_evidence.app_id = a.app_id
+              AND scope_evidence.feature_name = 'category_hint'
+              AND scope_evidence.is_active = 1
+              AND scope_evidence.confidence >= 0.3
+        )
+        OR EXISTS (
+            SELECT 1 FROM multiplayer_profiles profile
+            WHERE profile.app_id = a.app_id
+              AND (
+                  profile.dominant_mode IS NOT NULL
+                  OR profile.private_session IS NOT NULL
+                  OR profile.online_coop IS NOT NULL
+                  OR profile.self_hosted_server IS NOT NULL
+                  OR profile.drop_in_out IS NOT NULL
+                  OR profile.crossplay IS NOT NULL
+                  OR profile.recommended_max_players IS NOT NULL
+              )
+        )
+    )
+) OR EXISTS (
+    SELECT 1 FROM curation_overrides attention
+    WHERE attention.app_id = a.app_id AND attention.revoked_at_ms IS NULL
+) OR EXISTS (
+    SELECT 1 FROM feature_evidence human_evidence
+    WHERE human_evidence.app_id = a.app_id
+      AND human_evidence.source_type = 'human_golden'
+      AND human_evidence.is_active = 1
+)";
+
+const DUPLICATE_INACTIVE_EVIDENCE_SQL: &str = "evidence.is_active = 0
+    AND evidence.observed_at_ms < ?1
+    AND EXISTS (
+        SELECT 1 FROM feature_evidence newer
+        WHERE newer.app_id = evidence.app_id
+          AND newer.feature_name = evidence.feature_name
+          AND newer.source_type = evidence.source_type
+          AND newer.value_json = evidence.value_json
+          AND newer.evidence_id > evidence.evidence_id
+    )";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PipelineRetentionPlan {
+    duplicate_inactive_evidence: i64,
+    noneligible_documents: i64,
+    noneligible_embeddings: i64,
+    noneligible_fts_rows: i64,
+    historical_completed_jobs: i64,
+    historical_dead_jobs: i64,
+    estimated_payload_bytes: i64,
+}
+
+fn plan_pipeline_retention(db: &Database, cutoff: i64) -> StorageResult<PipelineRetentionPlan> {
+    db.with_conn(|conn| {
+        let duplicate_sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(length(evidence.value_json) + length(evidence.source_ref)), 0)
+             FROM feature_evidence evidence WHERE {DUPLICATE_INACTIVE_EVIDENCE_SQL}"
+        );
+        let (duplicate_inactive_evidence, evidence_bytes) = conn.query_row(
+            &duplicate_sql,
+            [cutoff],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let document_sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(length(document.title) + length(document.body)), 0)
+             FROM game_documents document
+             JOIN apps a ON a.app_id = document.app_id
+             WHERE NOT ({RETRIEVAL_ELIGIBILITY_SQL})"
+        );
+        let (noneligible_documents, document_bytes) = conn.query_row(
+            &document_sql,
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let embedding_sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(length(embedding.vector_blob)), 0)
+             FROM game_embeddings embedding
+             JOIN game_documents document ON document.document_id = embedding.document_id
+             JOIN apps a ON a.app_id = document.app_id
+             WHERE NOT ({RETRIEVAL_ELIGIBILITY_SQL})"
+        );
+        let (noneligible_embeddings, embedding_bytes) = conn.query_row(
+            &embedding_sql,
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let fts_sql = format!(
+            "SELECT COUNT(*) FROM game_fts fts
+             JOIN game_documents document ON document.document_id = fts.document_id
+             JOIN apps a ON a.app_id = document.app_id
+             WHERE NOT ({RETRIEVAL_ELIGIBILITY_SQL})"
+        );
+        let noneligible_fts_rows = conn.query_row(&fts_sql, [], |row| row.get(0))?;
+        let (historical_completed_jobs, historical_dead_jobs, job_bytes) = conn.query_row(
+            "SELECT
+                 COALESCE(SUM(status = 'completed'), 0),
+                 COALESCE(SUM(status = 'dead'), 0),
+                 COALESCE(SUM(length(entity_key) + length(idempotency_key) +
+                     length(COALESCE(payload_json, ''))), 0)
+             FROM jobs
+             WHERE status IN ('completed', 'dead') AND updated_at_ms < ?1",
+            [cutoff],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        Ok(PipelineRetentionPlan {
+            duplicate_inactive_evidence,
+            noneligible_documents,
+            noneligible_embeddings,
+            noneligible_fts_rows,
+            historical_completed_jobs,
+            historical_dead_jobs,
+            estimated_payload_bytes: evidence_bytes
+                .saturating_add(document_bytes)
+                .saturating_add(embedding_bytes)
+                .saturating_add(job_bytes),
+        })
+    })
+}
+
+fn apply_pipeline_retention(
+    db: &Database,
+    cutoff: i64,
+    batch_limit: i64,
+) -> StorageResult<(usize, usize, usize)> {
+    let now = db.now_ms();
+    db.with_conn_mut(|conn| {
+        let tx = conn.transaction()?;
+        let evidence_sql = format!(
+            "DELETE FROM feature_evidence WHERE evidence_id IN (
+                 SELECT evidence.evidence_id FROM feature_evidence evidence
+                 WHERE {DUPLICATE_INACTIVE_EVIDENCE_SQL}
+                 ORDER BY evidence.evidence_id LIMIT ?2
+             )"
+        );
+        let deleted_evidence = tx.execute(&evidence_sql, rusqlite::params![cutoff, batch_limit])?;
+
+        let document_sql = format!(
+            "SELECT document.document_id
+             FROM game_documents document
+             JOIN apps a ON a.app_id = document.app_id
+             WHERE NOT ({RETRIEVAL_ELIGIBILITY_SQL})
+             ORDER BY document.document_id LIMIT ?1"
+        );
+        let document_ids = {
+            let mut statement = tx.prepare(&document_sql)?;
+            statement
+                .query_map([batch_limit], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for document_id in &document_ids {
+            tx.execute("DELETE FROM game_fts WHERE document_id = ?1", [document_id])?;
+            tx.execute(
+                "DELETE FROM game_documents WHERE document_id = ?1",
+                [document_id],
+            )?;
+        }
+
+        let jobs = {
+            let mut statement = tx.prepare(
+                "SELECT job_id, status FROM jobs
+                 WHERE status IN ('completed', 'dead') AND updated_at_ms < ?1
+                 ORDER BY updated_at_ms, job_id LIMIT ?2",
+            )?;
+            statement
+                .query_map(rusqlite::params![cutoff, batch_limit], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for status in ["completed", "dead"] {
+            let deleted = jobs
+                .iter()
+                .filter(|(_, job_status)| job_status == status)
+                .count();
+            if deleted > 0 {
+                tx.execute(
+                    "INSERT INTO pipeline_retention_summary(
+                         status, deleted_count, last_cutoff_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(status) DO UPDATE SET
+                         deleted_count = deleted_count + excluded.deleted_count,
+                         last_cutoff_ms = excluded.last_cutoff_ms,
+                         updated_at_ms = excluded.updated_at_ms",
+                    rusqlite::params![
+                        status,
+                        i64::try_from(deleted).unwrap_or(i64::MAX),
+                        cutoff,
+                        now
+                    ],
+                )?;
+            }
+        }
+        for (job_id, _) in &jobs {
+            tx.execute("DELETE FROM jobs WHERE job_id = ?1", [job_id])?;
+        }
+        tx.commit()?;
+        Ok((deleted_evidence, document_ids.len(), jobs.len()))
+    })
+}
+
+fn run_pipeline_retention(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut args = args.peekable();
+    let db_path = required_path(args.next(), "--db path")?;
+    let retention_ms = if args.peek().is_some_and(|value| !value.starts_with("--")) {
+        args.next()
+            .expect("peeked retention value")
+            .parse::<i64>()
+            .map_err(|_| "retention-ms must be an integer".to_owned())?
+    } else {
+        2_592_000_000
+    };
+    if retention_ms <= 0 {
+        return Err("retention-ms must be positive".into());
+    }
+    let mut batch_limit = 100_000_i64;
+    let mut apply = false;
+    let mut confirm = false;
+    let mut backup_path: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--batch-limit" => {
+                batch_limit = args
+                    .next()
+                    .ok_or_else(|| "--batch-limit requires a value".to_owned())?
+                    .parse::<i64>()
+                    .map_err(|_| "--batch-limit must be an integer".to_owned())?;
+            }
+            "--apply" => apply = true,
+            "--confirm" => confirm = true,
+            "--backup" => backup_path = Some(required_path(args.next(), "--backup path")?),
+            _ => return Err(format!("unknown pipeline-retention option: {arg}")),
+        }
+    }
+    if !(1..=1_000_000).contains(&batch_limit) {
+        return Err("--batch-limit must be between 1 and 1000000".into());
+    }
+    let db = Database::open(&db_path).map_err(err)?;
+    db.assert_ready().map_err(err)?;
+    let cutoff = db.now_ms().saturating_sub(retention_ms);
+    let plan = plan_pipeline_retention(&db, cutoff).map_err(err)?;
+    println!("path={}", db_path.display());
+    println!("cutoff_ms={cutoff}");
+    println!(
+        "duplicate_inactive_evidence={}",
+        plan.duplicate_inactive_evidence
+    );
+    println!("noneligible_documents={}", plan.noneligible_documents);
+    println!("noneligible_embeddings={}", plan.noneligible_embeddings);
+    println!("noneligible_fts_rows={}", plan.noneligible_fts_rows);
+    println!(
+        "historical_completed_jobs={}",
+        plan.historical_completed_jobs
+    );
+    println!("historical_dead_jobs={}", plan.historical_dead_jobs);
+    println!("estimated_payload_bytes={}", plan.estimated_payload_bytes);
+    println!("batch_limit={batch_limit}");
+    if !apply {
+        println!("dry_run=true");
+        println!("compact=false");
+        return Ok(());
+    }
+    if !confirm {
+        return Err("--apply requires --confirm".into());
+    }
+    let backup = backup_path.ok_or_else(|| "--apply requires --backup path".to_owned())?;
+    if !backup.is_file() {
+        return Err(format!("backup path does not exist: {}", backup.display()));
+    }
+    let (deleted_evidence, deleted_documents, deleted_jobs) =
+        apply_pipeline_retention(&db, cutoff, batch_limit).map_err(err)?;
+    println!("deleted_evidence={deleted_evidence}");
+    println!("deleted_documents={deleted_documents}");
+    println!("deleted_jobs={deleted_jobs}");
+    println!("dry_run=false");
+    println!("compact=false");
+    Ok(())
 }
 
 fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<(), String> {
@@ -3061,6 +3586,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn integrated_ingestion_runs_stages_in_order_and_retries_only_the_failed_stage() {
+        let clock = std::sync::Arc::new(mpgs_storage::FakeClock::new(10_000));
+        let db = Database::open_in_memory_with_clock(clock.clone()).unwrap();
+        db.migrate().unwrap();
+        let repo = Repository::new(db);
+        let page = StoreSearchPage {
+            candidates: vec![mpgs_steam_source::StoreSearchCandidate {
+                app_id: 632360,
+                name: "Risk of Rain 2".into(),
+            }],
+            start: 0,
+            result_count: 1,
+            total_count: 1,
+            content_hash: "integrated-worker-fixture".into(),
+            sort: StoreSearchSort::ReleasedDesc,
+        };
+        repo.ingest_store_search_page_and_queue_new_games(&page)
+            .unwrap();
+
+        let mut calls = Vec::new();
+        let mut fail_review_once = true;
+        let first =
+            process_integrated_game_ingestion_with(&repo, "worker-a", 1, |app_id, stage| {
+                calls.push((app_id, stage.to_owned()));
+                if stage == "review_summary" && fail_review_once {
+                    fail_review_once = false;
+                    return Err(SoftEnrichError {
+                        category: "network",
+                        message: "fixture timeout".into(),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(first.completed_apps, 0);
+        assert_eq!(first.retried_apps, 1);
+
+        clock.advance_ms(WORKER_RETRY_BASE_MS);
+        let second =
+            process_integrated_game_ingestion_with(&repo, "worker-b", 1, |app_id, stage| {
+                calls.push((app_id, stage.to_owned()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(second.completed_apps, 1);
+        assert_eq!(second.retried_apps, 0);
+        assert_eq!(
+            calls,
+            vec![
+                (632360, "store_details".into()),
+                (632360, "review_summary".into()),
+                (632360, "review_summary".into()),
+                (632360, "popular_reviews".into()),
+                (632360, "ccu".into()),
+            ]
+        );
+        assert!(repo.pending_game_ingestion_app_ids().unwrap().is_empty());
+    }
+
+    #[test]
     fn evidence_retention_defaults_to_dry_run_and_requires_confirmation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retention.db");
@@ -3074,6 +3659,116 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, "--apply requires --confirm");
+    }
+
+    #[test]
+    fn pipeline_retention_defaults_to_dry_run_and_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline-retention.db");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        drop(db);
+
+        run_pipeline_retention([path.display().to_string()].into_iter()).unwrap();
+        let error =
+            run_pipeline_retention([path.display().to_string(), "--apply".to_owned()].into_iter())
+                .unwrap_err();
+        assert_eq!(error, "--apply requires --confirm");
+    }
+
+    #[test]
+    fn pipeline_retention_preserves_fact_changes_and_summarizes_deleted_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline-apply.db");
+        let backup = dir.path().join("pipeline-apply.backup.db");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO apps (
+                     app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+                 ) VALUES (42, 'game', 'Retention Fixture', 'released', 1, 1)",
+                [],
+            )?;
+            mpgs_storage::curation::insert_feature_evidence(
+                conn,
+                42,
+                "category_hint",
+                &serde_json::json!("A"),
+                "retention_fixture",
+                "page-hash-1",
+                0.5,
+                1,
+            )?;
+            mpgs_storage::curation::insert_feature_evidence(
+                conn,
+                42,
+                "category_hint",
+                &serde_json::json!("B"),
+                "retention_fixture",
+                "page-hash-2",
+                0.5,
+                2,
+            )?;
+            mpgs_storage::curation::insert_feature_evidence(
+                conn,
+                42,
+                "category_hint",
+                &serde_json::json!("A"),
+                "retention_fixture",
+                "page-hash-3",
+                0.5,
+                3,
+            )?;
+            for (key, status) in [("completed-job", "completed"), ("dead-job", "dead")] {
+                conn.execute(
+                    "INSERT INTO jobs (
+                         source, task_type, entity_key, priority, attempts, max_attempts,
+                         due_at_ms, status, idempotency_key, created_at_ms, updated_at_ms
+                     ) VALUES ('steam', 'fixture', ?1, 100, 1, 3, 1, ?2, ?1, 1, 1)",
+                    rusqlite::params![key, status],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        Repository::new(db.clone()).backup_to(&backup).unwrap();
+        drop(db);
+
+        run_pipeline_retention(
+            [
+                path.display().to_string(),
+                "1000".into(),
+                "--batch-limit".into(),
+                "100".into(),
+                "--apply".into(),
+                "--confirm".into(),
+                "--backup".into(),
+                backup.display().to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        let db = Database::open(&path).unwrap();
+        db.with_conn(|conn| {
+            let evidence: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM feature_evidence WHERE source_type = 'retention_fixture'",
+                [],
+                |row| row.get(0),
+            )?;
+            let summarized: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(deleted_count), 0) FROM pipeline_retention_summary",
+                [],
+                |row| row.get(0),
+            )?;
+            let jobs: i64 = conn.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
+            assert_eq!(evidence, 2);
+            assert_eq!(summarized, 2);
+            assert_eq!(jobs, 0);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -3220,15 +3915,26 @@ mod tests {
     }
 
     #[test]
-    fn store_first_phase_does_not_starve_on_optional_media_backfill() {
-        let filter = store_first_filter(EnrichmentNeedFilter::ALL);
-        assert!(filter.store);
-        assert!(filter.price);
-        assert!(!filter.reviews);
-        assert!(!filter.review_excerpts);
-        assert!(!filter.ccu);
-        assert!(!filter.media_backfill);
-        assert!(!filter.english_name);
+    fn enrichment_quota_plan_gives_every_enabled_dimension_a_budget() {
+        let plan = enrichment_quota_plan(20, EnrichmentNeedFilter::ALL, 0);
+        assert_eq!(plan.iter().map(|entry| entry.limit).sum::<u32>(), 20);
+        assert!(
+            plan.iter()
+                .any(|entry| entry.filter.store && entry.limit > 0)
+        );
+        assert!(
+            plan.iter()
+                .any(|entry| entry.filter.reviews && entry.limit > 0)
+        );
+        assert!(plan.iter().any(|entry| entry.filter.ccu && entry.limit > 0));
+        assert!(
+            plan.iter()
+                .any(|entry| entry.filter.english_name && entry.limit > 0)
+        );
+        assert!(
+            plan.iter()
+                .any(|entry| entry.filter.media_backfill && entry.limit > 0)
+        );
     }
 
     #[test]

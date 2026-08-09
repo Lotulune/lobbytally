@@ -86,6 +86,24 @@ impl ModeGuardrail {
     }
 }
 
+pub(crate) fn respects_mode_guardrail(items: &[RankedCandidate]) -> bool {
+    let guardrail = ModeGuardrail::new(items);
+    if !guardrail.enabled {
+        return true;
+    }
+    let mut counts = HashMap::<ModeFamily, usize>::new();
+    for item in items.iter().take(guardrail.top_k) {
+        if let Some(mode) = known_mode(item) {
+            let count = counts.entry(mode).or_default();
+            *count += 1;
+            if *count > guardrail.max_per_mode {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Maximal Marginal Relevance re-rank for relevance, structured content
 /// diversity, and a small confidence-gated exploration window.
 ///

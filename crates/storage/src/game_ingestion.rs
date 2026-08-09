@@ -1,0 +1,284 @@
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+use crate::error::{StorageError, StorageResult};
+use crate::models::GameIngestionTask;
+
+pub const INITIAL_STAGE: &str = "store_details";
+
+pub fn queue_new_app(
+    conn: &Connection,
+    app_id: u32,
+    source: &str,
+    now_ms: i64,
+) -> StorageResult<bool> {
+    let inserted = conn.execute(
+        "INSERT INTO game_ingestion_queue (
+            app_id, source, priority, stage, status, stage_attempts, total_attempts,
+            next_attempt_at_ms, discovered_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, 0, ?3, 'pending', 0, 0, ?4, ?4, ?4)
+         ON CONFLICT(app_id) DO NOTHING",
+        params![app_id, source, INITIAL_STAGE, now_ms],
+    )?;
+    Ok(inserted == 1)
+}
+
+pub fn pending_app_ids(conn: &Connection) -> StorageResult<Vec<u32>> {
+    let mut statement = conn.prepare(
+        "SELECT app_id
+         FROM game_ingestion_queue
+         WHERE status IN ('pending', 'retry')
+         ORDER BY priority DESC, discovered_at_ms, app_id",
+    )?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub fn recover_leases(conn: &Connection, now_ms: i64) -> StorageResult<usize> {
+    conn.execute(
+        "UPDATE game_ingestion_queue
+         SET lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
+         WHERE lease_owner IS NOT NULL OR lease_expires_at_ms IS NOT NULL",
+        [now_ms],
+    )
+    .map_err(Into::into)
+}
+
+pub fn claim_tasks(
+    conn: &Connection,
+    owner: &str,
+    limit: i64,
+    lease_ms: i64,
+    now_ms: i64,
+) -> StorageResult<Vec<GameIngestionTask>> {
+    validate_lease(owner, limit, lease_ms)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let mut statement = tx.prepare(
+        "SELECT app_id
+         FROM game_ingestion_queue
+         WHERE status IN ('pending', 'retry')
+           AND next_attempt_at_ms <= ?1
+           AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?1)
+         ORDER BY priority DESC, next_attempt_at_ms, discovered_at_ms, app_id
+         LIMIT ?2",
+    )?;
+    let app_ids = statement
+        .query_map(params![now_ms, limit], |row| row.get::<_, u32>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let lease_expires_at_ms = now_ms.saturating_add(lease_ms);
+    let mut claimed = Vec::with_capacity(app_ids.len());
+    for app_id in app_ids {
+        let changed = tx.execute(
+            "UPDATE game_ingestion_queue
+             SET lease_owner = ?1, lease_expires_at_ms = ?2,
+                 stage_attempts = stage_attempts + 1,
+                 total_attempts = total_attempts + 1,
+                 updated_at_ms = ?3
+             WHERE app_id = ?4
+               AND status IN ('pending', 'retry')
+               AND next_attempt_at_ms <= ?3
+               AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?3)",
+            params![owner, lease_expires_at_ms, now_ms, app_id],
+        )?;
+        if changed == 1
+            && let Some(task) = get_task(&tx, app_id)?
+        {
+            claimed.push(task);
+        }
+    }
+    tx.commit()?;
+    Ok(claimed)
+}
+
+pub fn advance_stage(
+    conn: &Connection,
+    app_id: u32,
+    owner: &str,
+    now_ms: i64,
+) -> StorageResult<GameIngestionTask> {
+    if owner.trim().is_empty() {
+        return Err(StorageError::validation("lease owner is required"));
+    }
+    let task = require_active_lease(conn, app_id, owner, now_ms)?;
+    let next_stage = match task.stage.as_str() {
+        "store_details" => "review_summary",
+        "review_summary" => "popular_reviews",
+        "popular_reviews" => "ccu",
+        "ccu" => "complete",
+        "complete" => return Ok(task),
+        stage => {
+            return Err(StorageError::validation(format!(
+                "unknown game ingestion stage {stage}"
+            )));
+        }
+    };
+    let complete = next_stage == "complete";
+    let changed = conn.execute(
+        "UPDATE game_ingestion_queue
+         SET stage = ?1,
+             status = CASE WHEN ?2 = 1 THEN 'complete' ELSE 'pending' END,
+             stage_attempts = 0,
+             next_attempt_at_ms = ?3,
+             last_error_category = NULL,
+             lease_owner = CASE WHEN ?2 = 1 THEN NULL ELSE lease_owner END,
+             lease_expires_at_ms = CASE WHEN ?2 = 1 THEN NULL ELSE lease_expires_at_ms END,
+             updated_at_ms = ?3
+         WHERE app_id = ?4 AND lease_owner = ?5
+           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?3",
+        params![next_stage, i64::from(complete), now_ms, app_id, owner],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::lease(format!(
+            "game ingestion lease for app {app_id} is no longer active"
+        )));
+    }
+    get_task(conn, app_id)?.ok_or_else(|| StorageError::not_found(format!("app {app_id} queue")))
+}
+
+pub fn retry_stage(
+    conn: &Connection,
+    app_id: u32,
+    owner: &str,
+    error_category: &str,
+    retry_delay_ms: i64,
+    now_ms: i64,
+) -> StorageResult<GameIngestionTask> {
+    if owner.trim().is_empty() {
+        return Err(StorageError::validation("lease owner is required"));
+    }
+    if error_category.trim().is_empty() {
+        return Err(StorageError::validation("error category is required"));
+    }
+    if !(1..=7 * 24 * 60 * 60 * 1000).contains(&retry_delay_ms) {
+        return Err(StorageError::validation(
+            "retry_delay_ms must be between 1 and 604800000",
+        ));
+    }
+    require_active_lease(conn, app_id, owner, now_ms)?;
+    let changed = conn.execute(
+        "UPDATE game_ingestion_queue
+         SET status = 'retry', next_attempt_at_ms = ?1,
+             last_error_category = ?2,
+             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3
+         WHERE app_id = ?4 AND lease_owner = ?5
+           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?3",
+        params![
+            now_ms.saturating_add(retry_delay_ms),
+            error_category,
+            now_ms,
+            app_id,
+            owner
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::lease(format!(
+            "game ingestion lease for app {app_id} is no longer active"
+        )));
+    }
+    get_task(conn, app_id)?.ok_or_else(|| StorageError::not_found(format!("app {app_id} queue")))
+}
+
+pub fn stage_observed(
+    conn: &Connection,
+    app_id: u32,
+    stage: &str,
+    country_code: &str,
+    language: &str,
+) -> StorageResult<bool> {
+    let observed = match stage {
+        "store_details" => conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM store_detail_refresh_state
+                WHERE app_id = ?1 AND country_code = ?2 AND language = ?3
+             )",
+            params![app_id, country_code, language],
+            |row| row.get(0),
+        )?,
+        "review_summary" => conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM review_snapshots WHERE app_id = ?1)",
+            [app_id],
+            |row| row.get(0),
+        )?,
+        "popular_reviews" => conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM popular_review_refresh_state WHERE app_id = ?1)",
+            [app_id],
+            |row| row.get(0),
+        )?,
+        "ccu" => conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM player_snapshots WHERE app_id = ?1)",
+            [app_id],
+            |row| row.get(0),
+        )?,
+        "complete" => true,
+        _ => {
+            return Err(StorageError::validation(format!(
+                "unknown game ingestion stage {stage}"
+            )));
+        }
+    };
+    Ok(observed)
+}
+
+fn validate_lease(owner: &str, limit: i64, lease_ms: i64) -> StorageResult<()> {
+    if owner.trim().is_empty() {
+        return Err(StorageError::validation("lease owner is required"));
+    }
+    if !(1..=100).contains(&limit) {
+        return Err(StorageError::validation(
+            "claim limit must be between 1 and 100",
+        ));
+    }
+    if !(1_000..=24 * 60 * 60 * 1000).contains(&lease_ms) {
+        return Err(StorageError::validation(
+            "lease_ms must be between 1000 and 86400000",
+        ));
+    }
+    Ok(())
+}
+
+fn require_active_lease(
+    conn: &Connection,
+    app_id: u32,
+    owner: &str,
+    now_ms: i64,
+) -> StorageResult<GameIngestionTask> {
+    let task = get_task(conn, app_id)?
+        .ok_or_else(|| StorageError::not_found(format!("app {app_id} queue")))?;
+    if task.lease_owner.as_deref() != Some(owner)
+        || task
+            .lease_expires_at_ms
+            .is_none_or(|expires| expires <= now_ms)
+    {
+        return Err(StorageError::lease(format!(
+            "game ingestion lease for app {app_id} is not owned by {owner}"
+        )));
+    }
+    Ok(task)
+}
+
+fn get_task(conn: &Connection, app_id: u32) -> StorageResult<Option<GameIngestionTask>> {
+    conn.query_row(
+        "SELECT app_id, source, priority, stage, status, stage_attempts, total_attempts,
+                next_attempt_at_ms, last_error_category, lease_owner, lease_expires_at_ms
+         FROM game_ingestion_queue WHERE app_id = ?1",
+        [app_id],
+        |row| {
+            Ok(GameIngestionTask {
+                app_id: row.get(0)?,
+                source: row.get(1)?,
+                priority: row.get(2)?,
+                stage: row.get(3)?,
+                status: row.get(4)?,
+                stage_attempts: row.get(5)?,
+                total_attempts: row.get(6)?,
+                next_attempt_at_ms: row.get(7)?,
+                last_error_category: row.get(8)?,
+                lease_owner: row.get(9)?,
+                lease_expires_at_ms: row.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
