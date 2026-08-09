@@ -201,7 +201,13 @@ fast-forward 到同一 SHA。更新器从临时副本运行，因此源码切换
 默认 600 秒，用于低配主机上的一次性迁移/索引构建；它不会改变 systemd 的总超时。
 
 紧急固定某个已发布版本时，可在 `deploy/.env` 临时设置完整的 40 位
-`MPGS_RELEASE_SHA`；成功恢复并确认后应删除该 pin，重新跟随发布指针。运行时密钥只
+`MPGS_RELEASE_SHA`。无论跟随发布指针还是使用 pin，更新器都从目标 SHA 提取同版本
+Compose；本地缺少 pinned commit 时只从 `origin` 获取该对象，不推进当前 checkout。
+更新器也会按运行中 server 镜像的 revision 加载回滚 Compose，因此连续 pin 或 pin
+后的失败升级不会重新混用 checkout 中的配置。
+为避免“目标镜像 + 打包目录中的其他版本 Compose”，自动更新要求部署目录是 Git
+checkout；非 Git 安装必须先安装目标发布随附的部署文件，不能直接运行自动更新器。
+成功恢复并确认后应删除该 pin，重新跟随发布指针。运行时密钥只
 保存在 `deploy/mpgs.env`，不得放入 `deploy/.env`、GitHub workflow 或镜像标签。
 `.dockerignore` 明确排除了两个部署 env 与 `deploy/runtime`，但这些文件仍应保持
 `0600` 且绝不能手工加入构建上下文。
