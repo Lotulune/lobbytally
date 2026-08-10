@@ -187,6 +187,8 @@ docker login ghcr.io
 Feed 候选缓存使用 5 分钟稳定快照，避免每个一分钟 Worker 批次都触发全分区冷重建；
 `/v1/meta.data_updated_at_ms` 仍是实时采集水位。排查延迟时应分别记录快照切换后的首个
 请求与同快照后续请求，不能只用热缓存结果判断 SQL 性能。
+schema 29 起 Feed 使用的四类活跃特征由触发器镜像到小型只读投影；排查迁移或冷查询时
+应确认 `feed_feature_evidence` 与 `idx_feed_feature_evidence_latest` 存在。
 
 `deploy/update.sh` 默认读取 `MPGS_RELEASE_POINTER_IMAGE`；它拒绝脏工作树，且只有
 当指针 SHA 与远端部署分支 tip 一致时才继续。脚本先从目标提交提取临时 Compose

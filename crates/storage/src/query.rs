@@ -658,10 +658,9 @@ pub fn list_candidates(
                         'value', json(evidence.value_json),
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    ) FROM feed_feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'matchmaking_core'
-                      AND evidence.is_active = 1
                       AND evidence.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
                       AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
@@ -671,10 +670,9 @@ pub fn list_candidates(
                         'value', json(evidence.value_json),
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    ) FROM feed_feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'public_world_dependency'
-                      AND evidence.is_active = 1
                       AND evidence.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
                       AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
@@ -684,22 +682,21 @@ pub fn list_candidates(
                         'value', json(evidence.value_json),
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    ) FROM feed_feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'service_shutdown_risk'
-                      AND evidence.is_active = 1
                       AND evidence.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
                       AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  (
-                    SELECT evidence.value_json FROM feature_evidence evidence
-                    WHERE evidence.app_id = a.app_id
-                      AND evidence.feature_name = 'catalog_taxonomy'
-                      AND evidence.is_active = 1
-                      AND evidence.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
-                      AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
-                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
+                    SELECT taxonomy.value_json
+                    FROM feed_feature_evidence taxonomy
+                    WHERE taxonomy.app_id = a.app_id
+                      AND taxonomy.feature_name = 'catalog_taxonomy'
+                      AND taxonomy.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
+                      AND (taxonomy.expires_at_ms IS NULL OR taxonomy.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
+                    ORDER BY taxonomy.observed_at_ms DESC, taxonomy.evidence_id DESC LIMIT 1
                  ),
                  p.computed_at_ms, r.captured_at_ms,
                  COALESCE(d.observed_at_ms, lp.captured_at_ms),
@@ -2509,7 +2506,11 @@ mod tests {
                     CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000, NULL, 1),
                  (77, 'service_shutdown_risk', 'true', 'test', 'expired', 0.99,
                     CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000,
-                    CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000, 1);
+                    CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000, 1),
+                 (77, 'catalog_taxonomy',
+                    '{\"categories\":[\"Co-op\"],\"genres\":[\"Action\"],\"publishers\":[\"Studio\"]}',
+                    'test', 'taxonomy', 0.8,
+                    CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000, NULL, 1);
                  INSERT INTO price_snapshots (
                     app_id, country_code, currency, captured_at_ms,
                     initial_price_minor, final_price_minor, discount_percent,
@@ -2547,6 +2548,15 @@ mod tests {
                 usd[0].service_shutdown_risk, None,
                 "expired evidence is unknown"
             );
+            assert_eq!(usd[0].taxonomy_tags, ["action", "co-op"]);
+            assert_eq!(usd[0].publisher.as_deref(), Some("Studio"));
+
+            conn.execute(
+                "UPDATE feature_evidence
+                 SET expires_at_ms = CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000
+                 WHERE app_id = 77 AND feature_name = 'catalog_taxonomy'",
+                [],
+            )?;
 
             let cny = list_candidates(
                 conn,
@@ -2560,6 +2570,8 @@ mod tests {
             assert_eq!(cny[0].final_price_minor, None, "stale price is unknown");
             assert_eq!(cny[0].price_currency, None);
             assert_eq!(cny[0].price_observed_at_ms, None);
+            assert!(cny[0].taxonomy_tags.is_empty());
+            assert_eq!(cny[0].publisher, None);
 
             let eur = list_candidates(
                 conn,
