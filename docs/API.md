@@ -644,7 +644,7 @@ POST   /admin/v1/golden-tests/run
 
 所有写操作记录操作者、原因、前后值和请求 ID（`x-request-id` 可选）。算法激活前必须有黄金测试结果。
 
-`GET /admin/v1/data-status` 返回每项维护任务的最近成功时间、下次运行、稳定错误类别、游标和 M3 覆盖率；新增的 `m7_coverage` 使用当前算法配置统计候选、可信熟人联机画像、日期、封面、四个分区和连续 7 天的评价/CCU 覆盖。它是 `mpgs-dbtool m7-data-audit` 的可观测对应物，不表示发布门禁已经通过。
+`GET /admin/v1/data-status` 返回每项维护任务的最近成功时间、下次运行、稳定错误类别、游标和 M3 覆盖率；`worker_queue` 是实时轻量查询，区分尚未领取的 `pending`、已经到期可领取的 `pending_due` 和 worker 正在持有限时执行权的 `leased`，并列出当前租约。`dimension_coverage` 以实际 worker 候选为范围，把 `*_checked`（已经请求过来源，包括来源明确无值）与字段确实可用的计数分开；评价和 CCU 的范围仅包含已发售候选。`m7_coverage` 使用当前算法配置统计候选、可信熟人联机画像、日期、封面、四个分区和连续 7 天的评价/CCU 覆盖。它是 `mpgs-dbtool m7-data-audit` 的可观测对应物，不表示发布门禁已经通过。
 
 ## 17. 限流与大小限制
 

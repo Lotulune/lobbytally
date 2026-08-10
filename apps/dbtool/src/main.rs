@@ -43,6 +43,7 @@ const WORKER_JOB_LIMIT_DEFAULT: i64 = 1;
 const WORKER_JOB_LIMIT_MAX: i64 = 10;
 const WORKER_LEASE_MS: i64 = 30 * 60 * 1_000;
 const WORKER_RETRY_BASE_MS: i64 = 60 * 1_000;
+const WORKER_PIPELINE_SNAPSHOT_INTERVAL_MS: i64 = 15 * 60 * 1_000;
 const STORE_SEARCH_TARGET_DEFAULT: u32 = 2_000;
 const STORE_SEARCH_TARGET_MAX: u32 = 10_000;
 const CANDIDATE_WORKER_PAGES_DEFAULT: u32 = 10;
@@ -228,68 +229,117 @@ fn list_enrichment_targets_with_quotas(
     filter: EnrichmentNeedFilter,
     media_policy: mpgs_storage::MediaBackfillPolicy,
 ) -> StorageResult<Vec<mpgs_storage::EnrichmentTarget>> {
+    const SHARED_SCAN_MULTIPLIER: u32 = 16;
+    const SHARED_SCAN_MIN: u32 = 256;
+    const SHARED_SCAN_MAX: u32 = 4_096;
+
     let mut merged = BTreeMap::<u32, mpgs_storage::EnrichmentTarget>::new();
-    for quota in enrichment_quota_plan(limit, filter, after_app_id) {
-        let targets = repo.list_enrichment_targets_after_filtered_with_media(
-            quota.limit,
-            Some(after_app_id),
-            country_code,
-            language,
-            quota.filter,
-            media_policy,
-        )?;
-        for target in targets {
+    let quotas = enrichment_quota_plan(limit, filter, after_app_id);
+    if quotas.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // The due-target query scans the complete candidate pool and evaluates
+    // several correlated freshness probes. Run one bounded shared scan for the
+    // normal path instead of repeating that work once per dimension. A rare
+    // dimension absent from the shared window gets one focused fallback query.
+    let shared_limit = limit
+        .saturating_mul(SHARED_SCAN_MULTIPLIER)
+        .max(SHARED_SCAN_MIN)
+        .min(SHARED_SCAN_MAX);
+    let shared = repo.list_enrichment_targets_after_filtered_with_media(
+        shared_limit,
+        Some(after_app_id),
+        country_code,
+        language,
+        filter,
+        media_policy,
+    )?;
+
+    for quota in quotas {
+        let mut selected = merged
+            .values()
+            .filter(|target| target.matches_filter(quota.filter))
+            .count();
+        for target in &shared {
+            if selected >= usize::try_from(quota.limit).unwrap_or(usize::MAX) {
+                break;
+            }
             let target = target.filtered(quota.filter);
-            if !target.needs_any() {
+            if !target.needs_any()
+                || merged
+                    .get(&target.app_id)
+                    .is_some_and(|current| current.matches_filter(quota.filter))
+            {
                 continue;
             }
-            merged
-                .entry(target.app_id)
-                .and_modify(|current| {
-                    current.needs_store_details |= target.needs_store_details;
-                    current.needs_reviews |= target.needs_reviews;
-                    current.needs_review_excerpts |= target.needs_review_excerpts;
-                    current.needs_ccu |= target.needs_ccu;
-                    current.needs_price |= target.needs_price;
-                    current.needs_media_backfill |= target.needs_media_backfill;
-                    current.needs_english_name |= target.needs_english_name;
-                })
-                .or_insert(target);
+            merge_enrichment_target(&mut merged, target);
+            selected += 1;
+        }
+
+        if selected < usize::try_from(quota.limit).unwrap_or(usize::MAX) {
+            let focused_limit = quota
+                .limit
+                .saturating_add(u32::try_from(selected).unwrap_or(u32::MAX));
+            let focused = repo.list_enrichment_targets_after_filtered_with_media(
+                focused_limit,
+                Some(after_app_id),
+                country_code,
+                language,
+                quota.filter,
+                media_policy,
+            )?;
+            for target in focused {
+                if selected >= usize::try_from(quota.limit).unwrap_or(usize::MAX) {
+                    break;
+                }
+                let target = target.filtered(quota.filter);
+                if !target.needs_any()
+                    || merged
+                        .get(&target.app_id)
+                        .is_some_and(|current| current.matches_filter(quota.filter))
+                {
+                    continue;
+                }
+                merge_enrichment_target(&mut merged, target);
+                selected += 1;
+            }
         }
     }
-    if merged.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
-        // Empty dimensions must not waste their share of the batch. Preserve
-        // the fair quota picks, then fill remaining slots from any due
-        // dimension without raising the configured per-run app limit.
-        let fill_targets = repo.list_enrichment_targets_after_filtered_with_media(
-            limit,
-            Some(after_app_id),
-            country_code,
-            language,
-            filter,
-            media_policy,
-        )?;
-        for target in fill_targets {
-            let target = target.filtered(filter);
-            if !target.needs_any() {
-                continue;
-            }
-            if let Some(current) = merged.get_mut(&target.app_id) {
-                current.needs_store_details |= target.needs_store_details;
-                current.needs_reviews |= target.needs_reviews;
-                current.needs_review_excerpts |= target.needs_review_excerpts;
-                current.needs_ccu |= target.needs_ccu;
-                current.needs_price |= target.needs_price;
-                current.needs_media_backfill |= target.needs_media_backfill;
-                current.needs_english_name |= target.needs_english_name;
-            } else if merged.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
-                merged.insert(target.app_id, target);
-            }
+
+    // Empty dimensions do not waste their quota. Fill remaining app slots from
+    // the already-loaded shared window without another database scan.
+    let target_limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    for target in shared {
+        let target = target.filtered(filter);
+        if target.needs_any()
+            && (merged.contains_key(&target.app_id) || merged.len() < target_limit)
+        {
+            merge_enrichment_target(&mut merged, target);
         }
     }
     let mut targets = merged.into_values().collect::<Vec<_>>();
     targets.sort_by_key(|target| (target.app_id <= after_app_id, target.app_id));
+    targets.truncate(target_limit);
     Ok(targets)
+}
+
+fn merge_enrichment_target(
+    merged: &mut BTreeMap<u32, mpgs_storage::EnrichmentTarget>,
+    target: mpgs_storage::EnrichmentTarget,
+) {
+    merged
+        .entry(target.app_id)
+        .and_modify(|current| {
+            current.needs_store_details |= target.needs_store_details;
+            current.needs_reviews |= target.needs_reviews;
+            current.needs_review_excerpts |= target.needs_review_excerpts;
+            current.needs_ccu |= target.needs_ccu;
+            current.needs_price |= target.needs_price;
+            current.needs_media_backfill |= target.needs_media_backfill;
+            current.needs_english_name |= target.needs_english_name;
+        })
+        .or_insert(target);
 }
 
 /// Continuation pages consumed per scheduled candidate-discovery channel.
@@ -1529,7 +1579,7 @@ fn run_steam_worker_once(
                     }
                 }
                 if let Err(failure) =
-                    storage_write_with_retry(|| repo.refresh_pipeline_status_snapshot())
+                    storage_write_with_retry(|| refresh_worker_pipeline_snapshot_if_due(repo))
                 {
                     eprintln!(
                         "warn job_id={} snapshot_refresh={}",
@@ -1565,7 +1615,7 @@ fn run_steam_worker_once(
                     stats.retried = stats.retried.saturating_add(1);
                 }
                 if let Err(snapshot_failure) =
-                    storage_write_with_retry(|| repo.refresh_pipeline_status_snapshot())
+                    storage_write_with_retry(|| refresh_worker_pipeline_snapshot_if_due(repo))
                 {
                     eprintln!(
                         "warn job_id={} snapshot_refresh={}",
@@ -1580,6 +1630,17 @@ fn run_steam_worker_once(
         }
     }
     Ok(stats)
+}
+
+fn refresh_worker_pipeline_snapshot_if_due(repo: &Repository) -> StorageResult<()> {
+    let now_ms = repo.database().now_ms();
+    let due = repo.pipeline_status_snapshot()?.is_none_or(|snapshot| {
+        now_ms.saturating_sub(snapshot.generated_at_ms) >= WORKER_PIPELINE_SNAPSHOT_INTERVAL_MS
+    });
+    if due {
+        repo.refresh_pipeline_status_snapshot()?;
+    }
+    Ok(())
 }
 
 fn run_catalog_worker_task(repo: &Repository, api_key: &str) -> Result<(), WorkerTaskError> {
@@ -4104,6 +4165,36 @@ mod tests {
         assert!(
             plan.iter()
                 .any(|entry| entry.filter.media_backfill && entry.limit > 0)
+        );
+    }
+
+    #[test]
+    fn worker_pipeline_snapshot_refresh_is_throttled() {
+        let clock = std::sync::Arc::new(mpgs_storage::FakeClock::new(1_000_000));
+        let db = Database::open_in_memory_with_clock(clock.clone()).unwrap();
+        db.migrate().unwrap();
+        let repo = Repository::new(db);
+        repo.ensure_runtime_defaults().unwrap();
+        let initial = repo.pipeline_status_snapshot().unwrap().unwrap();
+
+        clock.advance_ms(WORKER_PIPELINE_SNAPSHOT_INTERVAL_MS - 1);
+        refresh_worker_pipeline_snapshot_if_due(&repo).unwrap();
+        assert_eq!(
+            repo.pipeline_status_snapshot()
+                .unwrap()
+                .unwrap()
+                .generated_at_ms,
+            initial.generated_at_ms
+        );
+
+        clock.advance_ms(1);
+        refresh_worker_pipeline_snapshot_if_due(&repo).unwrap();
+        assert_eq!(
+            repo.pipeline_status_snapshot()
+                .unwrap()
+                .unwrap()
+                .generated_at_ms,
+            1_000_000 + WORKER_PIPELINE_SNAPSHOT_INTERVAL_MS
         );
     }
 

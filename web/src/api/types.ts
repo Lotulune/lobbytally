@@ -74,10 +74,14 @@ export interface DataStatusResponse {
   dimension_coverage: {
     candidates: number;
     released_candidates?: number;
+    store_details_checked?: number;
     store_details: number;
     release_date: number;
+    reviews_checked?: number;
     reviews: number;
+    ccu_checked?: number;
     ccu: number;
+    price_checked?: number;
     price: number;
     languages: number;
     retrieval_index: number;
@@ -92,6 +96,20 @@ export interface DataStatusResponse {
     error_category: string | null;
     notes?: string | null;
   }>;
+  worker_queue?: {
+    pending: number;
+    pending_due: number;
+    leased: number;
+    active_jobs: Array<{
+      job_id: number;
+      task_type: string;
+      entity_key: string;
+      attempts: number;
+      max_attempts: number;
+      lease_expires_at_ms: number | null;
+      updated_at_ms: number;
+    }>;
+  };
   integrated_ingestion?: {
     pending: number;
     retry: number;

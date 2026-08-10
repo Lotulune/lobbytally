@@ -59,10 +59,14 @@ function dataStatus(current: number): DataStatusResponse {
     dimension_coverage: {
       candidates: 100,
       released_candidates: 80,
+      store_details_checked: 100,
       store_details: 100,
       release_date: 99,
+      reviews_checked: 20,
       reviews: 20,
+      ccu_checked: 22,
       ccu: 18,
+      price_checked: 100,
       price: 90,
       languages: 80,
       retrieval_index: 100,
@@ -79,6 +83,22 @@ function dataStatus(current: number): DataStatusResponse {
         notes: `phase=enrichment;apps_attempted=${current};apps_total=20`,
       },
     ],
+    worker_queue: {
+      pending: 3,
+      pending_due: 2,
+      leased: 1,
+      active_jobs: [
+        {
+          job_id: 7,
+          task_type: "enrich_catalog",
+          entity_key: "scheduled",
+          attempts: 1,
+          max_attempts: 3,
+          lease_expires_at_ms: 100_000,
+          updated_at_ms: 1_000,
+        },
+      ],
+    },
     integrated_ingestion: {
       pending: 12,
       retry: 1,
@@ -143,9 +163,17 @@ describe("DataOpsScreen live worker progress", () => {
 
       expect(runtime.adminDataStatus).toHaveBeenCalledWith("test-token");
       expect(host.textContent).toContain("2 / 20 款");
-      expect(host.textContent).toContain("有玩家评价（已发售）20 / 80 · 25%");
+      expect(host.textContent).toContain("当前工作：补发售日与详情");
+      expect(host.textContent).toContain("待领取 3");
+      expect(host.textContent).toContain("可立即领取 2");
+      expect(host.textContent).toContain("已租约 1");
+      expect(host.textContent).toContain("玩家评价已采集（已发售）20 / 80 · 25%");
+      expect(host.textContent).toContain("价格状态已检查100 / 100 · 100%");
+      expect(host.textContent).toContain("有具体价格90款");
       expect(host.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("2");
-      expect(host.querySelectorAll(".section-metric")).toHaveLength(4);
+      expect(
+        host.querySelectorAll(".section-metrics:not(.data-ops-availability) .section-metric"),
+      ).toHaveLength(4);
       expect(host.querySelectorAll(".task-row")).toHaveLength(1);
 
       await act(async () => {
