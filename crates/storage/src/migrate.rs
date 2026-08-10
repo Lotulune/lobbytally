@@ -139,6 +139,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0027_ingestion_lane_circuit_breaker",
         include_str!("../../../migrations/0027_ingestion_lane_circuit_breaker.sql"),
     ),
+    (
+        28,
+        "0028_feed_scope_covering_index",
+        include_str!("../../../migrations/0028_feed_scope_covering_index.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {
@@ -289,6 +294,7 @@ mod tests {
         for index in [
             "idx_app_relations_target_type",
             "idx_review_snapshots_app_latest",
+            "idx_apps_feed_release_scope",
         ] {
             let exists: bool = conn
                 .query_row(
@@ -298,6 +304,43 @@ mod tests {
                 )
                 .unwrap();
             assert!(exists, "missing index {index}");
+        }
+
+        for (scope, predicate) in [
+            (
+                "recent",
+                "release_state = 'released'
+                 AND release_date >= '2026-01-01'
+                 AND release_date <= '2026-08-10'",
+            ),
+            (
+                "legacy",
+                "release_state = 'released' AND release_date < '2026-01-01'",
+            ),
+            (
+                "upcoming",
+                "((release_state IN ('upcoming', 'coming_soon')
+                    AND release_date >= '2026-08-10'
+                    AND release_date <= '2026-09-09')
+                   OR app_type IN ('demo', 'playtest'))",
+            ),
+        ] {
+            let sql = format!(
+                "EXPLAIN QUERY PLAN
+                 SELECT app_id FROM apps
+                 WHERE app_type IN ('game', 'demo', 'playtest') AND ({predicate})"
+            );
+            let mut statement = conn.prepare(&sql).unwrap();
+            let plan: Vec<String> = statement
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("COVERING INDEX idx_apps_feed_release_scope")),
+                "{scope} feed scope did not use covering index: {plan:?}"
+            );
         }
     }
 

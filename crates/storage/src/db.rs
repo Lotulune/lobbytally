@@ -12,6 +12,10 @@ use crate::migrate::{self, latest_version};
 /// How long `/v1/meta` may reuse a previously computed `data_updated_at_ms`.
 /// Full recomputation scans many large tables and is far too expensive for every request.
 const DATA_UPDATED_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Hold one coherent Feed snapshot across several one-minute worker batches.
+/// Source freshness remains available through `data_updated_at_ms`; this only
+/// controls Feed cursor/ETag and candidate-cache churn.
+const FEED_SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const READ_BUSY_TIMEOUT_MS: i32 = 5_000;
 // Production FTS commits can exceed five seconds on the 2C/1G host. The
 // retrieval scheduler now releases the writer between apps, so waiting through
@@ -27,6 +31,9 @@ pub struct Database {
     clock: Arc<dyn Clock>,
     /// Cached MAX(updated_at) watermark for public meta freshness.
     data_updated_cache: Arc<Mutex<Option<(Instant, i64)>>>,
+    /// Stable Feed snapshot watermark. Unlike public freshness, writes do not
+    /// invalidate this cache; it advances on the bounded TTL.
+    feed_snapshot_cache: Arc<Mutex<Option<(Instant, i64)>>>,
 }
 
 impl Database {
@@ -52,6 +59,7 @@ impl Database {
             write: Arc::new(Mutex::new(conn)),
             clock,
             data_updated_cache: Arc::new(Mutex::new(None)),
+            feed_snapshot_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -67,6 +75,7 @@ impl Database {
             write: Arc::new(Mutex::new(conn)),
             clock,
             data_updated_cache: Arc::new(Mutex::new(None)),
+            feed_snapshot_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -117,6 +126,30 @@ impl Database {
             *guard = Some((Instant::now(), value));
         }
         Ok(value)
+    }
+
+    pub(crate) fn cached_feed_snapshot_at_ms(
+        &self,
+        compute: impl FnOnce() -> StorageResult<i64>,
+    ) -> StorageResult<i64> {
+        if let Ok(guard) = self.feed_snapshot_cache.lock()
+            && let Some((at, value)) = *guard
+            && at.elapsed() < FEED_SNAPSHOT_CACHE_TTL
+        {
+            return Ok(value);
+        }
+        let value = compute()?;
+        if let Ok(mut guard) = self.feed_snapshot_cache.lock() {
+            *guard = Some((Instant::now(), value));
+        }
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_feed_snapshot_cache(&self) {
+        if let Ok(mut guard) = self.feed_snapshot_cache.lock() {
+            *guard = None;
+        }
     }
 
     pub fn with_conn<T>(

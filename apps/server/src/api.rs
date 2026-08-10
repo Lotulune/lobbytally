@@ -3070,7 +3070,7 @@ async fn get_feed_inner(
         "{}|tie_day={today}",
         feed_result_context(&preference_context, feed_sort, feed_order, demo_only),
     );
-    let snapshot_ms = match storage_result(repo, |repo| repo.data_updated_at_ms()).await {
+    let snapshot_ms = match storage_result(repo, |repo| repo.feed_snapshot_at_ms()).await {
         Ok(value) => value,
         Err(error) => return map_storage_error(error, None),
     };

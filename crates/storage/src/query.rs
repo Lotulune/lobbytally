@@ -590,7 +590,7 @@ pub fn list_candidates(
         "WITH candidate_scope AS MATERIALIZED (
              SELECT a.app_id
              FROM apps a
-             WHERE a.app_type IN ('game', 'demo', 'playtest', 'unknown')
+             WHERE a.app_type IN ('game', 'demo', 'playtest')
                AND ({scope_predicate})
          ){ranked_scope_cte}, daily_window AS (
              SELECT daily.app_id, daily.day_utc, daily.mean_ccu
@@ -2371,6 +2371,45 @@ mod tests {
                 10,
             )?;
             assert_eq!(rows[0].activity_momentum, None);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn candidate_query_excludes_unknown_catalog_entries() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn(|conn| {
+            crate::catalog::upsert_app(
+                conn,
+                42,
+                "unknown",
+                "unclassified-catalog-entry",
+                "released",
+                Some("2026-07-01"),
+                Some("day"),
+                None,
+                1,
+            )?;
+            conn.execute(
+                "INSERT INTO multiplayer_profiles (
+                    app_id, dominant_mode, online_coop, recommended_min_players,
+                    recommended_max_players, profile_confidence, computed_at_ms
+                 ) VALUES (42, 'coop', 1, 2, 4, 0.8, 1)",
+                [],
+            )?;
+
+            let rows = list_candidates(
+                conn,
+                FeedSection::RecentRelease,
+                CUTOFF,
+                TODAY,
+                "CNY",
+                &RecommendationConfig::default(),
+                10,
+            )?;
+            assert!(rows.is_empty());
             Ok(())
         })
         .unwrap();
