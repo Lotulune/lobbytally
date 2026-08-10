@@ -149,6 +149,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0029_feed_evidence_projection",
         include_str!("../../../migrations/0029_feed_evidence_projection.sql"),
     ),
+    (
+        30,
+        "0030_worker_candidate_scope_index",
+        include_str!("../../../migrations/0030_worker_candidate_scope_index.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {
@@ -449,6 +454,34 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn worker_candidate_scope_uses_partial_category_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_to_latest(&mut conn, 1).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT evidence.app_id
+                 FROM feature_evidence evidence
+                 WHERE evidence.feature_name = 'category_hint'
+                   AND evidence.is_active = 1
+                   AND evidence.confidence >= 0.3",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| {
+                step.contains("USING INDEX idx_feature_evidence_enrichment_candidates")
+                    || step
+                        .contains("USING COVERING INDEX idx_feature_evidence_enrichment_candidates")
+            }),
+            "worker candidate scope did not use partial index: {plan:?}"
+        );
     }
 
     #[test]
