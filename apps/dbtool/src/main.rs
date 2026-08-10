@@ -245,8 +245,7 @@ fn list_enrichment_targets_with_quotas(
     // dimension absent from the shared window gets one focused fallback query.
     let shared_limit = limit
         .saturating_mul(SHARED_SCAN_MULTIPLIER)
-        .max(SHARED_SCAN_MIN)
-        .min(SHARED_SCAN_MAX);
+        .clamp(SHARED_SCAN_MIN, SHARED_SCAN_MAX);
     let shared = repo.list_enrichment_targets_after_filtered_with_media(
         shared_limit,
         Some(after_app_id),
