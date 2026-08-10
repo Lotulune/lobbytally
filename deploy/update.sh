@@ -1,6 +1,25 @@
 #!/bin/sh
 set -eu
 
+if [ "${MPGS_UPDATE_LOCK_HELD:-0}" != 1 ]; then
+  if ! command -v flock >/dev/null 2>&1; then
+    printf 'flock is required to serialize MPGS deployments.\n' >&2
+    exit 2
+  fi
+  update_lock_file=${MPGS_UPDATE_LOCK_FILE:-"${TMPDIR:-/tmp}/mpgs-update-$(id -u).lock"}
+  export MPGS_UPDATE_LOCK_HELD=1
+  if flock --nonblock --conflict-exit-code 75 "$update_lock_file" "$0" "$@"; then
+    exit 0
+  else
+    update_status=$?
+  fi
+  if [ "$update_status" -eq 75 ]; then
+    printf 'Another MPGS deployment is already running; leaving it in control.\n'
+    exit 0
+  fi
+  exit "$update_status"
+fi
+
 if [ "${MPGS_UPDATE_REEXEC:-0}" != 1 ]; then
   original_script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
   update_copy=$(mktemp "${TMPDIR:-/tmp}/mpgs-update.XXXXXX")

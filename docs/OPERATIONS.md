@@ -190,7 +190,7 @@ Feed 候选缓存使用 5 分钟稳定快照，避免每个一分钟 Worker 批�
 schema 29 起 Feed 使用的四类活跃特征由触发器镜像到小型只读投影；排查迁移或冷查询时
 应确认 `feed_feature_evidence` 与 `idx_feed_feature_evidence_latest` 存在。
 Schema 30 另增加 `idx_feature_evidence_enrichment_candidates` 部分索引；Worker
-富化候选查询应从该小索引和 `multiplayer_profiles` 合并候选，而不是逐个探测完整 App 目录。
+富化候选查询应由该小索引驱动，再与 `multiplayer_profiles` 合并候选，而不是逐个探测完整 App 目录。
 
 `deploy/update.sh` 默认读取 `MPGS_RELEASE_POINTER_IMAGE`；它拒绝脏工作树，且只有
 当指针 SHA 与远端部署分支 tip 一致时才继续。脚本先从目标提交提取临时 Compose
@@ -203,6 +203,11 @@ fast-forward 到同一 SHA。更新器从临时副本运行，因此源码切换
 完整性、readiness、`/v1/meta.build_git_sha` 和 worker 健康检查；任一失败时，脚本会
 保留失败数据库副本、恢复升级前备份，并把旧容器的精确本地 image ID 临时标记为
 标准回滚镜像引用后自动重启，避免依赖已经移动的旧 tag。
+
+更新器在任何停服动作前获取主机级非阻塞 `flock`；定时任务与手工触发重叠时，后到
+实例会退出并把控制权留给已经运行的部署。生产手工触发应优先执行
+`sudo systemctl start mpgs-update.service`，并用 `journalctl -u mpgs-update.service`
+观察结果，不要绕过 systemd 并发启动多个脚本。
 
 成功部署后更新器默认只保留最近 3 份 `pre-update-*.db`，可在 `deploy/.env` 中用
 `MPGS_BACKUP_RETENTION_COUNT` 调整（范围 `1..100`）。`MPGS_DEPLOY_HEALTH_TIMEOUT_SECS`

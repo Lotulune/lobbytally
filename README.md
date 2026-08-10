@@ -85,7 +85,7 @@ curl http://127.0.0.1:18082/health/ready
 
 Compose 将 API 发布到宿主机回环地址 `127.0.0.1:18081`，完整模式另将 Web 网关发布到 `127.0.0.1:18082`；SQLite 只保留在绑定卷中。生产域名应由宿主机 Nginx 或其他 TLS 反向代理转发到所选模式的端口。
 
-`main` 分支更新后，GitHub Actions 会构建 release 镜像并发布到 GHCR。VPS 首次切换到远端镜像时复制 `deploy/.env.example` 为 `deploy/.env`；以后运行 `deploy/update.sh` 即可执行 `git pull`、镜像拉取、无本地构建滚动更新和健康检查。生产 VPS 使用 `deploy/mpgs-update.timer` 每 5 分钟自动检查镜像更新。
+`main` 分支更新后，GitHub Actions 会构建 release 镜像并发布到 GHCR。VPS 首次切换到远端镜像时复制 `deploy/.env.example` 为 `deploy/.env`；以后运行 `deploy/update.sh` 即可执行 `git pull`、镜像拉取、无本地构建滚动更新和健康检查。更新器使用主机级互斥锁避免并发停服；生产 VPS 使用 `deploy/mpgs-update.timer` 每 5 分钟自动检查镜像更新，手工触发应执行 `sudo systemctl start mpgs-update.service`。
 
 运行服务端：
 
