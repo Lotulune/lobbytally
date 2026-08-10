@@ -17,6 +17,7 @@ use mpgs_steam_source::{
     AppCatalogProposal, AppListPage, AppListRequest, AppRelationProposal, CcuProposal, GoldenGame,
     PopularReviewsProposal, ReviewSummaryProposal, StoreDetailsProposal, StoreSearchPage,
 };
+use rusqlite::TransactionBehavior;
 use std::{
     collections::HashMap,
     hash::Hash,
@@ -182,7 +183,7 @@ impl Repository {
     pub fn ingest_review(&self, proposal: &ReviewSummaryProposal) -> StorageResult<()> {
         let now = self.db.now_ms();
         self.db.with_conn_mut(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             ingest::ingest_review_summary(&tx, proposal, now)?;
             tx.commit()?;
             Ok(())
@@ -192,7 +193,7 @@ impl Repository {
     pub fn ingest_popular_reviews(&self, proposal: &PopularReviewsProposal) -> StorageResult<()> {
         let now = self.db.now_ms();
         self.db.with_conn_mut(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             ingest::ingest_popular_reviews(&tx, proposal, now)?;
             tx.commit()?;
             Ok(())
@@ -202,7 +203,7 @@ impl Repository {
     pub fn ingest_ccu(&self, proposal: &CcuProposal) -> StorageResult<()> {
         let now = self.db.now_ms();
         self.db.with_conn_mut(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             ingest::ingest_ccu(&tx, proposal, now)?;
             tx.commit()?;
             Ok(())
@@ -216,7 +217,7 @@ impl Repository {
     ) -> StorageResult<()> {
         let now = self.db.now_ms();
         self.db.with_conn_mut(|conn| {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             ingest::ingest_store_details(&tx, details, relations, now)?;
             tx.commit()?;
             Ok(())

@@ -302,6 +302,63 @@ fn previous_version_with_data_upgrades() {
 }
 
 #[test]
+fn per_app_ingestion_waits_for_writer_and_preserves_existing_identity() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ingestion-contention.db");
+    let db = Database::open(&path).unwrap();
+    db.migrate().unwrap();
+    db.with_conn_mut(|conn| {
+        conn.execute(
+            "INSERT INTO apps (
+                 app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+             ) VALUES (892970, 'game', 'Valheim', 'released', 1, 1)",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let repo = Repository::new(db);
+    let raw = RawResponse::validate(
+        200,
+        include_bytes!("../../steam-source/fixtures/reviews_summary.json").to_vec(),
+        None,
+        1024 * 1024,
+    )
+    .unwrap();
+    let review = parse_review_summary(&ReviewSummaryRequest::summary_only(892970), &raw).unwrap();
+
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let waiting_repo = repo.clone();
+    let waiting_writer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        waiting_repo.ingest_review(&review)
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    blocker.execute_batch("COMMIT").unwrap();
+
+    waiting_writer.join().unwrap().unwrap();
+    let app = repo.get_app(892970).unwrap().unwrap();
+    assert_eq!(app.canonical_name, "Valheim");
+    let review_count: i64 = repo
+        .database()
+        .with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM review_snapshots WHERE app_id = 892970",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(review_count, 1);
+}
+
+#[test]
 fn file_backed_reads_do_not_wait_for_writer_handle_lock() {
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};

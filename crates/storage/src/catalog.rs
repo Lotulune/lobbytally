@@ -185,12 +185,14 @@ pub fn ensure_app_stub(
     name: &str,
     now_ms: i64,
 ) -> StorageResult<()> {
-    if get_app(conn, app_id)?.is_some() {
-        return Ok(());
-    }
-    upsert_app(
-        conn, app_id, "unknown", name, "unknown", None, None, None, now_ms,
-    )
+    conn.execute(
+        "INSERT INTO apps (
+             app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+         ) VALUES (?1, 'unknown', ?2, 'unknown', ?3, ?3)
+         ON CONFLICT(app_id) DO NOTHING",
+        params![app_id, name, now_ms],
+    )?;
+    Ok(())
 }
 
 /// Preserve the localized store identity returned by a store-details request.
