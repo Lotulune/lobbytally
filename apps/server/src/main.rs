@@ -781,6 +781,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_write_advances_meta_without_churning_feed_snapshot() {
+        let (repo, app) = test_repo_and_app(RateLimitConfig::default());
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/feeds/classic_legacy?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_etag = first.headers().get(header::ETAG).unwrap().clone();
+        let first_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let feed_snapshot = first_json["data_updated_at_ms"].as_i64().unwrap();
+
+        repo.database()
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    "UPDATE apps SET updated_at_ms = ?1 WHERE app_id = 548430",
+                    [feed_snapshot + 1],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let meta = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/meta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(meta.status(), StatusCode::OK);
+        let meta_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(meta.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta_json["data_updated_at_ms"], feed_snapshot + 1);
+
+        let not_modified = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/feeds/classic_legacy?limit=1")
+                    .header(header::IF_NONE_MATCH, first_etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+
+        let current_feed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/feeds/classic_legacy?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current_feed.status(), StatusCode::OK);
+        let current_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(current_feed.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(current_json["data_updated_at_ms"], feed_snapshot);
+    }
+
+    #[tokio::test]
     async fn detail_etag_is_scoped_to_user_vote_state() {
         let (repo, app) = test_repo_and_app(RateLimitConfig::default());
         let first_user = account_for_repo(&repo, "detail_first");

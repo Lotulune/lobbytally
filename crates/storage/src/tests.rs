@@ -160,6 +160,50 @@ fn candidate_cache_is_bounded_by_the_data_snapshot() {
 }
 
 #[test]
+fn feed_snapshot_stays_stable_across_worker_writes_until_refresh() {
+    let (repo, clock) = repo_with_clock(1_000);
+    repo.database()
+        .with_conn(|conn| {
+            crate::catalog::upsert_app(
+                conn,
+                100,
+                "game",
+                "Snapshot 100",
+                "released",
+                Some("2026-08-08"),
+                Some("day"),
+                None,
+                1_000,
+            )
+        })
+        .unwrap();
+    assert_eq!(repo.feed_snapshot_at_ms().unwrap(), 1_000);
+
+    clock.set(2_000);
+    repo.database()
+        .with_conn_mut(|conn| {
+            crate::catalog::upsert_app(
+                conn,
+                101,
+                "game",
+                "Snapshot 101",
+                "released",
+                Some("2026-08-09"),
+                Some("day"),
+                None,
+                2_000,
+            )
+        })
+        .unwrap();
+
+    assert_eq!(repo.data_updated_at_ms().unwrap(), 2_000);
+    assert_eq!(repo.feed_snapshot_at_ms().unwrap(), 1_000);
+
+    repo.database().invalidate_feed_snapshot_cache();
+    assert_eq!(repo.feed_snapshot_at_ms().unwrap(), 2_000);
+}
+
+#[test]
 fn calendar_cache_is_bounded_by_the_data_snapshot() {
     let (repo, _) = repo_with_clock(1_000);
     let insert_calendar_app = |app_id, name: &str| {

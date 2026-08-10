@@ -2327,6 +2327,14 @@ impl Repository {
             .cached_data_updated_at_ms(|| self.db.with_conn(crate::query::data_updated_at_ms))
     }
 
+    /// Snapshot used by Feed cursors, ETags, and candidate caches. It advances
+    /// at most once every five minutes so one-minute worker batches do not
+    /// force every section through an expensive cold rebuild.
+    pub fn feed_snapshot_at_ms(&self) -> StorageResult<i64> {
+        self.db
+            .cached_feed_snapshot_at_ms(|| self.db.with_conn(crate::query::data_updated_at_ms))
+    }
+
     pub fn create_feedback(
         &self,
         user_id: &str,

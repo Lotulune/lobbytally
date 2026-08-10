@@ -179,6 +179,8 @@ M6 起 `schema_version` / `build_git_sha` / `data_updated_at_ms` 用于发布物
 
 ### `GET /v1/feeds/{section}`
 
+Feed 使用最多保持 5 分钟的稳定数据快照来绑定 ETag、游标和候选缓存。Worker 的一分钟采集批次仍会立即推进 `/v1/meta.data_updated_at_ms` 与详情数据，但不会逐批使所有 Feed 分区进入冷查询；Feed 响应中的 `snapshot_at_ms` / `data_updated_at_ms` 表示该次推荐实际使用的稳定快照。
+
 `section`：
 
 - `recent_release`
