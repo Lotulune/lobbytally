@@ -465,9 +465,12 @@ mod tests {
                 "EXPLAIN QUERY PLAN
                  SELECT evidence.app_id
                  FROM feature_evidence evidence
+                      INDEXED BY idx_feature_evidence_enrichment_candidates
+                 CROSS JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
                  WHERE evidence.feature_name = 'category_hint'
                    AND evidence.is_active = 1
-                   AND evidence.confidence >= 0.3",
+                   AND evidence.confidence >= 0.3
+                   AND candidate_app.app_type IN ('game', 'demo', 'playtest')",
             )
             .unwrap()
             .query_map([], |row| row.get(3))
@@ -481,6 +484,18 @@ mod tests {
                         .contains("USING COVERING INDEX idx_feature_evidence_enrichment_candidates")
             }),
             "worker candidate scope did not use partial index: {plan:?}"
+        );
+        let evidence_scan = plan
+            .iter()
+            .position(|step| step.contains("idx_feature_evidence_enrichment_candidates"))
+            .expect("partial evidence index must appear in the plan");
+        let app_lookup = plan
+            .iter()
+            .position(|step| step.contains("candidate_app"))
+            .expect("candidate app lookup must appear in the plan");
+        assert!(
+            evidence_scan < app_lookup,
+            "partial evidence index must drive the candidate join: {plan:?}"
         );
     }
 

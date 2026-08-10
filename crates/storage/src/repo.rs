@@ -584,7 +584,8 @@ impl Repository {
                 "WITH candidates(app_id) AS (
                      SELECT evidence.app_id
                      FROM feature_evidence evidence
-                     JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
+                          INDEXED BY idx_feature_evidence_enrichment_candidates
+                     CROSS JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND evidence.feature_name = 'category_hint'
                        AND evidence.is_active = 1
@@ -592,7 +593,7 @@ impl Repository {
                      UNION
                      SELECT profile.app_id
                      FROM multiplayer_profiles profile
-                     JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
+                     CROSS JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND (
                            profile.dominant_mode IS NOT NULL
@@ -787,7 +788,8 @@ impl Repository {
                 "WITH candidates(app_id) AS (
                      SELECT evidence.app_id
                      FROM feature_evidence evidence
-                     JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
+                          INDEXED BY idx_feature_evidence_enrichment_candidates
+                     CROSS JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND evidence.feature_name = 'category_hint'
                        AND evidence.is_active = 1
@@ -795,7 +797,7 @@ impl Repository {
                      UNION
                      SELECT profile.app_id
                      FROM multiplayer_profiles profile
-                     JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
+                     CROSS JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND (
                            profile.dominant_mode IS NOT NULL
