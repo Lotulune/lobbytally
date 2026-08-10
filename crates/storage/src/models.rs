@@ -325,13 +325,41 @@ pub struct PipelineDimensionCoverage {
     pub candidates: i64,
     #[serde(default)]
     pub released_candidates: i64,
+    #[serde(default)]
+    pub store_details_checked: i64,
     pub store_details: i64,
     pub release_date: i64,
+    #[serde(default)]
+    pub reviews_checked: i64,
     pub reviews: i64,
+    #[serde(default)]
+    pub ccu_checked: i64,
     pub ccu: i64,
+    #[serde(default)]
+    pub price_checked: i64,
     pub price: i64,
     pub languages: i64,
     pub retrieval_index: i64,
+}
+
+/// Live, lightweight worker queue state for the operator dashboard.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineWorkerQueueStatus {
+    pub pending: i64,
+    pub pending_due: i64,
+    pub leased: i64,
+    pub active_jobs: Vec<PipelineActiveJob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineActiveJob {
+    pub job_id: i64,
+    pub task_type: String,
+    pub entity_key: String,
+    pub attempts: i64,
+    pub max_attempts: i64,
+    pub lease_expires_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1640,6 +1640,51 @@ impl Repository {
         })
     }
 
+    pub fn pipeline_worker_queue_status(
+        &self,
+    ) -> StorageResult<crate::models::PipelineWorkerQueueStatus> {
+        let now_ms = self.db.now_ms();
+        self.db.with_conn(|conn| {
+            let (pending, pending_due, leased) = conn.query_row(
+                "SELECT
+                    COALESCE(SUM(status = 'pending'), 0),
+                    COALESCE(SUM(status = 'pending' AND due_at_ms <= ?1), 0),
+                    COALESCE(SUM(status = 'leased'), 0)
+                 FROM jobs
+                 WHERE status IN ('pending', 'leased')",
+                [now_ms],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let mut statement = conn.prepare(
+                "SELECT job_id, task_type, entity_key, attempts, max_attempts,
+                        lease_expires_at_ms, updated_at_ms
+                 FROM jobs
+                 WHERE status = 'leased'
+                 ORDER BY updated_at_ms ASC, job_id ASC
+                 LIMIT 10",
+            )?;
+            let active_jobs = statement
+                .query_map([], |row| {
+                    Ok(crate::models::PipelineActiveJob {
+                        job_id: row.get(0)?,
+                        task_type: row.get(1)?,
+                        entity_key: row.get(2)?,
+                        attempts: row.get(3)?,
+                        max_attempts: row.get(4)?,
+                        lease_expires_at_ms: row.get(5)?,
+                        updated_at_ms: row.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(crate::models::PipelineWorkerQueueStatus {
+                pending,
+                pending_due,
+                leased,
+                active_jobs,
+            })
+        })
+    }
+
     pub fn multiplayer_candidate_count(&self) -> StorageResult<i64> {
         self.db.with_conn(|conn| {
             conn.query_row("SELECT COUNT(*) FROM multiplayer_profiles", [], |row| {
@@ -1657,35 +1702,82 @@ impl Repository {
         let mut snapshot = self.pipeline_status_snapshot()?.unwrap_or_default();
         let dimension_coverage = self.db.with_conn(|conn| {
             conn.query_row(
-                "SELECT COUNT(*),
+                "WITH candidates AS MATERIALIZED (
+                     SELECT a.app_id
+                     FROM apps a
+                     WHERE a.app_type IN ('game', 'demo', 'playtest')
+                       AND (
+                           EXISTS (
+                               SELECT 1 FROM feature_evidence evidence
+                               WHERE evidence.app_id = a.app_id
+                                 AND evidence.feature_name = 'category_hint'
+                                 AND evidence.is_active = 1
+                                 AND evidence.confidence >= 0.3
+                           )
+                           OR EXISTS (
+                               SELECT 1 FROM multiplayer_profiles profile
+                               WHERE profile.app_id = a.app_id
+                                 AND (
+                                     profile.dominant_mode IS NOT NULL
+                                     OR profile.private_session IS NOT NULL
+                                     OR profile.online_coop IS NOT NULL
+                                     OR profile.self_hosted_server IS NOT NULL
+                                     OR profile.drop_in_out IS NOT NULL
+                                     OR profile.crossplay IS NOT NULL
+                                     OR profile.recommended_max_players IS NOT NULL
+                                 )
+                           )
+                       )
+                 )
+                 SELECT COUNT(*),
                         COALESCE(SUM(CASE WHEN a.release_state = 'released' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(EXISTS(
+                            SELECT 1 FROM store_detail_refresh_state refresh
+                            WHERE refresh.app_id = candidates.app_id
+                              AND refresh.status IN ('succeeded', 'not_found')
+                              AND refresh.store_checked_at_ms > 0
+                        )), 0),
                         COALESCE(SUM(CASE WHEN COALESCE(v.platforms_json, '[]') <> '[]' THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN a.release_date IS NOT NULL OR a.release_date_raw IS NOT NULL THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM latest_review_snapshots r WHERE r.app_id = p.app_id) THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM player_snapshots c WHERE c.app_id = p.app_id AND c.player_count IS NOT NULL AND c.result_code = 1) THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(EXISTS(SELECT 1 FROM price_snapshots price WHERE price.app_id = p.app_id AND price.final_price_minor IS NOT NULL)), 0),
+                        COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM review_snapshots r WHERE r.app_id = candidates.app_id) THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM latest_review_snapshots r WHERE r.app_id = candidates.app_id) THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM player_snapshots c WHERE c.app_id = candidates.app_id) THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM player_snapshots c WHERE c.app_id = candidates.app_id AND c.player_count IS NOT NULL AND c.result_code = 1) THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(
+                            EXISTS(SELECT 1 FROM price_snapshots price WHERE price.app_id = candidates.app_id)
+                            OR EXISTS(
+                                SELECT 1 FROM store_detail_refresh_state refresh
+                                WHERE refresh.app_id = candidates.app_id
+                                  AND refresh.price_checked_at_ms > 0
+                            )
+                        ), 0),
+                        COALESCE(SUM(EXISTS(SELECT 1 FROM price_snapshots price WHERE price.app_id = candidates.app_id AND price.final_price_minor IS NOT NULL)), 0),
                         COALESCE(SUM(CASE WHEN COALESCE(v.languages_json, '[]') <> '[]' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(EXISTS(SELECT 1 FROM game_documents d WHERE d.app_id = p.app_id)), 0),
+                        COALESCE(SUM(EXISTS(SELECT 1 FROM game_documents d WHERE d.app_id = candidates.app_id)), 0),
                         COALESCE(SUM(CASE WHEN media.capsule_url IS NOT NULL AND TRIM(media.capsule_url) <> '' THEN 1 ELSE 0 END), 0)
-                 FROM multiplayer_profiles p
-                 JOIN apps a ON a.app_id = p.app_id
-                 LEFT JOIN app_availability v ON v.app_id = p.app_id
-                 LEFT JOIN app_media media ON media.app_id = p.app_id",
+                 FROM candidates
+                 JOIN apps a ON a.app_id = candidates.app_id
+                 LEFT JOIN app_availability v ON v.app_id = candidates.app_id
+                 LEFT JOIN app_media media ON media.app_id = candidates.app_id",
                 [],
                 |row| {
                     Ok((
                         crate::models::PipelineDimensionCoverage {
                             candidates: row.get(0)?,
                             released_candidates: row.get(1)?,
-                            store_details: row.get(2)?,
-                            release_date: row.get(3)?,
-                            reviews: row.get(4)?,
-                            ccu: row.get(5)?,
-                            price: row.get(6)?,
-                            languages: row.get(7)?,
-                            retrieval_index: row.get(8)?,
+                            store_details_checked: row.get(2)?,
+                            store_details: row.get(3)?,
+                            release_date: row.get(4)?,
+                            reviews_checked: row.get(5)?,
+                            reviews: row.get(6)?,
+                            ccu_checked: row.get(7)?,
+                            ccu: row.get(8)?,
+                            price_checked: row.get(9)?,
+                            price: row.get(10)?,
+                            languages: row.get(11)?,
+                            retrieval_index: row.get(12)?,
                         },
-                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(13)?,
                     ))
                 },
             )
@@ -1786,12 +1878,16 @@ impl Repository {
         let active = self.active_algorithm_config()?;
         snapshot.m7_coverage = self.m7_data_coverage(&active.config)?;
         snapshot.dimension_coverage = crate::models::PipelineDimensionCoverage {
-            candidates: snapshot.coverage.normalized_multiplayer_candidates,
+            candidates: live_dimensions.candidates,
             released_candidates: live_dimensions.released_candidates,
+            store_details_checked: live_dimensions.store_details_checked,
             store_details: snapshot.coverage.with_platforms,
             release_date: snapshot.m7_coverage.candidates_with_date,
+            reviews_checked: live_dimensions.reviews_checked,
             reviews: live_dimensions.reviews,
+            ccu_checked: live_dimensions.ccu_checked,
             ccu: live_dimensions.ccu,
+            price_checked: live_dimensions.price_checked,
             price: snapshot.coverage.with_price,
             languages: snapshot.coverage.with_languages,
             retrieval_index: snapshot.dimension_coverage.retrieval_index,

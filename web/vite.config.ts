@@ -25,6 +25,7 @@ export default defineConfig(({ mode }) => {
       strictPort: true,
       proxy: {
         "/v1": { target: devApiProxyTarget, changeOrigin: true },
+        "/admin": { target: devApiProxyTarget, changeOrigin: true },
         "/health": { target: devApiProxyTarget, changeOrigin: true },
         "/.well-known": { target: devApiProxyTarget, changeOrigin: true },
         "/openapi.json": { target: devApiProxyTarget, changeOrigin: true },

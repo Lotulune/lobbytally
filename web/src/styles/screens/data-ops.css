@@ -120,6 +120,13 @@
   gap: 12px;
 }
 
+.data-ops .data-ops-scope-note {
+  margin: 0 0 14px;
+  color: var(--ink-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
 .data-ops .bar-row {
   display: grid;
   gap: 5px;
@@ -241,6 +248,10 @@
   border: 1px solid var(--border);
   border-radius: 8px;
   overflow: hidden;
+}
+
+.data-ops .data-ops-availability {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
 .data-ops .section-metric {
@@ -426,6 +437,10 @@
 
 @media (max-width: 760px) {
   .data-ops .section-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .data-ops .data-ops-availability {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

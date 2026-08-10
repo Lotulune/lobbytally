@@ -2621,6 +2621,37 @@ fn pipeline_inventory_counts_basic_rows() {
 }
 
 #[test]
+fn pipeline_worker_queue_status_is_live_and_separates_due_jobs_from_leases() {
+    let now_ms = 1_785_830_400_000;
+    let (repo, _) = repo_with_clock(now_ms);
+    for (key, due_at_ms) in [("due", now_ms), ("future", now_ms + 60_000)] {
+        repo.enqueue_job(&EnqueueJob {
+            source: "steam".into(),
+            task_type: "enrich_catalog".into(),
+            entity_key: key.into(),
+            priority: 10,
+            due_at_ms,
+            idempotency_key: format!("queue-{key}"),
+            payload_json: None,
+            max_attempts: 3,
+        })
+        .unwrap();
+    }
+    let leased = repo
+        .lease_jobs("worker-a", 1, 60_000, Some("steam"))
+        .unwrap();
+    assert_eq!(leased.len(), 1);
+
+    let status = repo.pipeline_worker_queue_status().unwrap();
+    assert_eq!(status.pending, 1);
+    assert_eq!(status.pending_due, 0);
+    assert_eq!(status.leased, 1);
+    assert_eq!(status.active_jobs.len(), 1);
+    assert_eq!(status.active_jobs[0].task_type, "enrich_catalog");
+    assert_eq!(status.active_jobs[0].attempts, 1);
+}
+
+#[test]
 fn pipeline_dynamic_coverage_uses_only_released_candidates() {
     let now_ms = 1_785_830_400_000i64;
     let (repo, _) = repo_with_clock(now_ms);
@@ -2632,11 +2663,12 @@ fn pipeline_dynamic_coverage_uses_only_released_candidates() {
                      created_at_ms, updated_at_ms
                  ) VALUES
                      (10, 'game', 'Released Fixture', 'released', 1, 1),
-                     (20, 'game', 'Upcoming Fixture', 'coming_soon', 1, 1);
+                     (20, 'game', 'Upcoming Fixture', 'coming_soon', 1, 1),
+                     (30, 'game', 'Empty Profile Fixture', 'released', 1, 1);
                  INSERT INTO multiplayer_profiles (app_id, computed_at_ms, online_coop)
-                 VALUES (10, 1, 1), (20, 1, 1);",
+                 VALUES (10, 1, 1), (20, 1, 1), (30, 1, NULL);",
             )?;
-            for app_id in [10, 20] {
+            for app_id in [10, 20, 30] {
                 conn.execute(
                     "INSERT INTO review_snapshots (
                          app_id, region_scope, language_scope, captured_at_ms,
@@ -2655,15 +2687,27 @@ fn pipeline_dynamic_coverage_uses_only_released_candidates() {
                     rusqlite::params![app_id, now_ms, format!("ccu-{app_id}")],
                 )?;
             }
+            conn.execute(
+                "UPDATE player_snapshots
+                 SET player_count = NULL, result_code = 42
+                 WHERE app_id = 10",
+                [],
+            )?;
             Ok(())
         })
+        .unwrap();
+    repo.record_store_details_not_found(10, "CN", "schinese")
         .unwrap();
 
     let snapshot = repo.refresh_pipeline_status_snapshot().unwrap();
     assert_eq!(snapshot.dimension_coverage.candidates, 2);
     assert_eq!(snapshot.dimension_coverage.released_candidates, 1);
+    assert_eq!(snapshot.dimension_coverage.store_details_checked, 1);
+    assert_eq!(snapshot.dimension_coverage.price_checked, 1);
+    assert_eq!(snapshot.dimension_coverage.reviews_checked, 1);
     assert_eq!(snapshot.dimension_coverage.reviews, 1);
-    assert_eq!(snapshot.dimension_coverage.ccu, 1);
+    assert_eq!(snapshot.dimension_coverage.ccu_checked, 1);
+    assert_eq!(snapshot.dimension_coverage.ccu, 0);
 }
 
 #[test]

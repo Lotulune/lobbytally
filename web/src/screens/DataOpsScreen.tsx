@@ -58,6 +58,8 @@ function taskLabel(name: string): string {
     case "enrichment":
     case "candidate_enrichment":
       return "补发售日与详情";
+    case "enrich_catalog":
+      return "采集候选资料";
     case "candidate_discovery":
       return "推进候选发现";
     case "quality_check":
@@ -85,6 +87,36 @@ function runProgress(notes: string | null | undefined): { current: number; total
   const total = Number(fields.get("apps_total"));
   if (!Number.isFinite(current) || !Number.isFinite(total) || total <= 0) return null;
   return { current: Math.max(0, current), total: Math.max(1, total) };
+}
+
+function activeRunDetail(run: DataStatusResponse["latest_runs"][number] | null): string | null {
+  if (!run?.notes) return null;
+  const fields = new Map(
+    run.notes.split(";").map((part) => {
+      const split = part.indexOf("=");
+      return split < 0 ? [part, ""] : [part.slice(0, split), part.slice(split + 1)];
+    }),
+  );
+  const attempted = Number(fields.get("apps_attempted"));
+  const total = Number(fields.get("apps_total"));
+  if (Number.isFinite(attempted) && Number.isFinite(total) && total > 0) {
+    const details = ([
+      ["store", "商店"],
+      ["reviews", "评价"],
+      ["popular_reviews", "热评"],
+      ["ccu", "在线"],
+    ] as const)
+      .map(([key, label]) => {
+        const value = Number(fields.get(key));
+        return Number.isFinite(value) ? `${label} ${value}` : null;
+      })
+      .filter((value): value is string => value !== null);
+    return `正在处理第 ${attempted} / ${total} 款${details.length ? ` · ${details.join(" · ")}` : ""}`;
+  }
+  if (run.task_type === "candidate_top_refresh") return "正在刷新近期发售与即将发售候选";
+  if (run.task_type === "candidate_discovery") return "正在推进 Steam 候选发现游标";
+  if (run.task_type === "catalog_sync") return "正在同步 Steam 应用目录";
+  return null;
 }
 
 function nextRunLabel(nextRunAtMs: number | null, nowMs: number): string {
@@ -208,8 +240,9 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
   const dimensions = status?.dimension_coverage;
   const tasks = status?.tasks ?? [];
   const latestRuns = status?.latest_runs ?? [];
+  const workerQueue = status?.worker_queue;
   const integrated = status?.integrated_ingestion;
-  const pool = inv?.multiplayer_profiles ?? 0;
+  const pool = dimensions?.candidates ?? inv?.multiplayer_profiles ?? 0;
   const releasedPool = dimensions?.released_candidates ?? pool;
 
   const sectionStats = useMemo(() => {
@@ -225,8 +258,14 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
       { name: "经典联机", value: m7.classic_legacy_candidates },
     ];
   }, [m7]);
-  const activeRun = latestRuns.find((run) => run.status === "running") ?? null;
+  const reportedRun = latestRuns.find((run) => run.status === "running") ?? null;
+  const activeRun = workerQueue === undefined || workerQueue.leased > 0 ? reportedRun : null;
   const activeProgress = runProgress(activeRun?.notes);
+  const activeJob = workerQueue?.active_jobs[0] ?? null;
+  const workerRunning = activeRun !== null || (workerQueue?.leased ?? 0) > 0;
+  const pendingJobs = workerQueue?.pending ?? inv?.jobs_pending ?? 0;
+  const leasedJobs = workerQueue?.leased ?? inv?.jobs_leased ?? 0;
+  const dueJobs = workerQueue?.pending_due ?? pendingJobs;
 
   const runLookup = async () => {
     setLookupError(null);
@@ -319,7 +358,11 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
       {status && inv ? (
         <>
           <div className="data-ops-grid">
-            <Stat label="联机游戏池" value={inv.multiplayer_profiles} hint="能参与推荐的" />
+            <Stat
+              label="Worker 采集范围"
+              value={pool}
+              hint={`联机档案 ${inv.multiplayer_profiles.toLocaleString()}，已排除不参与采集的壳数据`}
+            />
             <Stat
               label="近两周新发售"
               value={inv.released_last_14_days}
@@ -340,11 +383,9 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
             <Stat label="库内游戏总数" value={inv.apps_total} hint="含未整理壳数据" />
             <Stat
               label="排队任务"
-              value={inv.jobs_pending + inv.jobs_leased}
+              value={pendingJobs + leasedJobs}
               hint={
-                inv.jobs_dead_recent > 0
-                  ? `近 7 天失败 ${inv.jobs_dead_recent} · 历史 ${inv.jobs_dead}`
-                  : `近 7 天无失败 · 历史 ${inv.jobs_dead}`
+                `待领取 ${pendingJobs} · 可立即领取 ${dueJobs} · 已租约 ${leasedJobs}`
               }
               tone={inv.jobs_dead_recent > 0 ? "warn" : undefined}
             />
@@ -371,21 +412,31 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
           </div>
 
           <Panel title="Worker 实时状态">
-            <div className="worker-live" data-running={activeRun ? "true" : "false"}>
+            <div className="worker-live" data-running={workerRunning ? "true" : "false"}>
               <div className="worker-live-head">
                 <span className="worker-state-dot" />
                 <div>
-                  <strong>{activeRun ? taskLabel(activeRun.task_type) : "当前空闲"}</strong>
+                  <strong>
+                    {activeRun
+                      ? `当前工作：${taskLabel(activeRun.task_type)}`
+                      : activeJob
+                        ? `当前工作：${taskLabel(activeJob.task_type)}`
+                        : "当前空闲"}
+                  </strong>
                   <span>
                     {activeRun
-                      ? `开始于 ${ago(activeRun.started_at_ms)}`
+                      ? activeRunDetail(activeRun) ?? `开始于 ${ago(activeRun.started_at_ms)}`
+                      : activeJob
+                        ? `任务 ${activeJob.entity_key} · 第 ${activeJob.attempts} / ${activeJob.max_attempts} 次尝试`
                       : "队列有任务时会自动领取"}
                   </span>
                 </div>
                 <span className="worker-requests">
                   {activeRun
                     ? `请求 ${activeRun.request_count} · 成功 ${activeRun.success_count}`
-                    : `待领取 ${inv.jobs_pending} · 已租约 ${inv.jobs_leased}`}
+                    : workerRunning
+                      ? "已领取，正在启动"
+                      : "没有执行中的租约"}
                 </span>
               </div>
               {activeRun && activeProgress ? (
@@ -412,11 +463,19 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
                 </div>
               ) : null}
               <div className="worker-queue-line">
-                <span>新游待处理 {integrated?.pending ?? 0}</span>
-                <span>重试 {integrated?.retry ?? 0}</span>
-                <span>处理中 {integrated?.leased ?? 0}</span>
+                <span title="已经进入任务队列、尚未被 worker 领取">待领取 {pendingJobs}</span>
+                <span title="已到执行时间，可以立即被 worker 领取">可立即领取 {dueJobs}</span>
+                <span title="worker 已取得限时执行权，正常情况下就是处理中">已租约 {leasedJobs}</span>
+                <span data-tone={inv.jobs_dead_recent > 0 ? "bad" : "ok"}>
+                  近 7 天失败 {inv.jobs_dead_recent}
+                </span>
+              </div>
+              <div className="worker-queue-line">
+                <span>新游入库待处理 {integrated?.pending ?? 0}</span>
+                <span>新游重试 {integrated?.retry ?? 0}</span>
+                <span>新游处理中 {integrated?.leased ?? 0}</span>
                 <span data-tone={(integrated?.dead ?? 0) > 0 ? "bad" : "ok"}>
-                  Dead {integrated?.dead ?? 0}
+                  新游 Dead {integrated?.dead ?? 0}
                 </span>
               </div>
             </div>
@@ -460,21 +519,69 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
             </Panel>
           ) : null}
 
-          <Panel title="资料完整度">
+          <Panel title="采集进度">
+            <p className="data-ops-scope-note">
+              基础资料统计 {pool.toLocaleString()} 款 worker 候选；评价与在线人数只统计
+              {releasedPool.toLocaleString()} 款已发售候选。已检查但 Steam 没有该字段，不再误报为 worker
+              缺失。
+            </p>
             <div className="bar-list">
-              <Bar name="商店详情" value={dimensions?.store_details ?? 0} max={pool} />
-              <Bar name="有发售日" value={dimensions?.release_date ?? 0} max={pool} />
-              <Bar name="有玩家评价（已发售）" value={dimensions?.reviews ?? 0} max={releasedPool} />
-              <Bar name="有在线人数（已发售）" value={dimensions?.ccu ?? 0} max={releasedPool} />
-              <Bar name="有价格" value={dimensions?.price ?? 0} max={pool} />
-              <Bar name="有语言信息" value={dimensions?.languages ?? 0} max={pool} />
+              <Bar
+                name="商店信息已检查"
+                value={dimensions?.store_details_checked ?? dimensions?.store_details ?? 0}
+                max={pool}
+              />
+              <Bar
+                name="玩家评价已采集（已发售）"
+                value={dimensions?.reviews_checked ?? dimensions?.reviews ?? 0}
+                max={releasedPool}
+              />
+              <Bar
+                name="在线人数已采样（已发售）"
+                value={dimensions?.ccu_checked ?? dimensions?.ccu ?? 0}
+                max={releasedPool}
+              />
+              <Bar
+                name="价格状态已检查"
+                value={dimensions?.price_checked ?? dimensions?.price ?? 0}
+                max={pool}
+              />
               <Bar name="已建检索索引" value={dimensions?.retrieval_index ?? 0} max={pool} />
               <Bar
                 name="可以正常推荐"
                 value={cov?.recommendation_ready_profiles ?? 0}
                 max={pool}
               />
-              <Bar name="有封面图" value={m7?.candidates_with_cover ?? 0} max={pool} />
+            </div>
+          </Panel>
+
+          <Panel title="可用字段量">
+            <div className="section-metrics data-ops-availability">
+              <div className="section-metric">
+                <span>有发售日</span>
+                <strong>{(dimensions?.release_date ?? 0).toLocaleString()}</strong>
+                <small>款</small>
+              </div>
+              <div className="section-metric">
+                <span>有语言信息</span>
+                <strong>{(dimensions?.languages ?? 0).toLocaleString()}</strong>
+                <small>款</small>
+              </div>
+              <div className="section-metric">
+                <span>有具体价格</span>
+                <strong>{(dimensions?.price ?? 0).toLocaleString()}</strong>
+                <small>款</small>
+              </div>
+              <div className="section-metric">
+                <span>有可用 CCU</span>
+                <strong>{(dimensions?.ccu ?? 0).toLocaleString()}</strong>
+                <small>款</small>
+              </div>
+              <div className="section-metric">
+                <span>有封面图</span>
+                <strong>{(m7?.candidates_with_cover ?? 0).toLocaleString()}</strong>
+                <small>款</small>
+              </div>
             </div>
           </Panel>
 

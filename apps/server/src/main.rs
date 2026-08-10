@@ -501,6 +501,10 @@ mod tests {
         assert!(json["coverage"]["normalized_multiplayer_candidates"].is_number());
         assert!(json["m7_coverage"]["trusted_friend_multiplayer_profiles"].is_number());
         assert!(json["m7_coverage"]["trusted_profiles_with_seven_day_ccu"].is_number());
+        assert!(json["dimension_coverage"]["store_details_checked"].is_number());
+        assert!(json["dimension_coverage"]["ccu_checked"].is_number());
+        assert!(json["worker_queue"]["pending"].is_number());
+        assert!(json["worker_queue"]["active_jobs"].is_array());
     }
 
     async fn account_session_json(app: &axum::Router, username: &str) -> serde_json::Value {
