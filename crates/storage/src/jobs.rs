@@ -65,6 +65,22 @@ pub fn enqueue_job(conn: &Connection, job: &EnqueueJob, now_ms: i64) -> StorageR
     Ok(conn.last_insert_rowid())
 }
 
+/// Atomically enqueue a job unless an equivalent pending or leased job exists.
+pub fn enqueue_job_if_no_active(
+    conn: &Connection,
+    job: &EnqueueJob,
+    now_ms: i64,
+) -> StorageResult<Option<i64>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if has_active_job(&tx, &job.source, &job.task_type, &job.entity_key)? {
+        tx.commit()?;
+        return Ok(None);
+    }
+    let job_id = enqueue_job(&tx, job, now_ms)?;
+    tx.commit()?;
+    Ok(Some(job_id))
+}
+
 pub fn lease_jobs(
     conn: &Connection,
     owner: &str,
@@ -398,6 +414,38 @@ mod tests {
     use super::*;
     use crate::db::Database;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn conditional_enqueue_keeps_one_active_job_per_lane() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            let first = EnqueueJob {
+                source: "steam".into(),
+                task_type: "enrich_catalog".into(),
+                entity_key: "scheduled".into(),
+                priority: 50,
+                due_at_ms: 0,
+                idempotency_key: "enrichment-first".into(),
+                payload_json: None,
+                max_attempts: 3,
+            };
+            assert!(enqueue_job_if_no_active(conn, &first, 0)?.is_some());
+
+            let duplicate = EnqueueJob {
+                idempotency_key: "enrichment-duplicate".into(),
+                ..first.clone()
+            };
+            assert!(enqueue_job_if_no_active(conn, &duplicate, 0)?.is_none());
+
+            let leased = lease_jobs(conn, "worker", 1, 60_000, 0, Some("steam"))?;
+            complete_job(conn, leased[0].job_id, "worker", "completed", 1)?;
+            assert!(enqueue_job_if_no_active(conn, &duplicate, 1)?.is_some());
+            assert_eq!(count_jobs_by_status(conn, "pending")?, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn an_expired_final_attempt_is_recovered_as_dead() {

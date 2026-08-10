@@ -1471,6 +1471,7 @@ fn run_steam_worker_once(
     };
     for job in jobs {
         let status = worker_task_status(&job.task_type);
+        let mut continue_enrichment = false;
         let result = match job.task_type.as_str() {
             "sync_catalog" => match api_key {
                 Some(key) => run_catalog_worker_task(repo, key),
@@ -1482,7 +1483,11 @@ fn run_steam_worker_once(
             "collect_candidates" => run_candidate_worker_task(repo, owner),
             "collect_candidate_top" => run_candidate_top_worker_task(repo, owner),
             "collect_candidate_continuation" => run_candidate_worker_task(repo, owner),
-            "enrich_catalog" => run_enrichment_worker_task(repo, owner, enrich_limit),
+            "enrich_catalog" => {
+                run_enrichment_worker_task(repo, owner, enrich_limit).map(|has_more| {
+                    continue_enrichment = has_more;
+                })
+            }
             _ => Err(worker_task_error(
                 "invalid_payload",
                 "unsupported Steam job type",
@@ -1502,6 +1507,26 @@ fn run_steam_worker_once(
                         "warn job_id={} task_type={} status_refresh={}",
                         job.job_id, job.task_type, failure.message
                     );
+                }
+                if continue_enrichment {
+                    let continuation = mpgs_storage::EnqueueJob {
+                        source: "steam".into(),
+                        task_type: "enrich_catalog".into(),
+                        entity_key: "scheduled".into(),
+                        priority: 50,
+                        due_at_ms: repo.database().now_ms(),
+                        idempotency_key: format!("enrichment-continuation:{}", job.job_id),
+                        payload_json: None,
+                        max_attempts: 3,
+                    };
+                    if let Err(failure) = storage_write_with_retry(|| {
+                        repo.enqueue_job_if_no_active(&continuation).map(|_| ())
+                    }) {
+                        eprintln!(
+                            "warn job_id={} enrichment_continuation={}",
+                            job.job_id, failure.message
+                        );
+                    }
                 }
                 if let Err(failure) =
                     storage_write_with_retry(|| repo.refresh_pipeline_status_snapshot())
@@ -1706,14 +1731,16 @@ fn run_enrichment_worker_task(
     repo: &Repository,
     owner: &str,
     limit: u32,
-) -> Result<(), WorkerTaskError> {
+) -> Result<bool, WorkerTaskError> {
     let (country_code, language) = configured_store_locale()
         .map_err(|_| worker_task_error("invalid_payload", "invalid Steam store locale"))?;
     let integrated_limit = i64::from(limit).min(INTEGRATED_INGESTION_LIMIT);
     let integrated = process_integrated_game_ingestion(repo, owner, integrated_limit)?;
+    let integrated_batch_full = integrated_limit > 0
+        && integrated.claimed_apps >= usize::try_from(integrated_limit).unwrap_or(usize::MAX);
     let limit = limit.saturating_sub(u32::try_from(integrated.claimed_apps).unwrap_or(limit));
     if limit == 0 {
-        return Ok(());
+        return Ok(integrated_batch_full);
     }
     let cursor = repo
         .source_cursor(ENRICH_CURSOR_KEY)
@@ -1755,10 +1782,12 @@ fn run_enrichment_worker_task(
         )
     })?;
     if targets.is_empty() {
-        return worker_storage_with_retry(|| {
+        worker_storage_with_retry(|| {
             repo.finish_source_run(run_id, "succeeded", 0, 0, None, Some("no targets due"))
-        });
+        })?;
+        return Ok(integrated_batch_full);
     }
+    let enrichment_batch_full = targets.len() >= usize::try_from(limit).unwrap_or(usize::MAX);
     match enrich_steam_candidates(repo, &targets, &country_code, &language, Some(run_id)) {
         Ok(stats) => {
             let next_cursor = EnrichmentCursor {
@@ -1802,7 +1831,7 @@ fn run_enrichment_worker_task(
             // by a later quota pass. Treat per-app partial failures as a
             // completed scheduler batch so unrelated apps do not consume the
             // same global job retry budget.
-            Ok(())
+            Ok(integrated_batch_full || enrichment_batch_full)
         }
         Err(failure) => {
             let _ = worker_storage_with_retry(|| {

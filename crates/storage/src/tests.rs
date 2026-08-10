@@ -1376,8 +1376,8 @@ fn store_search_candidates_are_auditable_without_fabricated_profiles() {
     let targets = repo.list_enrichment_targets(10).unwrap();
     assert_eq!(targets.len(), 2);
     assert!(targets.iter().all(|t| t.needs_store_details));
-    assert!(targets.iter().all(|t| t.needs_reviews));
-    assert!(targets.iter().all(|t| t.needs_ccu));
+    assert!(targets.iter().all(|t| !t.needs_reviews));
+    assert!(targets.iter().all(|t| !t.needs_ccu));
     assert!(targets.iter().all(|t| t.needs_price));
 
     let rotated = repo
@@ -2136,7 +2136,7 @@ fn golden_profile_import_raises_recommendation_ready_coverage() {
 #[test]
 fn enrichment_targets_refresh_dynamic_dimensions_by_age() {
     use crate::repo::{
-        CCU_REFRESH_INTERVAL_MS, PRICE_REFRESH_INTERVAL_MS, STORE_EMPTY_RETRY_INTERVAL_MS,
+        CCU_REFRESH_INTERVAL_MS, REVIEW_REFRESH_INTERVAL_MS, STORE_EMPTY_RETRY_INTERVAL_MS,
     };
 
     let day_ms = 24 * 60 * 60 * 1_000;
@@ -2163,6 +2163,15 @@ fn enrichment_targets_refresh_dynamic_dimensions_by_age() {
     .unwrap();
     let details = parse_store_details(&StoreDetailsRequest::new(892970), &store).unwrap();
     repo.ingest_store_details(&details.details, &details.relations)
+        .unwrap();
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'released' WHERE app_id = 892970",
+                [],
+            )?;
+            Ok(())
+        })
         .unwrap();
 
     let reviews = RawResponse::validate(
@@ -2305,16 +2314,16 @@ fn enrichment_targets_refresh_dynamic_dimensions_by_age() {
     assert!(!ccu_due[0].needs_review_excerpts);
     assert!(!ccu_due[0].needs_price);
 
-    clock.advance_ms(PRICE_REFRESH_INTERVAL_MS - CCU_REFRESH_INTERVAL_MS);
-    let daily_due = repo.list_enrichment_targets(10).unwrap();
-    assert!(daily_due[0].needs_reviews);
-    assert!(daily_due[0].needs_review_excerpts);
+    clock.advance_ms(REVIEW_REFRESH_INTERVAL_MS - CCU_REFRESH_INTERVAL_MS);
+    let review_due = repo.list_enrichment_targets(10).unwrap();
+    assert!(review_due[0].needs_reviews);
+    assert!(review_due[0].needs_review_excerpts);
     assert!(
-        !daily_due[0].needs_price,
+        !review_due[0].needs_price,
         "checked-empty store fields must use the longer retry interval"
     );
 
-    clock.advance_ms(STORE_EMPTY_RETRY_INTERVAL_MS - PRICE_REFRESH_INTERVAL_MS + 1);
+    clock.advance_ms(STORE_EMPTY_RETRY_INTERVAL_MS - REVIEW_REFRESH_INTERVAL_MS + 1);
     let empty_retry_due = repo.list_enrichment_targets(10).unwrap();
     assert!(empty_retry_due[0].needs_store_details);
     assert!(empty_retry_due[0].needs_price);
@@ -2353,10 +2362,7 @@ fn empty_price_backoff_does_not_freeze_upcoming_store_refresh() {
     repo.ingest_store_details(&parsed.details, &parsed.relations)
         .unwrap();
 
-    let immediate = repo.list_enrichment_targets(10).unwrap();
-    let immediate = immediate.iter().find(|target| target.app_id == 42).unwrap();
-    assert!(!immediate.needs_store_details);
-    assert!(!immediate.needs_price);
+    assert!(repo.list_enrichment_targets(10).unwrap().is_empty());
 
     clock.advance_ms(PRICE_REFRESH_INTERVAL_MS + 1);
     let due = repo.list_enrichment_targets(10).unwrap();
@@ -2386,6 +2392,15 @@ fn enrichment_targets_prioritize_apps_missing_the_most_dynamic_dimensions() {
         sort: StoreSearchSort::ReleasedDesc,
     })
     .unwrap();
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'released' WHERE app_id IN (10, 20)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
 
     let reviews = RawResponse::validate(
         200,
@@ -2424,6 +2439,69 @@ fn enrichment_targets_prioritize_apps_missing_the_most_dynamic_dimensions() {
         .unwrap();
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].app_id, 20);
+}
+
+#[test]
+fn enrichment_targets_prioritize_stale_reviews_for_historically_popular_games() {
+    let (repo, _) = repo_with_clock(10 * 24 * 60 * 60 * 1_000);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 10,
+                name: "No Known Audience".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 20,
+                name: "Known Audience".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "popular-recovery-priority".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'released' WHERE app_id IN (10, 20)",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let ccu = RawResponse::validate(
+        200,
+        include_bytes!("../../steam-source/fixtures/ccu_ok.json").to_vec(),
+        None,
+        1024 * 1024,
+    )
+    .unwrap();
+    repo.ingest_ccu(&parse_ccu(&CcuRequest::new(20), &ccu).unwrap())
+        .unwrap();
+
+    let targets = repo
+        .list_enrichment_targets_after_filtered(
+            1,
+            Some(0),
+            "CN",
+            "schinese",
+            crate::models::EnrichmentNeedFilter {
+                store: false,
+                reviews: true,
+                review_excerpts: true,
+                ccu: false,
+                price: false,
+                media_backfill: false,
+                english_name: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].app_id, 20);
+    assert!(targets[0].needs_reviews);
 }
 
 #[test]
@@ -2540,6 +2618,52 @@ fn pipeline_inventory_counts_basic_rows() {
     assert!(inv.apps_total > 0);
     assert!(inv.multiplayer_profiles >= 0);
     assert!(inv.jobs_pending >= 0);
+}
+
+#[test]
+fn pipeline_dynamic_coverage_uses_only_released_candidates() {
+    let now_ms = 1_785_830_400_000i64;
+    let (repo, _) = repo_with_clock(now_ms);
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute_batch(
+                "INSERT INTO apps (
+                     app_id, app_type, canonical_name, release_state,
+                     created_at_ms, updated_at_ms
+                 ) VALUES
+                     (10, 'game', 'Released Fixture', 'released', 1, 1),
+                     (20, 'game', 'Upcoming Fixture', 'coming_soon', 1, 1);
+                 INSERT INTO multiplayer_profiles (app_id, computed_at_ms, online_coop)
+                 VALUES (10, 1, 1), (20, 1, 1);",
+            )?;
+            for app_id in [10, 20] {
+                conn.execute(
+                    "INSERT INTO review_snapshots (
+                         app_id, region_scope, language_scope, captured_at_ms,
+                         total_positive, total_negative, total_reviews, review_score,
+                         review_score_desc, wilson_lower, filter_offtopic_activity,
+                         parameter_hash, content_hash, source
+                     ) VALUES (?1, 'all', 'all', ?2, 90, 10, 100, 9,
+                               'Very Positive', 0.8, 1, 'fixture', ?3, 'fixture')",
+                    rusqlite::params![app_id, now_ms, format!("review-{app_id}")],
+                )?;
+                conn.execute(
+                    "INSERT INTO player_snapshots (
+                         app_id, captured_at_ms, player_count, result_code,
+                         content_hash, source, offline_players_excluded
+                     ) VALUES (?1, ?2, 1000, 1, ?3, 'fixture', 1)",
+                    rusqlite::params![app_id, now_ms, format!("ccu-{app_id}")],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    let snapshot = repo.refresh_pipeline_status_snapshot().unwrap();
+    assert_eq!(snapshot.dimension_coverage.candidates, 2);
+    assert_eq!(snapshot.dimension_coverage.released_candidates, 1);
+    assert_eq!(snapshot.dimension_coverage.reviews, 1);
+    assert_eq!(snapshot.dimension_coverage.ccu, 1);
 }
 
 #[test]

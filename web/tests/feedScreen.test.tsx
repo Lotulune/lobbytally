@@ -4,17 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const runtime = vi.hoisted(() => ({
   goToPage: vi.fn(),
-  subscribeRankingChanged: vi.fn(() => () => undefined),
-  gameCardProps: [] as Array<{ recommendationContext?: boolean }>,
-}));
-
-vi.mock("../src/app/runtime", () => ({
-  feedbackQueue: { subscribeRankingChanged: runtime.subscribeRankingChanged },
-}));
-
-vi.mock("../src/app/useFeed", () => ({
-  defaultOrderForSort: () => "desc",
-  useFeed: () => ({
+  useFeed: vi.fn((_section: string, _sort: string, _order: string) => ({
     items: [{ app_id: 1, name: "Test Game" }],
     loading: false,
     error: null,
@@ -25,12 +15,29 @@ vi.mock("../src/app/useFeed", () => ({
     fromOfflineCache: false,
     algorithmVersion: null,
     reload: vi.fn(),
-    goToPage: runtime.goToPage,
-  }),
+    goToPage: vi.fn(),
+  })),
+  subscribeRankingChanged: vi.fn(() => () => undefined),
+  gameCardProps: [] as Array<{
+    recommendationContext?: boolean;
+    recommendationRankLimit?: number;
+  }>,
+}));
+
+vi.mock("../src/app/runtime", () => ({
+  feedbackQueue: { subscribeRankingChanged: runtime.subscribeRankingChanged },
+}));
+
+vi.mock("../src/app/useFeed", () => ({
+  defaultOrderForSort: () => "desc",
+  useFeed: (section: string, sort: string, order: string) => {
+    const result = runtime.useFeed(section, sort, order);
+    return { ...result, goToPage: runtime.goToPage };
+  },
 }));
 
 vi.mock("../src/screens/GameCard", () => ({
-  GameCard: (props: { recommendationContext?: boolean }) => {
+  GameCard: (props: { recommendationContext?: boolean; recommendationRankLimit?: number }) => {
     runtime.gameCardProps.push(props);
     return <article className="card">Test Game</article>;
   },
@@ -43,6 +50,7 @@ import { FeedScreen } from "../src/screens/FeedScreen";
 describe("FeedScreen", () => {
   afterEach(() => {
     runtime.goToPage.mockReset();
+    runtime.useFeed.mockClear();
     runtime.subscribeRankingChanged.mockClear();
     runtime.gameCardProps.length = 0;
   });
@@ -94,7 +102,7 @@ describe("FeedScreen", () => {
     }
   });
 
-  it("offers a strict fit-index sort with an explicit direction", () => {
+  it("shows the first ten badges for recommendation-index order", () => {
     const main = document.createElement("main");
     document.body.append(main);
     const root = createRoot(main);
@@ -102,12 +110,15 @@ describe("FeedScreen", () => {
       act(() => root.render(<FeedScreen section="recent_release" onOpenGame={() => undefined} />));
 
       const fit = Array.from(main.querySelectorAll("button")).find(
-        (button) => button.textContent?.trim() === "适配指数",
+        (button) => button.textContent?.trim() === "推荐指数",
       );
       expect(fit).toBeTruthy();
 
       act(() => fit?.click());
-      expect(main.querySelector('[aria-label*="当前降序"]')).not.toBeNull();
+      expect(runtime.useFeed).toHaveBeenLastCalledWith("recent_release", "fit_index", "desc");
+      expect(main.querySelector('[aria-label*="当前降序"]')).toBeNull();
+      expect(runtime.gameCardProps.at(-1)?.recommendationContext).toBe(true);
+      expect(runtime.gameCardProps.at(-1)?.recommendationRankLimit).toBe(10);
     } finally {
       act(() => root.unmount());
       main.remove();

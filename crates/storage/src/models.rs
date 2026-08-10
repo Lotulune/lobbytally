@@ -323,6 +323,8 @@ pub struct PipelineInventory {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineDimensionCoverage {
     pub candidates: i64,
+    #[serde(default)]
+    pub released_candidates: i64,
     pub store_details: i64,
     pub release_date: i64,
     pub reviews: i64,

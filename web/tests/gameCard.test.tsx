@@ -161,6 +161,17 @@ describe("GameCard recommendation semantics", () => {
       act(() =>
         root.render(
           <GameCard
+            item={item({ rank: 10 })}
+            onOpen={() => undefined}
+            recommendationRankLimit={10}
+          />,
+        ),
+      );
+      expect(host.textContent).toContain("第 10 推荐");
+
+      act(() =>
+        root.render(
+          <GameCard
             item={item({ rank: 2 })}
             onOpen={() => undefined}
             recommendationContext={false}

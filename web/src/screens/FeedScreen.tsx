@@ -80,7 +80,7 @@ function RankedFeedPanel({
               {option.label}
             </Button>
           ))}
-          {sort !== "recommended" && (
+          {sort !== "recommended" && sort !== "fit_index" && (
             <Button
               size="small"
               variant="ghost"
@@ -143,7 +143,8 @@ function RankedFeedPanel({
                 item={item}
                 onOpen={onOpenGame}
                 recommendationRunId={feed.recommendationRunId}
-                recommendationContext={sort === "recommended"}
+                recommendationContext={sort === "recommended" || sort === "fit_index"}
+                recommendationRankLimit={sort === "fit_index" ? 10 : 5}
               />
             ))}
           </div>

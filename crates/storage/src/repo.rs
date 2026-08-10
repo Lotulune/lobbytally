@@ -24,8 +24,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const REVIEW_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
-pub const CCU_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
+// Keep refresh demand inside the worker's sustainable full-catalog throughput.
+// Both intervals remain comfortably inside the public feed freshness windows.
+pub const REVIEW_REFRESH_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+pub const CCU_REFRESH_INTERVAL_MS: i64 = 2 * 24 * 60 * 60 * 1_000;
 pub const PRICE_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const STORE_EMPTY_RETRY_INTERVAL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 pub const ENGLISH_NAME_RETRY_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
@@ -630,17 +632,17 @@ impl Repository {
                                          END
                                   )
                               THEN 1 ELSE 0 END AS needs_store_details,
-                         CASE WHEN NOT EXISTS (
+                         CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM review_snapshots review
                              WHERE review.app_id = candidates.app_id
                                AND review.captured_at_ms >= ?2
                          ) THEN 1 ELSE 0 END AS needs_reviews,
-                         CASE WHEN NOT EXISTS (
+                         CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM popular_review_refresh_state review
                              WHERE review.app_id = candidates.app_id
                                AND review.captured_at_ms >= ?2
                          ) THEN 1 ELSE 0 END AS needs_review_excerpts,
-                         CASE WHEN NOT EXISTS (
+                         CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM player_snapshots player
                              WHERE player.app_id = candidates.app_id
                                AND player.captured_at_ms >= ?3
@@ -687,7 +689,23 @@ impl Repository {
                                          AND en_refresh.language = 'english'
                                          AND en_refresh.captured_at_ms >= ?17
                                    )
-                              THEN 1 ELSE 0 END AS needs_english_name
+                              THEN 1 ELSE 0 END AS needs_english_name,
+                         COALESCE((
+                             SELECT player.player_count
+                             FROM player_snapshots player
+                             WHERE player.app_id = candidates.app_id
+                               AND player.player_count IS NOT NULL
+                               AND player.result_code = 1
+                             ORDER BY player.captured_at_ms DESC
+                             LIMIT 1
+                         ), 0) AS last_known_ccu,
+                         COALESCE((
+                             SELECT review.total_reviews
+                             FROM review_snapshots review
+                             WHERE review.app_id = candidates.app_id
+                             ORDER BY review.captured_at_ms DESC
+                             LIMIT 1
+                         ), 0) AS last_known_reviews
                      FROM candidates
                      JOIN apps a ON a.app_id = candidates.app_id
                      LEFT JOIN app_availability v ON v.app_id = candidates.app_id
@@ -706,6 +724,11 @@ impl Repository {
                     OR (needs_media_backfill = 1 AND ?13 = 1)
                     OR (needs_english_name = 1 AND ?16 = 1)
                  ORDER BY
+                     CASE WHEN (needs_reviews = 1 AND ?9 = 1)
+                                  OR (needs_review_excerpts = 1 AND ?10 = 1)
+                         THEN last_known_ccu ELSE 0 END DESC,
+                     CASE WHEN needs_ccu = 1 AND ?11 = 1
+                         THEN last_known_reviews ELSE 0 END DESC,
                      (
                          CASE WHEN needs_media_backfill = 1 AND ?13 = 1 THEN 5 ELSE 0 END
                        + CASE WHEN needs_english_name = 1 AND ?16 = 1 THEN 4 ELSE 0 END
@@ -1382,6 +1405,12 @@ impl Repository {
             .with_conn_mut(|conn| jobs::enqueue_job(conn, job, now))
     }
 
+    pub fn enqueue_job_if_no_active(&self, job: &EnqueueJob) -> StorageResult<Option<i64>> {
+        let now = self.db.now_ms();
+        self.db
+            .with_conn_mut(|conn| jobs::enqueue_job_if_no_active(conn, job, now))
+    }
+
     pub fn has_active_job(
         &self,
         source: &str,
@@ -1629,10 +1658,11 @@ impl Repository {
         let dimension_coverage = self.db.with_conn(|conn| {
             conn.query_row(
                 "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN a.release_state = 'released' THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN COALESCE(v.platforms_json, '[]') <> '[]' THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN a.release_date IS NOT NULL OR a.release_date_raw IS NOT NULL THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(EXISTS(SELECT 1 FROM latest_review_snapshots r WHERE r.app_id = p.app_id)), 0),
-                        COALESCE(SUM(EXISTS(SELECT 1 FROM player_snapshots c WHERE c.app_id = p.app_id AND c.player_count IS NOT NULL AND c.result_code = 1)), 0),
+                        COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM latest_review_snapshots r WHERE r.app_id = p.app_id) THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM player_snapshots c WHERE c.app_id = p.app_id AND c.player_count IS NOT NULL AND c.result_code = 1) THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(EXISTS(SELECT 1 FROM price_snapshots price WHERE price.app_id = p.app_id AND price.final_price_minor IS NOT NULL)), 0),
                         COALESCE(SUM(CASE WHEN COALESCE(v.languages_json, '[]') <> '[]' THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(EXISTS(SELECT 1 FROM game_documents d WHERE d.app_id = p.app_id)), 0),
@@ -1646,15 +1676,16 @@ impl Repository {
                     Ok((
                         crate::models::PipelineDimensionCoverage {
                             candidates: row.get(0)?,
-                            store_details: row.get(1)?,
-                            release_date: row.get(2)?,
-                            reviews: row.get(3)?,
-                            ccu: row.get(4)?,
-                            price: row.get(5)?,
-                            languages: row.get(6)?,
-                            retrieval_index: row.get(7)?,
+                            released_candidates: row.get(1)?,
+                            store_details: row.get(2)?,
+                            release_date: row.get(3)?,
+                            reviews: row.get(4)?,
+                            ccu: row.get(5)?,
+                            price: row.get(6)?,
+                            languages: row.get(7)?,
+                            retrieval_index: row.get(8)?,
                         },
-                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             )
@@ -1748,15 +1779,19 @@ impl Repository {
         &self,
     ) -> StorageResult<crate::models::PipelineStatusSnapshot> {
         let mut snapshot = self.refresh_pipeline_status_snapshot()?;
+        let live_dimensions = snapshot.dimension_coverage;
         snapshot.coverage = self.m3_catalog_coverage()?;
+        snapshot.coverage.with_reviews = live_dimensions.reviews;
+        snapshot.coverage.with_ccu = live_dimensions.ccu;
         let active = self.active_algorithm_config()?;
         snapshot.m7_coverage = self.m7_data_coverage(&active.config)?;
         snapshot.dimension_coverage = crate::models::PipelineDimensionCoverage {
             candidates: snapshot.coverage.normalized_multiplayer_candidates,
+            released_candidates: live_dimensions.released_candidates,
             store_details: snapshot.coverage.with_platforms,
             release_date: snapshot.m7_coverage.candidates_with_date,
-            reviews: snapshot.coverage.with_reviews,
-            ccu: snapshot.coverage.with_ccu,
+            reviews: live_dimensions.reviews,
+            ccu: live_dimensions.ccu,
             price: snapshot.coverage.with_price,
             languages: snapshot.coverage.with_languages,
             retrieval_index: snapshot.dimension_coverage.retrieval_index,
