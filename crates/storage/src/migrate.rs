@@ -144,6 +144,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0028_feed_scope_covering_index",
         include_str!("../../../migrations/0028_feed_scope_covering_index.sql"),
     ),
+    (
+        29,
+        "0029_feed_evidence_projection",
+        include_str!("../../../migrations/0029_feed_evidence_projection.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {
@@ -342,6 +347,108 @@ mod tests {
                 "{scope} feed scope did not use covering index: {plan:?}"
             );
         }
+    }
+
+    #[test]
+    fn feed_evidence_projection_tracks_active_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_to(&mut conn, 28, 1).unwrap();
+        conn.execute(
+            "INSERT INTO apps (
+                 app_id, app_type, canonical_name, release_state,
+                 created_at_ms, updated_at_ms
+             ) VALUES (42, 'game', 'Taxonomy Projection', 'released', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO feature_evidence (
+                 evidence_id, app_id, feature_name, value_json, source_type,
+                 source_ref, confidence, observed_at_ms, expires_at_ms, is_active
+             ) VALUES
+             (1, 42, 'catalog_taxonomy', '{\"genres\":[\"old\"]}',
+                'test', 'old', 0.8, 10, NULL, 1),
+             (2, 42, 'catalog_taxonomy', '{\"genres\":[\"inactive\"]}',
+                'test', 'inactive', 0.8, 20, NULL, 0),
+             (3, 42, 'category_hint', '{\"category\":\"multiplayer\"}',
+                'test', 'category', 0.3, 15, NULL, 1);",
+        )
+        .unwrap();
+
+        migrate_to_latest(&mut conn, 2).unwrap();
+        let projection_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM feed_feature_evidence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(projection_rows, 1);
+
+        conn.execute(
+            "INSERT INTO feature_evidence (
+                 evidence_id, app_id, feature_name, value_json, source_type,
+                 source_ref, confidence, observed_at_ms, expires_at_ms, is_active
+             ) VALUES (
+                 4, 42, 'catalog_taxonomy', '{\"genres\":[\"new\"]}',
+                 'test', 'new', 0.9, 30, NULL, 1
+             )",
+            [],
+        )
+        .unwrap();
+        assert_eq!(latest_projected_taxonomy(&conn), r#"{"genres":["new"]}"#);
+
+        conn.execute(
+            "UPDATE feature_evidence SET is_active = 0 WHERE evidence_id = 4",
+            [],
+        )
+        .unwrap();
+        assert_eq!(latest_projected_taxonomy(&conn), r#"{"genres":["old"]}"#);
+
+        conn.execute(
+            "UPDATE feature_evidence
+             SET feature_name = 'catalog_taxonomy' WHERE evidence_id = 3",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            latest_projected_taxonomy(&conn),
+            r#"{"category":"multiplayer"}"#
+        );
+
+        conn.execute("DELETE FROM feature_evidence WHERE evidence_id = 3", [])
+            .unwrap();
+        assert_eq!(latest_projected_taxonomy(&conn), r#"{"genres":["old"]}"#);
+
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT value_json FROM feed_feature_evidence
+                 WHERE app_id = 42
+                   AND feature_name = 'catalog_taxonomy'
+                   AND observed_at_ms >= 1
+                   AND (expires_at_ms IS NULL OR expires_at_ms >= 1)
+                 ORDER BY observed_at_ms DESC, evidence_id DESC LIMIT 1",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("COVERING INDEX idx_feed_feature_evidence_latest")),
+            "Feed evidence projection did not use its covering index: {plan:?}"
+        );
+    }
+
+    fn latest_projected_taxonomy(conn: &Connection) -> String {
+        conn.query_row(
+            "SELECT value_json FROM feed_feature_evidence
+             WHERE app_id = 42 AND feature_name = 'catalog_taxonomy'
+             ORDER BY observed_at_ms DESC, evidence_id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
