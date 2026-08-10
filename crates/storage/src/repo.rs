@@ -581,31 +581,27 @@ impl Repository {
 
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "WITH candidates AS (
-                     SELECT a.app_id
-                     FROM apps a
-                     WHERE a.app_type IN ('game', 'demo', 'playtest')
+                "WITH candidates(app_id) AS (
+                     SELECT evidence.app_id
+                     FROM feature_evidence evidence
+                     JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
+                     WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
+                       AND evidence.feature_name = 'category_hint'
+                       AND evidence.is_active = 1
+                       AND evidence.confidence >= 0.3
+                     UNION
+                     SELECT profile.app_id
+                     FROM multiplayer_profiles profile
+                     JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
+                     WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND (
-                           EXISTS (
-                               SELECT 1 FROM feature_evidence e
-                               WHERE e.app_id = a.app_id
-                                 AND e.feature_name = 'category_hint'
-                                 AND e.is_active = 1
-                                 AND e.confidence >= 0.3
-                           )
-                           OR EXISTS (
-                               SELECT 1 FROM multiplayer_profiles profile
-                               WHERE profile.app_id = a.app_id
-                                 AND (
-                                     profile.dominant_mode IS NOT NULL
-                                     OR profile.private_session IS NOT NULL
-                                     OR profile.online_coop IS NOT NULL
-                                     OR profile.self_hosted_server IS NOT NULL
-                                     OR profile.drop_in_out IS NOT NULL
-                                     OR profile.crossplay IS NOT NULL
-                                     OR profile.recommended_max_players IS NOT NULL
-                                 )
-                           )
+                           profile.dominant_mode IS NOT NULL
+                           OR profile.private_session IS NOT NULL
+                           OR profile.online_coop IS NOT NULL
+                           OR profile.self_hosted_server IS NOT NULL
+                           OR profile.drop_in_out IS NOT NULL
+                           OR profile.crossplay IS NOT NULL
+                           OR profile.recommended_max_players IS NOT NULL
                        )
                  ), due AS (
                      SELECT
@@ -788,31 +784,27 @@ impl Repository {
     pub fn media_coverage_stats(&self) -> StorageResult<MediaCoverageStats> {
         self.db.with_conn(|conn| {
             let (candidates, with_media): (i64, i64) = conn.query_row(
-                "WITH candidates AS (
-                     SELECT a.app_id
-                     FROM apps a
-                     WHERE a.app_type IN ('game', 'demo', 'playtest')
+                "WITH candidates(app_id) AS (
+                     SELECT evidence.app_id
+                     FROM feature_evidence evidence
+                     JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
+                     WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
+                       AND evidence.feature_name = 'category_hint'
+                       AND evidence.is_active = 1
+                       AND evidence.confidence >= 0.3
+                     UNION
+                     SELECT profile.app_id
+                     FROM multiplayer_profiles profile
+                     JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
+                     WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND (
-                           EXISTS (
-                               SELECT 1 FROM feature_evidence e
-                               WHERE e.app_id = a.app_id
-                                 AND e.feature_name = 'category_hint'
-                                 AND e.is_active = 1
-                                 AND e.confidence >= 0.3
-                           )
-                           OR EXISTS (
-                               SELECT 1 FROM multiplayer_profiles profile
-                               WHERE profile.app_id = a.app_id
-                                 AND (
-                                     profile.dominant_mode IS NOT NULL
-                                     OR profile.private_session IS NOT NULL
-                                     OR profile.online_coop IS NOT NULL
-                                     OR profile.self_hosted_server IS NOT NULL
-                                     OR profile.drop_in_out IS NOT NULL
-                                     OR profile.crossplay IS NOT NULL
-                                     OR profile.recommended_max_players IS NOT NULL
-                                 )
-                           )
+                           profile.dominant_mode IS NOT NULL
+                           OR profile.private_session IS NOT NULL
+                           OR profile.online_coop IS NOT NULL
+                           OR profile.self_hosted_server IS NOT NULL
+                           OR profile.drop_in_out IS NOT NULL
+                           OR profile.crossplay IS NOT NULL
+                           OR profile.recommended_max_players IS NOT NULL
                        )
                  )
                  SELECT

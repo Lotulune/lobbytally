@@ -22,8 +22,8 @@ use mpgs_steam_source::{
     parse_popular_reviews, parse_review_summary, parse_store_details, parse_store_search_page,
 };
 use mpgs_storage::{
-    Clock, Database, EnrichmentNeedFilter, HASH_EMBED_MODEL, PutEmbedding, Repository,
-    StorageError, StorageResult, SystemClock,
+    Clock, Database, EnrichmentNeedFilter, HASH_EMBED_MODEL, MediaCoverageStats, PutEmbedding,
+    Repository, StorageError, StorageResult, SystemClock,
 };
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +142,15 @@ fn configured_enrichment_need_filter(media_enabled: bool) -> EnrichmentNeedFilte
         media_backfill: !skip_store && media_enabled,
         english_name: !skip_store,
     }
+}
+
+fn media_backfill_due(
+    policy: mpgs_storage::MediaBackfillPolicy,
+    coverage: MediaCoverageStats,
+) -> bool {
+    policy.enabled
+        && coverage.candidate_apps > 0
+        && coverage.coverage_ratio + f64::EPSILON < policy.coverage_threshold
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1810,7 +1819,11 @@ fn run_enrichment_worker_task(
         .map_err(|_| worker_task_error("invalid_payload", "invalid stored enrichment cursor"))?
         .unwrap_or_default();
     let media_policy = configured_media_backfill_policy();
-    let need_filter = configured_enrichment_need_filter(media_policy.enabled);
+    // Media coverage is a full candidate-scope query. Gate the quota once and
+    // reuse the result in run notes so a completed backfill lane cannot cause
+    // an extra coverage scan and a guaranteed-empty focused fallback.
+    let coverage = repo.media_coverage_stats().map_err(worker_storage_error)?;
+    let need_filter = configured_enrichment_need_filter(media_backfill_due(media_policy, coverage));
     let targets = list_enrichment_targets_with_quotas(
         repo,
         limit,
@@ -1821,7 +1834,6 @@ fn run_enrichment_worker_task(
         media_policy,
     )
     .map_err(worker_storage_error)?;
-    let coverage = repo.media_coverage_stats().map_err(worker_storage_error)?;
     let run_notes = format!(
         "worker=true;phase=quota;limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{};integrated_claimed={};integrated_completed={};integrated_retried={}",
         targets.len(),
@@ -4165,6 +4177,32 @@ mod tests {
             plan.iter()
                 .any(|entry| entry.filter.media_backfill && entry.limit > 0)
         );
+    }
+
+    #[test]
+    fn completed_media_coverage_removes_the_backfill_quota() {
+        let policy = mpgs_storage::MediaBackfillPolicy::DEFAULT;
+        let incomplete = MediaCoverageStats {
+            candidate_apps: 100,
+            apps_with_media: 94,
+            coverage_ratio: 0.94,
+        };
+        let complete = MediaCoverageStats {
+            candidate_apps: 100,
+            apps_with_media: 95,
+            coverage_ratio: 0.95,
+        };
+
+        assert!(media_backfill_due(policy, incomplete));
+        assert!(!media_backfill_due(policy, complete));
+        assert!(!media_backfill_due(
+            policy,
+            MediaCoverageStats {
+                candidate_apps: 0,
+                apps_with_media: 0,
+                coverage_ratio: 1.0,
+            }
+        ));
     }
 
     #[test]
