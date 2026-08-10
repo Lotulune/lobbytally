@@ -73,6 +73,7 @@ export interface DataStatusResponse {
   };
   dimension_coverage: {
     candidates: number;
+    released_candidates?: number;
     store_details: number;
     release_date: number;
     reviews: number;
@@ -160,7 +161,7 @@ export interface FeatureFreshness {
 
 export const FEED_SORT_OPTIONS: { id: FeedSort; label: string }[] = [
   { id: "recommended", label: "推荐顺序" },
-  { id: "fit_index", label: "适配指数" },
+  { id: "fit_index", label: "推荐指数" },
   { id: "ccu", label: "在线人数" },
   { id: "reviews", label: "评论数" },
   { id: "release_date", label: "发售日期" },

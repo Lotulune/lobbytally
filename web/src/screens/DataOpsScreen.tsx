@@ -210,6 +210,7 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
   const latestRuns = status?.latest_runs ?? [];
   const integrated = status?.integrated_ingestion;
   const pool = inv?.multiplayer_profiles ?? 0;
+  const releasedPool = dimensions?.released_candidates ?? pool;
 
   const sectionStats = useMemo(() => {
     if (!m7) return [];
@@ -463,8 +464,8 @@ export function DataOpsScreen({ onOpenGame }: { onOpenGame?: (appId: number) => 
             <div className="bar-list">
               <Bar name="商店详情" value={dimensions?.store_details ?? 0} max={pool} />
               <Bar name="有发售日" value={dimensions?.release_date ?? 0} max={pool} />
-              <Bar name="有玩家评价" value={dimensions?.reviews ?? 0} max={pool} />
-              <Bar name="有在线人数" value={dimensions?.ccu ?? 0} max={pool} />
+              <Bar name="有玩家评价（已发售）" value={dimensions?.reviews ?? 0} max={releasedPool} />
+              <Bar name="有在线人数（已发售）" value={dimensions?.ccu ?? 0} max={releasedPool} />
               <Bar name="有价格" value={dimensions?.price ?? 0} max={pool} />
               <Bar name="有语言信息" value={dimensions?.languages ?? 0} max={pool} />
               <Bar name="已建检索索引" value={dimensions?.retrieval_index ?? 0} max={pool} />

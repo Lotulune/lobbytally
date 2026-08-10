@@ -2703,8 +2703,8 @@ struct FeedQuery {
     max_price_minor: Option<i64>,
     currency: Option<String>,
     demo_only: Option<bool>,
-    /// Ranking override after the recommendation score: `recommended` (default),
-    /// strict `fit_index`, `ccu`, `reviews`, or `release_date`.
+    /// Ranking override: recommendation score (`recommended` or `fit_index`),
+    /// strict `ccu`, `reviews`, or `release_date`.
     sort: Option<String>,
     /// `desc` (default for ccu/reviews) or `asc` (default for release_date).
     /// Ignored when `sort=recommended`.
@@ -2895,10 +2895,14 @@ fn visible_recommendation_index(
     presentation: Option<&FeedPresentation>,
 ) -> Option<u8> {
     let presentation = presentation?;
-    (presentation.data_confidence >= MIN_INDEX_DATA_CONFIDENCE
-        && presentation.effective_feature_count >= MIN_INDEX_FEATURES)
+    recommendation_index_is_eligible(presentation)
         .then(|| indices.get(&app_id).copied())
         .flatten()
+}
+
+fn recommendation_index_is_eligible(presentation: &FeedPresentation) -> bool {
+    presentation.data_confidence >= MIN_INDEX_DATA_CONFIDENCE
+        && presentation.effective_feature_count >= MIN_INDEX_FEATURES
 }
 
 fn fit_band(index: Option<u8>) -> &'static str {
@@ -3368,11 +3372,7 @@ async fn get_feed_inner(
                 "friend_fit": item.score.friend_fit,
                 "recommendation_index": recommendation_index,
                 "fit_band": fit_band(recommendation_index),
-                "slot_reason": if matches!(feed_sort, FeedSort::Recommended) {
-                    slot_reason_str(item.slot_reason)
-                } else {
-                    "base"
-                },
+                "slot_reason": "base",
                 "score_calibration_version": SCORE_CALIBRATION_VERSION,
                 "party": {
                     "recommended_min": item.recommended_min,
@@ -3550,24 +3550,27 @@ fn apply_feed_sort(
     order: FeedSortOrder,
     presentation: &HashMap<u32, FeedPresentation>,
 ) {
-    if matches!(sort, FeedSort::Recommended) || items.len() < 2 {
+    if items.len() < 2 {
         return;
     }
     items.sort_by(|left, right| {
         let left_p = presentation.get(&left.app_id);
         let right_p = presentation.get(&right.app_id);
         let primary = match sort {
-            FeedSort::Recommended => std::cmp::Ordering::Equal,
-            FeedSort::FitIndex => match order {
-                FeedSortOrder::Asc => left
-                    .score
-                    .relevance_score
-                    .total_cmp(&right.score.relevance_score),
-                FeedSortOrder::Desc => right
-                    .score
-                    .relevance_score
-                    .total_cmp(&left.score.relevance_score),
-            },
+            FeedSort::Recommended => compare_recommendation_score(
+                left.score.relevance_score,
+                right.score.relevance_score,
+                left_p,
+                right_p,
+                FeedSortOrder::Desc,
+            ),
+            FeedSort::FitIndex => compare_recommendation_score(
+                left.score.relevance_score,
+                right.score.relevance_score,
+                left_p,
+                right_p,
+                order,
+            ),
             FeedSort::Ccu => compare_optional_missing_last(
                 left_p.and_then(|value| value.typical_ccu_7d.or(value.latest_ccu)),
                 right_p.and_then(|value| value.typical_ccu_7d.or(value.latest_ccu)),
@@ -3598,6 +3601,26 @@ fn apply_feed_sort(
             })
             .then_with(|| left.app_id.cmp(&right.app_id))
     });
+}
+
+fn compare_recommendation_score(
+    left_score: f64,
+    right_score: f64,
+    left: Option<&FeedPresentation>,
+    right: Option<&FeedPresentation>,
+    order: FeedSortOrder,
+) -> std::cmp::Ordering {
+    match (
+        left.is_some_and(recommendation_index_is_eligible),
+        right.is_some_and(recommendation_index_is_eligible),
+    ) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => match order {
+            FeedSortOrder::Asc => left_score.total_cmp(&right_score),
+            FeedSortOrder::Desc => right_score.total_cmp(&left_score),
+        },
+    }
 }
 
 /// Select an internal natural-language recall page from the complete ranked
@@ -8327,6 +8350,27 @@ mod tests {
         }
     }
 
+    fn feed_presentation(data_confidence: f64, effective_feature_count: usize) -> FeedPresentation {
+        FeedPresentation {
+            release_date: None,
+            release_date_raw: None,
+            release_date_precision: None,
+            cover_url: None,
+            cover_updated_at_ms: None,
+            total_reviews: None,
+            total_positive: None,
+            latest_ccu: None,
+            typical_ccu_7d: None,
+            data_confidence,
+            effective_feature_count,
+            profile_observed_at_ms: None,
+            reviews_observed_at_ms: None,
+            activity_observed_at_ms: None,
+            price_observed_at_ms: None,
+            release_observed_at_ms: None,
+        }
+    }
+
     fn test_router_with_rank_models(primary: &str, fallbacks: &[&str]) -> TaskRouter {
         let mut routes = mpgs_ai::default_task_routes();
         let route = routes
@@ -8635,7 +8679,7 @@ mod tests {
     }
 
     #[test]
-    fn fit_index_is_a_strict_scalar_sort_with_aliases_and_direction() {
+    fn recommendation_and_fit_index_use_the_same_strict_score_order() {
         assert_eq!(FeedSort::parse(Some("fit_index")), Ok(FeedSort::FitIndex));
         assert_eq!(FeedSort::parse(Some("relevance")), Ok(FeedSort::FitIndex));
         assert_eq!(FeedSort::parse(Some("fit")), Ok(FeedSort::FitIndex));
@@ -8644,11 +8688,17 @@ mod tests {
             Ok(FeedSortOrder::Desc)
         );
 
-        let presentation = HashMap::new();
+        let presentation = HashMap::from([
+            (1, feed_presentation(0.8, 3)),
+            (2, feed_presentation(0.8, 3)),
+            (3, feed_presentation(0.8, 3)),
+            (4, feed_presentation(0.4, 2)),
+        ]);
         let original = vec![
             recall_candidate(1, 0.2),
             recall_candidate(2, 0.9),
             recall_candidate(3, 0.5),
+            recall_candidate(4, 0.99),
         ];
         let mut descending = original.clone();
         apply_feed_sort(
@@ -8662,7 +8712,22 @@ mod tests {
                 .iter()
                 .map(|item| item.app_id)
                 .collect::<Vec<_>>(),
-            vec![2, 3, 1]
+            vec![2, 3, 1, 4]
+        );
+
+        let mut recommended = original.clone();
+        apply_feed_sort(
+            &mut recommended,
+            FeedSort::Recommended,
+            FeedSortOrder::Desc,
+            &presentation,
+        );
+        assert_eq!(
+            recommended
+                .iter()
+                .map(|item| item.app_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 1, 4]
         );
 
         let mut ascending = original;
@@ -8674,7 +8739,7 @@ mod tests {
         );
         assert_eq!(
             ascending.iter().map(|item| item.app_id).collect::<Vec<_>>(),
-            vec![1, 3, 2]
+            vec![1, 3, 2, 4]
         );
     }
 

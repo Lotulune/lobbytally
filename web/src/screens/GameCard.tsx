@@ -38,11 +38,13 @@ export function GameCard({
   onOpen,
   recommendationRunId = null,
   recommendationContext = true,
+  recommendationRankLimit = 5,
 }: {
   item: FeedItem;
   onOpen: (appId: number, recommendationRunId?: string | null) => void;
   recommendationRunId?: string | null;
   recommendationContext?: boolean;
+  recommendationRankLimit?: number;
 }) {
   const { fireAction } = useTheme();
   const toast = useToast();
@@ -138,7 +140,10 @@ export function GameCard({
     .filter((entry): entry is PendingFeedback => entry !== null)
     .some((entry) => entry.feedbackId === null || entry.syncError !== null);
   const showRecommendationBadge =
-    recommendationContext && typeof item.rank === "number" && item.rank >= 1 && item.rank <= 5;
+    recommendationContext &&
+    typeof item.rank === "number" &&
+    item.rank >= 1 &&
+    item.rank <= recommendationRankLimit;
 
   return (
     <article

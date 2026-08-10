@@ -58,6 +58,7 @@ function dataStatus(current: number): DataStatusResponse {
     },
     dimension_coverage: {
       candidates: 100,
+      released_candidates: 80,
       store_details: 100,
       release_date: 99,
       reviews: 20,
@@ -142,6 +143,7 @@ describe("DataOpsScreen live worker progress", () => {
 
       expect(runtime.adminDataStatus).toHaveBeenCalledWith("test-token");
       expect(host.textContent).toContain("2 / 20 款");
+      expect(host.textContent).toContain("有玩家评价（已发售）20 / 80 · 25%");
       expect(host.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("2");
       expect(host.querySelectorAll(".section-metric")).toHaveLength(4);
       expect(host.querySelectorAll(".task-row")).toHaveLength(1);
