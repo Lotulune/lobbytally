@@ -62,23 +62,29 @@ export function useFeed(
   section: FeedSection,
   sort: FeedSort = "recommended",
   order?: FeedSortOrder,
+  pageSize: number | null = FEED_PAGE_SIZE,
 ): FeedState & {
   reload: () => void;
   goToPage: (page: number) => void;
 } {
   const [state, setState] = useState<FeedState>(INITIAL);
   const [page, setPage] = useState(1);
+  const pageRef = useRef(1);
   const generation = useRef(0);
+  const lastPageSize = useRef<number | null>(null);
   const resolvedOrder = order ?? defaultOrderForSort(sort, section);
 
   const load = useCallback(
     (targetPage: number) => {
+      // null = responsive page size not measured yet; the first fetch waits
+      // for the real value instead of loading a guess and reloading.
+      if (pageSize === null) return;
       const gen = generation.current + 1;
       generation.current = gen;
       setState((prev) => ({ ...INITIAL, loading: true, page: targetPage, total: prev.total, totalPages: prev.totalPages }));
       apiClient
         .feed(section, {
-          limit: FEED_PAGE_SIZE,
+          limit: pageSize,
           page: targetPage,
           sort,
           order: resolvedOrder,
@@ -109,17 +115,29 @@ export function useFeed(
           }));
         });
     },
-    [section, sort, resolvedOrder],
+    [section, sort, resolvedOrder, pageSize],
   );
 
   useEffect(() => {
-    setPage(1);
-    load(1);
-  }, [load]);
+    if (pageSize === null) return;
+    const previousSize = lastPageSize.current;
+    lastPageSize.current = pageSize;
+    let targetPage = 1;
+    if (previousSize !== null && previousSize !== pageSize) {
+      // Window resize changed the page size: stay near the same items instead
+      // of snapping back to page 1.
+      const firstItemIndex = (pageRef.current - 1) * previousSize;
+      targetPage = Math.floor(firstItemIndex / pageSize) + 1;
+    }
+    pageRef.current = targetPage;
+    setPage(targetPage);
+    load(targetPage);
+  }, [load, pageSize]);
 
   const goToPage = useCallback(
     (targetPage: number) => {
       if (targetPage < 1) return;
+      pageRef.current = targetPage;
       setPage(targetPage);
       load(targetPage);
     },

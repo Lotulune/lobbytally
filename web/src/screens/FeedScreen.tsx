@@ -1,12 +1,14 @@
 // Feed screen: section tabs live in the shell; this renders one section's list
-// with page-based pagination and optional sort controls.
+// with page-based pagination and optional sort controls. The page size adapts
+// to the window width (complete card rows, bilibili-style).
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FeedSection, FeedSort, FeedSortOrder } from "../api/types";
 import { FEED_SORT_OPTIONS } from "../api/types";
 import { formatAgo, isStale, SECTION_META } from "../app/format";
 import { feedbackQueue } from "../app/runtime";
 import { defaultOrderForSort, useFeed } from "../app/useFeed";
+import { useFeedPageSize } from "../app/useFeedPageSize";
 import { Button } from "../components/Button";
 import { Chip } from "../components/Chip";
 import { EmptyState } from "../components/EmptyState";
@@ -32,7 +34,9 @@ function RankedFeedPanel({
     defaultOrderForSort(defaultSortFor(section), section),
   );
 
-  const feed = useFeed(section, sort, order);
+  const hostRef = useRef<HTMLElement>(null);
+  const pageSize = useFeedPageSize(hostRef);
+  const feed = useFeed(section, sort, order, pageSize);
   const meta = SECTION_META[section];
 
   useEffect(() => feedbackQueue.subscribeRankingChanged(feed.reload), [feed.reload]);
@@ -52,7 +56,7 @@ function RankedFeedPanel({
   };
 
   return (
-    <section aria-label={meta.label}>
+    <section ref={hostRef} aria-label={meta.label}>
       <header className="feed-head">
         <div className="statusline">
           <span>{meta.hint}</span>
@@ -96,7 +100,7 @@ function RankedFeedPanel({
 
       {feed.loading && (
         <div className="feed-grid" aria-busy="true">
-          {Array.from({ length: 6 }, (_, i) => (
+          {Array.from({ length: pageSize ?? 6 }, (_, i) => (
             <Skeleton key={i} />
           ))}
         </div>

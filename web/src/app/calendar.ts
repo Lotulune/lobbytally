@@ -43,43 +43,71 @@ export function groupByMonth(items: CalendarItem[]): MonthGroup[] {
   return Array.from(groups.values());
 }
 
-/** `YYYY-MM-DD` -> `M月D日`, else the raw string. */
-export function dayLabel(day: string | null): string {
-  if (!day) return "日期未定";
-  const match = /^\d{4}-(\d{2})-(\d{2})$/.exec(day);
-  if (!match) return day;
-  return `${Number(match[1])}月${Number(match[2])}日`;
-}
-
-const PRECISION_LABELS: Record<string, string> = {
-  day: "具体日期",
-  month: "预计月份",
-  quarter: "预计季度",
-  year: "预计年份",
-  unknown: "日期未定",
-};
-
-export function precisionLabel(precision: string | null): string | null {
-  if (!precision) return null;
-  return PRECISION_LABELS[precision] ?? precision;
-}
-
-export function confidenceLabel(confidence: number | null): string {
-  if (confidence === null) return "置信度未知";
-  if (confidence >= 0.8) return `高置信 ${Math.round(confidence * 100)}%`;
-  if (confidence >= 0.5) return `中置信 ${Math.round(confidence * 100)}%`;
-  return `低置信 ${Math.round(confidence * 100)}%`;
-}
-
 export function appTypeLabel(appType: string): string {
   if (appType === "demo") return "Demo";
   if (appType === "playtest") return "Playtest";
   return "正式游戏";
 }
 
-export function earlyDataLabel(earlyData: boolean, reviewTotal: number | null): string | null {
-  if (!earlyData) return null;
-  return reviewTotal === null ? "早期数据" : `早期数据 · ${reviewTotal} 条评价`;
+const WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/** `YYYY-MM-DD` -> 周几 (calendar days are interpreted in UTC, like the API). */
+export function weekdayLabel(day: string): string | null {
+  const ts = Date.parse(`${day}T00:00:00Z`);
+  if (Number.isNaN(ts)) return null;
+  return WEEKDAY_LABELS[new Date(ts).getUTCDay()] ?? null;
+}
+
+/** Whole-day distance between a calendar day and "today" (UTC days). */
+export function countdownLabel(day: string, nowMs: number): string | null {
+  const target = Date.parse(`${day}T00:00:00Z`);
+  if (Number.isNaN(target)) return null;
+  const today = Date.parse(`${toDayString(new Date(nowMs))}T00:00:00Z`);
+  const diff = Math.round((target - today) / 86_400_000);
+  if (diff === 0) return "今天";
+  if (diff === 1) return "明天";
+  if (diff > 1) return `${diff} 天后`;
+  if (diff === -1) return "昨天";
+  return `${-diff} 天前`;
+}
+
+export interface CalendarWhen {
+  /** Short date text for the row's date cell, faithful to source precision. */
+  primary: string;
+  /** Weekday + countdown context; only present for day-precision dates. */
+  secondary: string | null;
+}
+
+/**
+ * Row date cell. Month/quarter/year precision stays visibly fuzzy ("预计…")
+ * instead of being dressed up as an exact day (PRD: 数据未知时显示未知).
+ * The year is omitted for exact dates — the month group header carries it.
+ */
+export function calendarWhen(
+  item: Pick<CalendarItem, "release_date" | "release_date_precision">,
+  nowMs: number,
+): CalendarWhen {
+  const date = item.release_date;
+  const precision = item.release_date_precision;
+  if (!date) return { primary: "日期未定", secondary: null };
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!parts) return { primary: "日期未定", secondary: null };
+  const year = parts[1];
+  const month = Number(parts[2]);
+  const dayOfMonth = Number(parts[3]);
+  if (precision === "month") {
+    return { primary: `预计 ${month} 月`, secondary: null };
+  }
+  if (precision === "quarter") {
+    return { primary: `预计 Q${Math.floor((month - 1) / 3) + 1}`, secondary: null };
+  }
+  if (precision === "year") {
+    return { primary: `预计 ${year} 年`, secondary: null };
+  }
+  // day precision (or unlabeled exact date from the store)
+  const secondary =
+    [weekdayLabel(date), countdownLabel(date, nowMs)].filter(Boolean).join(" · ") || null;
+  return { primary: `${month} 月 ${dayOfMonth} 日`, secondary };
 }
 
 /** Format a Date as `YYYY-MM-DD` in UTC (calendar API uses calendar days). */

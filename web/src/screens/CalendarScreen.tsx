@@ -7,14 +7,12 @@ import type { CalendarItem, CalendarPeriod, CalendarResponse } from "../api/type
 import { apiClient } from "../app/runtime";
 import {
   appTypeLabel,
-  confidenceLabel,
+  calendarWhen,
   defaultWindow,
-  earlyDataLabel,
   groupByMonth,
-  precisionLabel,
   recentWindow,
 } from "../app/calendar";
-import { formatAgo, formatReleaseDate, isStale, releaseStateLabel } from "../app/format";
+import { formatAgo, formatCount, isStale } from "../app/format";
 import { Button } from "../components/Button";
 import { Chip } from "../components/Chip";
 import { EmptyState } from "../components/EmptyState";
@@ -45,47 +43,45 @@ function matchesType(item: CalendarItem, typeFilter: CalendarTypeFilter): boolea
 
 function CalendarRow({
   item,
+  period,
   onOpenGame,
 }: {
   item: CalendarItem;
+  period: CalendarPeriod;
   onOpenGame: (appId: number) => void;
 }) {
-  const earlyLabel = earlyDataLabel(item.early_data, item.review_total);
+  const when = calendarWhen(item, Date.now());
+  // Freshness stays available on hover without occupying row space; the
+  // screen header already surfaces the overall data age.
+  const freshness = `资料刷新于 ${formatAgo(item.updated_at_ms)}${
+    item.source_modified_at_ms != null && item.source_modified_at_ms !== item.updated_at_ms
+      ? ` · 来源观测 ${formatAgo(item.source_modified_at_ms)}`
+      : ""
+  }`;
+  const showReviewCount =
+    period === "recent" && typeof item.review_total === "number" && item.review_total > 0;
+  const hasTags = item.app_type !== "game" || item.is_early_access === true || showReviewCount;
   return (
     <button
       type="button"
       className="cal-row"
       data-app-id={item.app_id}
+      title={freshness}
       onClick={() => onOpenGame(item.app_id)}
     >
-      <span className="cal-day">{formatReleaseDate(item.release_date, item.release_date_raw, item.release_date_precision)}</span>
+      <span className="cal-when">
+        <span className="cal-when-primary">{when.primary}</span>
+        {when.secondary && <span className="cal-when-secondary">{when.secondary}</span>}
+      </span>
       <GameMedia coverUrl={item.cover_url ?? null} name={item.canonical_name} appId={item.app_id} compact />
       <span className="cal-name">{item.canonical_name}</span>
-      <span className="cal-tags">
-        <Chip tone="accent">{appTypeLabel(item.app_type)}</Chip>
-        <Chip>{releaseStateLabel(item.release_state)}</Chip>
-        {item.is_early_access && <Chip tone="warn">抢先体验</Chip>}
-        {earlyLabel && <Chip tone="warn">{earlyLabel}</Chip>}
-        {precisionLabel(item.release_date_precision) && (
-          <Chip>{precisionLabel(item.release_date_precision)}</Chip>
-        )}
-        <Chip
-          tone={
-            item.current_data_confidence !== null && item.current_data_confidence < 0.5
-              ? "warn"
-              : undefined
-          }
-        >
-          {confidenceLabel(item.current_data_confidence)}
-        </Chip>
-        <span className="cal-source">
-          资料刷新于 {formatAgo(item.updated_at_ms)}
-          {item.source_modified_at_ms != null &&
-            item.source_modified_at_ms !== item.updated_at_ms && (
-              <> · 来源观测 {formatAgo(item.source_modified_at_ms)}</>
-            )}
+      {hasTags && (
+        <span className="cal-tags">
+          {item.app_type !== "game" && <Chip tone="accent">{appTypeLabel(item.app_type)}</Chip>}
+          {item.is_early_access && <Chip tone="warn">抢先体验</Chip>}
+          {showReviewCount && <Chip>{formatCount(item.review_total)} 条评价</Chip>}
         </span>
-      </span>
+      )}
     </button>
   );
 }
@@ -227,7 +223,7 @@ export function CalendarScreen({ onOpenGame }: { onOpenGame: (appId: number) => 
           </header>
           <div className="cal-list">
             {group.items.map((item) => (
-              <CalendarRow key={item.app_id} item={item} onOpenGame={onOpenGame} />
+              <CalendarRow key={item.app_id} item={item} period={period} onOpenGame={onOpenGame} />
             ))}
           </div>
         </section>
@@ -242,7 +238,7 @@ export function CalendarScreen({ onOpenGame }: { onOpenGame: (appId: number) => 
           <p className="cal-note">这些游戏尚未公布确切日期，不会被伪造成具体日期。</p>
           <div className="cal-list">
             {undated.map((item) => (
-              <CalendarRow key={item.app_id} item={item} onOpenGame={onOpenGame} />
+              <CalendarRow key={item.app_id} item={item} period={period} onOpenGame={onOpenGame} />
             ))}
           </div>
         </section>

@@ -2,15 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { CalendarItem } from "../src/api/types";
 import {
   appTypeLabel,
-  confidenceLabel,
-  dayLabel,
+  calendarWhen,
+  countdownLabel,
   defaultWindow,
-  earlyDataLabel,
   groupByMonth,
   monthLabel,
-  precisionLabel,
   recentWindow,
   toDayString,
+  weekdayLabel,
 } from "../src/app/calendar";
 
 function item(appId: number, releaseDate: string | null): CalendarItem {
@@ -50,28 +49,42 @@ describe("calendar helpers", () => {
     expect(groups[0]?.key).toBe("2026-08");
   });
 
-  it("labels months and days", () => {
+  it("labels months", () => {
     expect(monthLabel("2026-08-02")).toBe("2026年 8 月");
     expect(monthLabel("bad")).toBeNull();
-    expect(dayLabel("2026-08-02")).toBe("8月2日");
-    expect(dayLabel(null)).toBe("日期未定");
   });
 
-  it("labels precision and returns null when absent", () => {
-    expect(precisionLabel("month")).toBe("预计月份");
-    expect(precisionLabel(null)).toBeNull();
-    expect(precisionLabel("weird")).toBe("weird");
-  });
-
-  it("labels app types and data confidence honestly", () => {
+  it("labels app types", () => {
     expect(appTypeLabel("demo")).toBe("Demo");
     expect(appTypeLabel("playtest")).toBe("Playtest");
     expect(appTypeLabel("game")).toBe("正式游戏");
-    expect(confidenceLabel(null)).toBe("置信度未知");
-    expect(confidenceLabel(0.42)).toBe("低置信 42%");
-    expect(confidenceLabel(0.82)).toBe("高置信 82%");
-    expect(earlyDataLabel(true, 42)).toBe("早期数据 · 42 条评价");
-    expect(earlyDataLabel(false, 42)).toBeNull();
+  });
+
+  it("labels weekdays and countdowns in UTC days", () => {
+    expect(weekdayLabel("2026-08-14")).toBe("周五");
+    expect(weekdayLabel("bad")).toBeNull();
+    const now = Date.UTC(2026, 7, 13, 15, 30); // 2026-08-13
+    expect(countdownLabel("2026-08-13", now)).toBe("今天");
+    expect(countdownLabel("2026-08-14", now)).toBe("明天");
+    expect(countdownLabel("2026-08-20", now)).toBe("7 天后");
+    expect(countdownLabel("2026-08-12", now)).toBe("昨天");
+    expect(countdownLabel("2026-08-01", now)).toBe("12 天前");
+  });
+
+  it("renders the date cell faithfully to source precision", () => {
+    const now = Date.UTC(2026, 7, 13);
+    const when = (date: string | null, precision: string | null) =>
+      calendarWhen({ release_date: date, release_date_precision: precision }, now);
+
+    expect(when("2026-08-14", "day")).toEqual({
+      primary: "8 月 14 日",
+      secondary: "周五 · 明天",
+    });
+    // Coarse precision must stay visibly fuzzy instead of a fake exact day.
+    expect(when("2026-09-01", "month")).toEqual({ primary: "预计 9 月", secondary: null });
+    expect(when("2026-10-01", "quarter")).toEqual({ primary: "预计 Q4", secondary: null });
+    expect(when("2026-12-01", "year")).toEqual({ primary: "预计 2026 年", secondary: null });
+    expect(when(null, "tba")).toEqual({ primary: "日期未定", secondary: null });
   });
 
   it("builds a 60-day upcoming window in UTC", () => {

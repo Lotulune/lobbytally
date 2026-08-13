@@ -7,6 +7,10 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
+  /* 行式列表页面：主容器随窗口放宽（服务卡片流），本页保持可读行宽并居中 */
+  width: 100%;
+  max-width: 1360px;
+  margin-inline: auto;
 }
 
 /* ---- 工具带：标题 + 排序 ---- */

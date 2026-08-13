@@ -9,6 +9,10 @@
   display: flex;
   flex-direction: column;
   gap: 16px;
+  /* 行式列表页面：主容器随窗口放宽（服务卡片流），本页保持可读行宽并居中 */
+  width: 100%;
+  max-width: 1360px;
+  margin-inline: auto;
 }
 
 /* ---- 工具带：标题 + 数据时效 ---- */
@@ -98,10 +102,9 @@
   margin: -2px 0 10px;
 }
 
-/* ---- 条目行：日期 > 封面 > 名称 > 标签 ---- */
+/* ---- 条目行：日期 > 封面 > 名称 > 标签（列模板在 base.css 统一定义） ---- */
 
 .calendar-screen .cal-row {
-  grid-template-columns: 96px 68px minmax(0, 1fr) auto;
   background: var(--surface-2);
 }
 
@@ -116,6 +119,9 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
+  width: 100%;
+  max-width: 1360px;
+  margin-inline: auto;
 }
 
 /* ---- 工具带：标题 + 结果计数 ---- */
@@ -165,16 +171,4 @@
   flex-shrink: 1;
 }
 
-/* ---- 窄屏：日历行折行 ---- */
-
-@media (max-width: 720px) {
-  .calendar-screen .cal-row {
-    grid-template-columns: 68px minmax(0, 1fr);
-  }
-
-  .calendar-screen .cal-day,
-  .calendar-screen .cal-tags {
-    grid-column: 1 / -1;
-    justify-content: flex-start;
-  }
-}
+/* 窄屏折行规则同样在 base.css（860px 断点）统一定义。 */

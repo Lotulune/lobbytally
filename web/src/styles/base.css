@@ -51,6 +51,12 @@
   --tab-active-ink: var(--accent);
   --card-border-hover: var(--accent);
   --press-scale: 0.98;
+
+  /* layout: content column cap + feed card grid (JS reads the feed tokens to
+     compute the adaptive page size — keep them in sync with .feed-grid) */
+  --content-max: 2160px;
+  --feed-card-min: 330px;
+  --feed-grid-gap: 16px;
 }
 
 * {
@@ -296,7 +302,9 @@ body::before {
   width: 100%;
   max-width: none;
   margin: 0;
-  padding: 20px max(22px, calc((100vw - 1180px) / 2 + 22px)) 60px;
+  /* Content column grows with the window (bilibili-style) up to --content-max,
+     then stays centered. Card count per row follows via .feed-grid auto-fill. */
+  padding: 20px max(22px, calc((100vw - var(--content-max)) / 2 + 22px)) 60px;
   overflow-y: auto;
 }
 
@@ -629,8 +637,8 @@ body::before {
 
 .feed-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(var(--feed-card-min), 1fr));
+  gap: var(--feed-grid-gap);
   margin-top: 18px;
 }
 
@@ -1565,7 +1573,10 @@ body::before {
   text-align: left;
   cursor: pointer;
   display: grid;
-  grid-template-columns: 96px 1fr auto;
+  /* date | cover | name (flexible) | tags (content-sized, capped so a long
+     name can never be squeezed out by the tag column). The tags element is
+     only rendered when a row actually has chips. */
+  grid-template-columns: 108px 68px minmax(0, 1fr) fit-content(42%);
   align-items: center;
   gap: 12px;
   padding: 10px 14px;
@@ -1586,14 +1597,26 @@ body::before {
   transform: scale(var(--press-scale));
 }
 
-.cal-day {
+.cal-when {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cal-when-primary {
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--accent);
-  white-space: nowrap;
+}
+
+.cal-when-secondary {
+  font-size: 11px;
+  color: var(--ink-muted);
 }
 
 .cal-name {
+  min-width: 0;
   font-family: var(--font-display);
   font-size: 14.5px;
   overflow-wrap: anywhere;
@@ -1604,17 +1627,14 @@ body::before {
   gap: 6px;
   flex-wrap: wrap;
   justify-content: flex-end;
+  min-width: 0;
 }
 
-.cal-source {
-  color: var(--ink-muted);
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-@media (max-width: 640px) {
+/* Narrow windows: tags wrap onto their own line under the row so the name
+   column never collapses into a vertical letter stack. */
+@media (max-width: 860px) {
   .cal-row {
-    grid-template-columns: 80px 1fr;
+    grid-template-columns: 108px 68px minmax(0, 1fr);
   }
   .cal-tags {
     grid-column: 1 / -1;

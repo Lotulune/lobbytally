@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const runtime = vi.hoisted(() => ({
   goToPage: vi.fn(),
-  useFeed: vi.fn((_section: string, _sort: string, _order: string) => ({
+  useFeed: vi.fn((_section: string, _sort: string, _order: string, _pageSize: number | null) => ({
     items: [{ app_id: 1, name: "Test Game" }],
     loading: false,
     error: null,
@@ -30,8 +30,8 @@ vi.mock("../src/app/runtime", () => ({
 
 vi.mock("../src/app/useFeed", () => ({
   defaultOrderForSort: () => "desc",
-  useFeed: (section: string, sort: string, order: string) => {
-    const result = runtime.useFeed(section, sort, order);
+  useFeed: (section: string, sort: string, order: string, pageSize: number | null) => {
+    const result = runtime.useFeed(section, sort, order, pageSize);
     return { ...result, goToPage: runtime.goToPage };
   },
 }));
@@ -115,7 +115,12 @@ describe("FeedScreen", () => {
       expect(fit).toBeTruthy();
 
       act(() => fit?.click());
-      expect(runtime.useFeed).toHaveBeenLastCalledWith("recent_release", "fit_index", "desc");
+      expect(runtime.useFeed).toHaveBeenLastCalledWith(
+        "recent_release",
+        "fit_index",
+        "desc",
+        expect.any(Number),
+      );
       expect(main.querySelector('[aria-label*="当前降序"]')).toBeNull();
       expect(runtime.gameCardProps.at(-1)?.recommendationContext).toBe(true);
       expect(runtime.gameCardProps.at(-1)?.recommendationRankLimit).toBe(10);

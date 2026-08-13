@@ -276,13 +276,17 @@ describe("M4 native desktop journey", () => {
     expect(bodyText).not.toContain("session_minutes");
   });
 
-  it("shows upcoming and recent calendar entries with honest early-data context", async () => {
+  it("shows upcoming and recent calendar entries with honest date context", async () => {
     await clickAuxTab("calendar");
     await expect($("section[aria-label='发售日历']")).toBeDisplayed();
     await expect($("button.cal-row")).toBeDisplayed();
-    await expectVisibleText("早期数据", "section[aria-label='发售日历']");
-    await expectVisibleText("置信度", "section[aria-label='发售日历']");
-    await expectVisibleText("来源更新于", "section[aria-label='发售日历']");
+    // Every row keeps a precision-faithful date cell; review/confidence noise
+    // is gone for unreleased entries.
+    await expect($("button.cal-row .cal-when-primary")).toBeDisplayed();
+    const calendarText = await $("section[aria-label='发售日历']").getText();
+    expect(calendarText).not.toContain("置信度");
+    expect(calendarText).not.toContain("早期数据");
+    await expectVisibleText("数据更新于", "section[aria-label='发售日历']");
 
     await (await exactButton("近期发售")).click();
     await expect($("button.cal-row")).toBeDisplayed();

@@ -8,6 +8,10 @@
   display: flex;
   flex-direction: column;
   gap: 20px;
+  /* 主容器随窗口放宽（服务卡片流），详情页保持可读行宽并居中 */
+  width: 100%;
+  max-width: 1440px;
+  margin-inline: auto;
 }
 
 /* 返回行：去掉共享样式的下外边距，由 .detail-screen 的 gap 统一节奏 */
