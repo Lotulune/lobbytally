@@ -462,6 +462,14 @@ struct IntegratedIngestionStats {
     dead_apps: usize,
 }
 
+fn integrated_ingestion_should_continue(stats: &IntegratedIngestionStats, limit: i64) -> bool {
+    limit > 0
+        && stats.claimed_apps >= usize::try_from(limit).unwrap_or(usize::MAX)
+        && stats.completed_apps > 0
+        && stats.retried_apps == 0
+        && stats.dead_apps == 0
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -1296,9 +1304,14 @@ fn configured_worker_owner() -> Result<String, String> {
     Ok(owner)
 }
 
-fn worker_retry_delay_ms(attempts: i64) -> i64 {
+fn worker_retry_delay_ms(category: &str, attempts: i64) -> i64 {
     let exponent = attempts.clamp(1, 6) as u32 - 1;
-    WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent)
+    let exponential = WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent);
+    if category == "rate_limited" {
+        exponential.max(i64::try_from(ENRICH_RATE_LIMIT_COOLDOWN_MS).unwrap_or(i64::MAX))
+    } else {
+        exponential
+    }
 }
 
 fn worker_task_status(task_type: &str) -> Option<(&'static str, &'static str)> {
@@ -1409,6 +1422,16 @@ fn process_integrated_game_ingestion_with(
             if task.stage == "complete" {
                 stats.completed_apps = stats.completed_apps.saturating_add(1);
                 break;
+            }
+            if matches!(
+                task.enrichment_profile.as_str(),
+                "basic_upcoming" | "basic_demo"
+            ) && task.stage != "store_details"
+            {
+                task = worker_storage_with_retry(|| {
+                    repo.advance_game_ingestion_stage(task.app_id, owner)
+                })?;
+                continue;
             }
             let observed = repo
                 .game_ingestion_stage_observed(task.app_id, &task.stage, &country_code, &language)
@@ -1603,7 +1626,7 @@ fn run_steam_worker_once(
                         job.job_id,
                         owner,
                         job_error_category,
-                        worker_retry_delay_ms(job.attempts),
+                        worker_retry_delay_ms(job_error_category, job.attempts),
                     )
                 })
                 .map_err(|failure| failure.message)?;
@@ -1805,11 +1828,10 @@ fn run_enrichment_worker_task(
         .map_err(|_| worker_task_error("invalid_payload", "invalid Steam store locale"))?;
     let integrated_limit = i64::from(limit).min(INTEGRATED_INGESTION_LIMIT);
     let integrated = process_integrated_game_ingestion(repo, owner, integrated_limit)?;
-    let integrated_batch_full = integrated_limit > 0
-        && integrated.claimed_apps >= usize::try_from(integrated_limit).unwrap_or(usize::MAX);
+    let continue_integrated = integrated_ingestion_should_continue(&integrated, integrated_limit);
     let limit = limit.saturating_sub(u32::try_from(integrated.claimed_apps).unwrap_or(limit));
     if limit == 0 {
-        return Ok(integrated_batch_full);
+        return Ok(continue_integrated);
     }
     let cursor = repo
         .source_cursor(ENRICH_CURSOR_KEY)
@@ -1857,7 +1879,7 @@ fn run_enrichment_worker_task(
         worker_storage_with_retry(|| {
             repo.finish_source_run(run_id, "succeeded", 0, 0, None, Some("no targets due"))
         })?;
-        return Ok(integrated_batch_full);
+        return Ok(continue_integrated);
     }
     let enrichment_batch_full = targets.len() >= usize::try_from(limit).unwrap_or(usize::MAX);
     match enrich_steam_candidates(repo, &targets, &country_code, &language, Some(run_id)) {
@@ -1899,11 +1921,19 @@ fn run_enrichment_worker_task(
                     Some(&notes),
                 )
             })?;
-            // Missing dimensions remain due in storage and are selected again
-            // by a later quota pass. Treat per-app partial failures as a
-            // completed scheduler batch so unrelated apps do not consume the
-            // same global job retry budget.
-            Ok(integrated_batch_full || enrichment_batch_full)
+            // Failed dimensions stay due and need the normal scheduler delay;
+            // immediately continuing a partial batch would hammer the same
+            // degraded upstream endpoint.
+            if let Some(category) = stats.first_error_category {
+                return Err(worker_task_error(category, "partial enrichment failure"));
+            }
+            Ok(integrated.retried_apps == 0
+                && integrated.dead_apps == 0
+                && enrichment_batch_should_continue(
+                    continue_integrated,
+                    enrichment_batch_full,
+                    &stats,
+                ))
         }
         Err(failure) => {
             let _ = worker_storage_with_retry(|| {
@@ -2763,6 +2793,24 @@ struct EnrichStats {
     popular_reviews_ok: i64,
     ccu_ok: i64,
     error_count: i64,
+    first_error_category: Option<&'static str>,
+}
+
+impl EnrichStats {
+    fn record_error(&mut self, category: &'static str) {
+        self.error_count = self.error_count.saturating_add(1);
+        if self.first_error_category.is_none() || category == "rate_limited" {
+            self.first_error_category = Some(category);
+        }
+    }
+}
+
+fn enrichment_batch_should_continue(
+    continue_integrated: bool,
+    batch_full: bool,
+    stats: &EnrichStats,
+) -> bool {
+    stats.error_count == 0 && (continue_integrated || (batch_full && stats.success_count > 0))
 }
 
 fn enrich_steam_candidates(
@@ -2845,7 +2893,7 @@ fn enrich_steam_candidates(
                     }
                 }
                 Err(error) => {
-                    stats.error_count = stats.error_count.saturating_add(1);
+                    stats.record_error(error.category);
                     eprintln!(
                         "warn app_id={} store_details: {} ({})",
                         target.app_id, error.message, error.category
@@ -2872,7 +2920,7 @@ fn enrich_steam_candidates(
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    stats.error_count = stats.error_count.saturating_add(1);
+                    stats.record_error(error.category);
                     eprintln!(
                         "warn app_id={} english_name: {} ({})",
                         target.app_id, error.message, error.category
@@ -2888,7 +2936,7 @@ fn enrich_steam_candidates(
                     app_ok = app_ok.saturating_add(1);
                 }
                 Err(error) => {
-                    stats.error_count = stats.error_count.saturating_add(1);
+                    stats.record_error(error.category);
                     eprintln!(
                         "warn app_id={} reviews: {} ({})",
                         target.app_id, error.message, error.category
@@ -2905,7 +2953,7 @@ fn enrich_steam_candidates(
                     app_ok = app_ok.saturating_add(1);
                 }
                 Err(error) => {
-                    stats.error_count = stats.error_count.saturating_add(1);
+                    stats.record_error(error.category);
                     eprintln!(
                         "warn app_id={} popular_reviews: {} ({})",
                         target.app_id, error.message, error.category
@@ -2922,7 +2970,7 @@ fn enrich_steam_candidates(
                     app_ok = app_ok.saturating_add(1);
                 }
                 Err(error) => {
-                    stats.error_count = stats.error_count.saturating_add(1);
+                    stats.record_error(error.category);
                     eprintln!(
                         "warn app_id={} ccu: {} ({})",
                         target.app_id, error.message, error.category
@@ -3885,6 +3933,47 @@ mod tests {
             ]
         );
         assert!(repo.pending_game_ingestion_app_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_continues_only_after_a_full_successful_batch() {
+        let completed = IntegratedIngestionStats {
+            claimed_apps: 1,
+            completed_apps: 1,
+            ..IntegratedIngestionStats::default()
+        };
+        let retried = IntegratedIngestionStats {
+            claimed_apps: 1,
+            retried_apps: 1,
+            ..IntegratedIngestionStats::default()
+        };
+        assert!(integrated_ingestion_should_continue(&completed, 1));
+        assert!(!integrated_ingestion_should_continue(&retried, 1));
+
+        let successful = EnrichStats {
+            success_count: 4,
+            ..EnrichStats::default()
+        };
+        let partial = EnrichStats {
+            success_count: 3,
+            error_count: 1,
+            ..EnrichStats::default()
+        };
+        assert!(enrichment_batch_should_continue(false, true, &successful));
+        assert!(!enrichment_batch_should_continue(false, true, &partial));
+        assert!(!enrichment_batch_should_continue(false, false, &successful));
+        assert!(!enrichment_batch_should_continue(true, true, &partial));
+
+        let mut failed = EnrichStats::default();
+        failed.record_error("rate_limited");
+        failed.record_error("network");
+        assert_eq!(failed.error_count, 2);
+        assert_eq!(failed.first_error_category, Some("rate_limited"));
+        assert_eq!(
+            worker_retry_delay_ms("rate_limited", 1),
+            i64::try_from(ENRICH_RATE_LIMIT_COOLDOWN_MS).unwrap()
+        );
+        assert_eq!(worker_retry_delay_ms("network", 1), WORKER_RETRY_BASE_MS);
     }
 
     #[test]

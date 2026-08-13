@@ -58,11 +58,20 @@ export function weekdayLabel(day: string): string | null {
   return WEEKDAY_LABELS[new Date(ts).getUTCDay()] ?? null;
 }
 
-/** Whole-day distance between a calendar day and "today" (UTC days). */
-export function countdownLabel(day: string, nowMs: number): string | null {
+/** Whole-day distance between a calendar day and the viewer's local "today". */
+export function countdownLabel(
+  day: string,
+  nowMs: number,
+  timezoneOffsetMinutes = new Date(nowMs).getTimezoneOffset(),
+): string | null {
   const target = Date.parse(`${day}T00:00:00Z`);
   if (Number.isNaN(target)) return null;
-  const today = Date.parse(`${toDayString(new Date(nowMs))}T00:00:00Z`);
+  const localNow = new Date(nowMs - timezoneOffsetMinutes * 60_000);
+  const today = Date.UTC(
+    localNow.getUTCFullYear(),
+    localNow.getUTCMonth(),
+    localNow.getUTCDate(),
+  );
   const diff = Math.round((target - today) / 86_400_000);
   if (diff === 0) return "今天";
   if (diff === 1) return "明天";
