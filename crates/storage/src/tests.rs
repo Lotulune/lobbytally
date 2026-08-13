@@ -1582,6 +1582,9 @@ fn integrated_game_ingestion_resumes_current_stage_after_exit_and_network_retry(
     assert_eq!(review.stage, "review_summary");
 
     clock.advance_ms(30_001);
+    let expired_snapshot = repo.refresh_pipeline_status_snapshot().unwrap();
+    assert_eq!(expired_snapshot.integrated_ingestion.pending, 1);
+    assert_eq!(expired_snapshot.integrated_ingestion.leased, 0);
     let resumed = repo
         .claim_game_ingestion_tasks("worker-b", 1, 30_000)
         .unwrap();
@@ -1604,6 +1607,58 @@ fn integrated_game_ingestion_resumes_current_stage_after_exit_and_network_retry(
     assert_eq!(retried[0].stage_failure_attempts, 1);
     assert_eq!(retried[0].total_failure_attempts, 1);
     assert_eq!(retried[0].lease_count, 3);
+}
+
+#[test]
+fn basic_ingestion_profiles_stop_after_store_details_and_promote_released_games() {
+    let (repo, _) = repo_with_clock(10_000);
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute_batch(
+                "INSERT INTO apps (
+                     app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
+                 ) VALUES
+                     (10, 'game', 'Upcoming Fixture', 'coming_soon', 1, 1),
+                     (20, 'demo', 'Demo Fixture', 'released', 1, 1),
+                     (30, 'game', 'Promoted Fixture', 'coming_soon', 1, 1);",
+            )?;
+            for app_id in [10, 20, 30] {
+                crate::game_ingestion::queue_new_app(conn, app_id, "fixture", 10_000)?;
+            }
+            conn.execute(
+                "UPDATE game_ingestion_queue SET stage = 'review_summary' WHERE app_id = 20",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let tasks = repo
+        .claim_game_ingestion_tasks("worker-a", 3, 30_000)
+        .unwrap();
+    assert_eq!(tasks[0].enrichment_profile, "basic_upcoming");
+    assert_eq!(tasks[1].enrichment_profile, "basic_demo");
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'released' WHERE app_id = 30",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    for app_id in [10, 20] {
+        let completed = repo
+            .advance_game_ingestion_stage(app_id, "worker-a")
+            .unwrap();
+        assert_eq!(completed.stage, "complete");
+        assert_eq!(completed.status, "complete");
+    }
+    let promoted = repo.advance_game_ingestion_stage(30, "worker-a").unwrap();
+    assert_eq!(promoted.enrichment_profile, "full_released");
+    assert_eq!(promoted.stage, "review_summary");
+    assert_eq!(promoted.status, "pending");
 }
 
 #[test]
@@ -2724,8 +2779,8 @@ fn pipeline_inventory_counts_basic_rows() {
 #[test]
 fn pipeline_worker_queue_status_is_live_and_separates_due_jobs_from_leases() {
     let now_ms = 1_785_830_400_000;
-    let (repo, _) = repo_with_clock(now_ms);
-    for (key, due_at_ms) in [("due", now_ms), ("future", now_ms + 60_000)] {
+    let (repo, clock) = repo_with_clock(now_ms);
+    for (key, due_at_ms) in [("due", now_ms), ("future", now_ms + 120_000)] {
         repo.enqueue_job(&EnqueueJob {
             source: "steam".into(),
             task_type: "enrich_catalog".into(),
@@ -2750,6 +2805,16 @@ fn pipeline_worker_queue_status_is_live_and_separates_due_jobs_from_leases() {
     assert_eq!(status.active_jobs.len(), 1);
     assert_eq!(status.active_jobs[0].task_type, "enrich_catalog");
     assert_eq!(status.active_jobs[0].attempts, 1);
+
+    clock.advance_ms(60_001);
+    let expired = repo.pipeline_worker_queue_status().unwrap();
+    assert_eq!(expired.pending, 2);
+    assert_eq!(expired.pending_due, 1);
+    assert_eq!(expired.leased, 0);
+    assert!(expired.active_jobs.is_empty());
+    let inventory = repo.pipeline_inventory().unwrap();
+    assert_eq!(inventory.jobs_pending, 2);
+    assert_eq!(inventory.jobs_leased, 0);
 }
 
 #[test]

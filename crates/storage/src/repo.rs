@@ -1596,13 +1596,16 @@ impl Repository {
                 )
                 .optional()?;
             let jobs_pending: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM jobs WHERE status = 'pending'",
-                [],
+                "SELECT COUNT(*) FROM jobs
+                 WHERE status = 'pending'
+                    OR (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= ?1)",
+                [now_ms],
                 |row| row.get(0),
             )?;
             let jobs_leased: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM jobs WHERE status = 'leased'",
-                [],
+                "SELECT COUNT(*) FROM jobs
+                 WHERE status = 'leased' AND lease_expires_at_ms > ?1",
+                [now_ms],
                 |row| row.get(0),
             )?;
             let jobs_dead: i64 = conn.query_row(
@@ -1642,9 +1645,11 @@ impl Repository {
         self.db.with_conn(|conn| {
             let (pending, pending_due, leased) = conn.query_row(
                 "SELECT
-                    COALESCE(SUM(status = 'pending'), 0),
-                    COALESCE(SUM(status = 'pending' AND due_at_ms <= ?1), 0),
-                    COALESCE(SUM(status = 'leased'), 0)
+                    COALESCE(SUM(status = 'pending' OR
+                        (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= ?1)), 0),
+                    COALESCE(SUM((status = 'pending' AND due_at_ms <= ?1) OR
+                        (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= ?1)), 0),
+                    COALESCE(SUM(status = 'leased' AND lease_expires_at_ms > ?1), 0)
                  FROM jobs
                  WHERE status IN ('pending', 'leased')",
                 [now_ms],
@@ -1654,12 +1659,12 @@ impl Repository {
                 "SELECT job_id, task_type, entity_key, attempts, max_attempts,
                         lease_expires_at_ms, updated_at_ms
                  FROM jobs
-                 WHERE status = 'leased'
+                 WHERE status = 'leased' AND lease_expires_at_ms > ?1
                  ORDER BY updated_at_ms ASC, job_id ASC
                  LIMIT 10",
             )?;
             let active_jobs = statement
-                .query_map([], |row| {
+                .query_map([now_ms], |row| {
                     Ok(crate::models::PipelineActiveJob {
                         job_id: row.get(0)?,
                         task_type: row.get(1)?,
@@ -1782,9 +1787,11 @@ impl Repository {
         let integrated_ingestion = self.db.with_conn(|conn| {
             let mut status = conn.query_row(
                 "SELECT
-                    COALESCE(SUM(status = 'pending' AND lease_owner IS NULL), 0),
-                    COALESCE(SUM(status = 'retry' AND lease_owner IS NULL), 0),
-                    COALESCE(SUM(lease_owner IS NOT NULL), 0),
+                    COALESCE(SUM(status = 'pending' AND
+                        (lease_owner IS NULL OR COALESCE(lease_expires_at_ms, 0) <= ?1)), 0),
+                    COALESCE(SUM(status = 'retry' AND
+                        (lease_owner IS NULL OR COALESCE(lease_expires_at_ms, 0) <= ?1)), 0),
+                    COALESCE(SUM(lease_owner IS NOT NULL AND lease_expires_at_ms > ?1), 0),
                     COALESCE(SUM(status = 'dead'), 0),
                     COALESCE(SUM(stage = 'store_details' AND status NOT IN ('complete', 'dead')), 0),
                     COALESCE(SUM(stage = 'review_summary' AND status NOT IN ('complete', 'dead')), 0),
@@ -1792,7 +1799,7 @@ impl Repository {
                     COALESCE(SUM(stage = 'ccu' AND status NOT IN ('complete', 'dead')), 0),
                     MIN(CASE WHEN status = 'dead' THEN dead_at_ms END)
                  FROM game_ingestion_queue",
-                [],
+                [generated_at_ms],
                 |row| {
                     Ok(crate::models::GameIngestionQueueStatus {
                         pending: row.get(0)?,

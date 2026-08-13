@@ -124,15 +124,35 @@ pub fn advance_stage(
         return Err(StorageError::validation("lease owner is required"));
     }
     let task = require_active_lease(conn, app_id, owner, now_ms)?;
+    let enrichment_profile = if task.enrichment_profile == "basic_upcoming"
+        && conn.query_row(
+            "SELECT release_state = 'released'
+             FROM apps WHERE app_id = ?1",
+            [app_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+        "full_released"
+    } else {
+        task.enrichment_profile.as_str()
+    };
+    let basic_profile = matches!(enrichment_profile, "basic_upcoming" | "basic_demo");
+    let full_profile = matches!(enrichment_profile, "full_released" | "full_override");
+    if !basic_profile && !full_profile {
+        return Err(StorageError::validation(format!(
+            "unknown game ingestion profile {enrichment_profile}"
+        )));
+    }
     let next_stage = match task.stage.as_str() {
+        "store_details" if basic_profile => "complete",
         "store_details" => "review_summary",
-        "review_summary" => "popular_reviews",
-        "popular_reviews" => "ccu",
-        "ccu" => "complete",
+        "review_summary" | "popular_reviews" | "ccu" if basic_profile => "complete",
+        "review_summary" if full_profile => "popular_reviews",
+        "popular_reviews" if full_profile => "ccu",
+        "ccu" if full_profile => "complete",
         "complete" => return Ok(task),
         stage => {
             return Err(StorageError::validation(format!(
-                "unknown game ingestion stage {stage}"
+                "stage {stage} is not valid for game ingestion profile {enrichment_profile}"
             )));
         }
     };
@@ -141,17 +161,25 @@ pub fn advance_stage(
         "UPDATE game_ingestion_queue
          SET stage = ?1,
              status = CASE WHEN ?2 = 1 THEN 'complete' ELSE 'pending' END,
+             enrichment_profile = ?3,
              stage_failure_attempts = 0,
-             next_attempt_at_ms = ?3,
+             next_attempt_at_ms = ?4,
              last_error_category = NULL,
              last_error_summary = NULL,
              dead_at_ms = NULL,
              lease_owner = CASE WHEN ?2 = 1 THEN NULL ELSE lease_owner END,
              lease_expires_at_ms = CASE WHEN ?2 = 1 THEN NULL ELSE lease_expires_at_ms END,
-             updated_at_ms = ?3
-         WHERE app_id = ?4 AND lease_owner = ?5
-           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?3",
-        params![next_stage, i64::from(complete), now_ms, app_id, owner],
+             updated_at_ms = ?4
+         WHERE app_id = ?5 AND lease_owner = ?6
+           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?4",
+        params![
+            next_stage,
+            i64::from(complete),
+            enrichment_profile,
+            now_ms,
+            app_id,
+            owner
+        ],
     )?;
     if changed != 1 {
         return Err(StorageError::lease(format!(
