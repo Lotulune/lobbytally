@@ -220,6 +220,13 @@ image ID 临时标记为标准回滚镜像引用后自动重启，避免依赖�
 超时会放弃本次升级并重启旧版本。成功切换后 updater 会输出实测 `Public cutover window`
 秒数，生产验收应记录该值而不是用整个 update service 运行时长代替用户可见停机时间。
 
+main 分支仍对每次 push 执行常规 CI，但 `release-main` 只在生产 runtime 路径发生变化时
+才构建并推进。`scripts/release_scope.sh` 对文档、CI/测试、桌面/E2E、打包脚本和仅供人工
+安装的 host 示例配置进行明确豁免；任何未分类的新路径默认视为生产变更，以避免漏发。
+Git 比较显式关闭 rename detection，从而同时检查重命名前后的路径；历史抓取、diff 或分类
+发生异常时也统一回退为“需要发布”。因此纯测试/文档提交不会再触发无意义的 GHCR 重建
+和公网切换，同时分类器自身故障不会静默吞掉真实生产发布。
+
 PR 2 镜像部署并稳定观察新游入库至少 24 小时后，先保持所有应用 writer 停止并验证
 最新备份，再从同一 immutable server 镜像运行存量清理 dry-run：
 

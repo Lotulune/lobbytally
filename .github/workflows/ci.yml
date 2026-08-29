@@ -71,6 +71,7 @@ jobs:
           sh deploy/tests/worker-health-v2.sh
           sh deploy/tests/update-backup-cutover.sh
           sh deploy/tests/update-failure-injection.sh
+          sh deploy/tests/release-scope.sh
 
       - name: Install Rust 1.97.0
         run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt,clippy
@@ -287,10 +288,42 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  release_scope:
+    name: Detect production runtime changes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      runtime_changed: ${{ steps.scope.outputs.runtime_changed }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 2
+
+      - name: Classify changed paths
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          runtime_changed=$(sh scripts/release_scope_from_git.sh "$BEFORE_SHA" "$RELEASE_SHA")
+          case "$runtime_changed" in
+            true|false) ;;
+            *)
+              printf 'Invalid release-scope result: %s\n' "$runtime_changed" >&2
+              exit 1
+              ;;
+          esac
+          printf 'runtime_changed=%s\n' "$runtime_changed" | tee -a "$GITHUB_OUTPUT"
+
   publish-containers:
     name: Publish paired production containers
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.release_scope.outputs.runtime_changed == 'true'
     needs:
+      - release_scope
       - web
       - quality
       - build-linux
