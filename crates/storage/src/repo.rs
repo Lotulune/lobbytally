@@ -621,25 +621,16 @@ impl Repository {
                      SELECT
                          candidates.app_id,
                          CASE WHEN (
-                                    a.release_state IN ('upcoming', 'coming_soon')
-                                    OR (
-                                        a.release_state = 'unknown'
-                                        AND (
-                                            a.release_date IS NOT NULL
-                                            OR NULLIF(trim(a.release_date_raw), '') IS NOT NULL
-                                        )
-                                    )
+                                    a.release_state IN ('upcoming', 'coming_soon', 'unknown')
+                                    AND a.release_date IS NOT NULL
+                                    AND a.release_date <= ?20
                                   ) AND NOT EXISTS (
                                       SELECT 1 FROM store_detail_refresh_state lifecycle_refresh
                                       WHERE lifecycle_refresh.app_id = candidates.app_id
                                         AND lifecycle_refresh.country_code = ?5
                                         AND lifecycle_refresh.language = ?7
                                         AND lifecycle_refresh.status IN ('succeeded', 'not_found')
-                                        AND lifecycle_refresh.store_checked_at_ms >= CASE
-                                            WHEN a.release_date IS NOT NULL
-                                                 AND a.release_date <= ?20 THEN ?19
-                                            ELSE ?4
-                                        END
+                                        AND lifecycle_refresh.store_checked_at_ms >= ?19
                                   )
                               THEN 1 ELSE 0 END AS release_transition_overdue,
                           CASE WHEN (

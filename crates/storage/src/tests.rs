@@ -2579,7 +2579,7 @@ fn stale_pre_release_lifecycle_outranks_regular_store_backlog() {
 
     let raw = RawResponse::validate(
         200,
-        br#"{"4001890":{"success":true,"data":{"steam_appid":4001890,"type":"game","name":"How to Fish","is_free":true,"platforms":{"windows":true},"supported_languages":"English","release_date":{"coming_soon":true,"date":"Coming soon"}}}}"#
+        br#"{"4001890":{"success":true,"data":{"steam_appid":4001890,"type":"game","name":"How to Fish","is_free":true,"platforms":{"windows":true},"supported_languages":"English","release_date":{"coming_soon":true,"date":"1970-01-01"}}}}"#
             .to_vec(),
         Some("application/json".into()),
         4096,
@@ -2609,6 +2609,64 @@ fn stale_pre_release_lifecycle_outranks_regular_store_backlog() {
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].app_id, 4_001_890);
     assert!(due[0].needs_store_details);
+}
+
+#[test]
+fn future_pre_release_refresh_does_not_get_p0_lifecycle_priority() {
+    use crate::repo::PRICE_REFRESH_INTERVAL_MS;
+
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let (repo, clock) = repo_with_clock(10 * day_ms);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 10,
+                name: "Regular Store Backlog".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 4_001_890,
+                name: "Future Launch Fixture".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "future-release-no-p0-priority".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
+    let raw = RawResponse::validate(
+        200,
+        br#"{"4001890":{"success":true,"data":{"steam_appid":4001890,"type":"game","name":"Future Launch Fixture","is_free":true,"platforms":{"windows":true},"supported_languages":"English","release_date":{"coming_soon":true,"date":"2099-01-01"}}}}"#
+            .to_vec(),
+        Some("application/json".into()),
+        4096,
+    )
+    .unwrap();
+    let parsed = parse_store_details(
+        &StoreDetailsRequest::with_locale(4_001_890, "CN", "schinese").unwrap(),
+        &raw,
+    )
+    .unwrap();
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+    clock.advance_ms(PRICE_REFRESH_INTERVAL_MS + 1);
+
+    let store_only = crate::models::EnrichmentNeedFilter {
+        store: true,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: false,
+    };
+    let due = repo
+        .list_enrichment_targets_after_filtered(1, None, "CN", "schinese", store_only)
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].app_id, 10);
 }
 
 #[test]
