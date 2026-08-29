@@ -13,6 +13,20 @@ fail() {
   exit 1
 }
 
+assert_event_contains_all() {
+  file=$1
+  marker=$2
+  shift 2
+  line=$(grep -F "$marker" "$file" | head -n 1)
+  [ -n "$line" ] || fail "missing event: $marker"
+  for needle in "$@"; do
+    case "$line" in
+      *"$needle"*) ;;
+      *) fail "event '$marker' is missing '$needle': $line" ;;
+    esac
+  done
+}
+
 assert_contains() {
   file=$1
   needle=$2
@@ -177,7 +191,7 @@ case "$verb" in
         event "compose_stop:${MPGS_SERVER_IMAGE:-unset}"
         ;;
       up)
-        event "compose_up:${MPGS_SERVER_IMAGE:-unset}"
+        event "compose_up:server=${MPGS_SERVER_IMAGE:-unset}:web=${MPGS_WEB_IMAGE:-unset}:services=$*"
         case "${MPGS_SERVER_IMAGE:-}" in
           *":sha-$FAKE_NEW_SHA")
             if [ "$FAKE_SCENARIO" = new_up_failure ]; then
@@ -323,24 +337,30 @@ assert_contains "$SCENARIO_EVENTS" 'preflight_backup:'
 assert_contains "$SCENARIO_EVENTS" 'compose_stop:'
 assert_contains "$SCENARIO_EVENTS" 'recover_leases'
 assert_contains "$SCENARIO_EVENTS" 'final_backup:'
-assert_contains "$SCENARIO_EVENTS" 'compose_up:mpgs-rollback-server:'
+assert_event_contains_all "$SCENARIO_EVENTS" 'compose_up:server=mpgs-rollback-server:' \
+  'web=mpgs-rollback-web:' 'mpgs-server' 'mpgs-worker' 'mpgs-web'
 assert_not_contains "$SCENARIO_EVENTS" 'restore_final:'
 assert_before "$SCENARIO_EVENTS" 'preflight_backup:' 'compose_stop:'
 assert_before "$SCENARIO_EVENTS" 'compose_stop:' 'recover_leases'
 assert_before "$SCENARIO_EVENTS" 'recover_leases' 'final_backup:'
-assert_before "$SCENARIO_EVENTS" 'final_backup:' 'compose_up:mpgs-rollback-server:'
+assert_before "$SCENARIO_EVENTS" 'final_backup:' 'compose_up:server=mpgs-rollback-server:'
 assert_contains "$SCENARIO_OUTPUT" 'Quiesced rollback snapshot failed or exceeded 5s; restarting the previous release.'
 rm -rf "$SCENARIO_FIXTURE"
 
 run_scenario new_up_failure
 assert_contains "$SCENARIO_EVENTS" 'preflight_backup:'
 assert_contains "$SCENARIO_EVENTS" 'final_backup:'
-assert_contains "$SCENARIO_EVENTS" "compose_up:example.invalid/mpgs-server:sha-$new_sha"
+assert_event_contains_all "$SCENARIO_EVENTS" \
+  "compose_up:server=example.invalid/mpgs-server:sha-$new_sha" \
+  "web=example.invalid/mpgs-web:sha-$new_sha" 'mpgs-server' 'mpgs-worker' 'mpgs-web'
 assert_contains "$SCENARIO_EVENTS" 'restore_final:'
-assert_contains "$SCENARIO_EVENTS" 'compose_up:mpgs-rollback-server:'
-assert_before "$SCENARIO_EVENTS" 'final_backup:' "compose_up:example.invalid/mpgs-server:sha-$new_sha"
-assert_before "$SCENARIO_EVENTS" "compose_up:example.invalid/mpgs-server:sha-$new_sha" 'restore_final:'
-assert_before "$SCENARIO_EVENTS" 'restore_final:' 'compose_up:mpgs-rollback-server:'
+assert_event_contains_all "$SCENARIO_EVENTS" 'compose_up:server=mpgs-rollback-server:' \
+  'web=mpgs-rollback-web:' 'mpgs-server' 'mpgs-worker' 'mpgs-web'
+assert_before "$SCENARIO_EVENTS" 'final_backup:' \
+  "compose_up:server=example.invalid/mpgs-server:sha-$new_sha"
+assert_before "$SCENARIO_EVENTS" \
+  "compose_up:server=example.invalid/mpgs-server:sha-$new_sha" 'restore_final:'
+assert_before "$SCENARIO_EVENTS" 'restore_final:' 'compose_up:server=mpgs-rollback-server:'
 restore_event=$(grep -F 'restore_final:' "$SCENARIO_EVENTS" | head -n 1)
 case "$restore_event" in
   *pre-update-*.db) ;;
@@ -353,14 +373,19 @@ assert_contains "$SCENARIO_OUTPUT" 'Previous release restored.'
 rm -rf "$SCENARIO_FIXTURE"
 
 run_scenario health_timeout
-assert_contains "$SCENARIO_EVENTS" "compose_up:example.invalid/mpgs-server:sha-$new_sha"
+assert_event_contains_all "$SCENARIO_EVENTS" \
+  "compose_up:server=example.invalid/mpgs-server:sha-$new_sha" \
+  "web=example.invalid/mpgs-web:sha-$new_sha" 'mpgs-server' 'mpgs-worker' 'mpgs-web'
 assert_contains "$SCENARIO_EVENTS" 'curl:'
 assert_contains "$SCENARIO_EVENTS" 'restore_final:'
-assert_contains "$SCENARIO_EVENTS" 'compose_up:mpgs-rollback-server:'
-assert_before "$SCENARIO_EVENTS" 'final_backup:' "compose_up:example.invalid/mpgs-server:sha-$new_sha"
-assert_before "$SCENARIO_EVENTS" "compose_up:example.invalid/mpgs-server:sha-$new_sha" 'curl:'
+assert_event_contains_all "$SCENARIO_EVENTS" 'compose_up:server=mpgs-rollback-server:' \
+  'web=mpgs-rollback-web:' 'mpgs-server' 'mpgs-worker' 'mpgs-web'
+assert_before "$SCENARIO_EVENTS" 'final_backup:' \
+  "compose_up:server=example.invalid/mpgs-server:sha-$new_sha"
+assert_before "$SCENARIO_EVENTS" \
+  "compose_up:server=example.invalid/mpgs-server:sha-$new_sha" 'curl:'
 assert_before "$SCENARIO_EVENTS" 'curl:' 'restore_final:'
-assert_before "$SCENARIO_EVENTS" 'restore_final:' 'compose_up:mpgs-rollback-server:'
+assert_before "$SCENARIO_EVENTS" 'restore_final:' 'compose_up:server=mpgs-rollback-server:'
 assert_contains "$SCENARIO_OUTPUT" 'Deployment did not become healthy after 1 attempts:'
 assert_contains "$SCENARIO_OUTPUT" 'Previous release restored.'
 rm -rf "$SCENARIO_FIXTURE"
