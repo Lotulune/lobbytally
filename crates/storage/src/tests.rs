@@ -2612,6 +2612,84 @@ fn stale_pre_release_lifecycle_outranks_regular_store_backlog() {
 }
 
 #[test]
+fn released_search_rediscovery_promotes_undated_pre_release_refresh_once() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let (repo, clock) = repo_with_clock(10 * day_ms);
+    let upcoming_page = StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 4_001_890,
+            name: "How to Fish".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "undated-upcoming-search".into(),
+        sort: StoreSearchSort::ReleasedAsc,
+    };
+    repo.ingest_store_search_page(&upcoming_page).unwrap();
+
+    let coming_soon = RawResponse::validate(
+        200,
+        br#"{"4001890":{"success":true,"data":{"steam_appid":4001890,"type":"game","name":"How to Fish","is_free":true,"platforms":{"windows":true},"supported_languages":"English","release_date":{"coming_soon":true,"date":"Coming soon"}}}}"#
+            .to_vec(),
+        Some("application/json".into()),
+        4096,
+    )
+    .unwrap();
+    let parsed = parse_store_details(
+        &StoreDetailsRequest::with_locale(4_001_890, "CN", "schinese").unwrap(),
+        &coming_soon,
+    )
+    .unwrap();
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+
+    let store_only = crate::models::EnrichmentNeedFilter {
+        store: true,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: false,
+    };
+    assert!(
+        repo.list_enrichment_targets_after_filtered(10, None, "CN", "schinese", store_only)
+            .unwrap()
+            .is_empty()
+    );
+
+    clock.advance_ms(60 * 60 * 1_000);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: upcoming_page.candidates.clone(),
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "rediscovered-in-released-search".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
+    let due = repo
+        .list_enrichment_targets_after_filtered(10, None, "CN", "schinese", store_only)
+        .unwrap();
+    let target = due
+        .iter()
+        .find(|target| target.app_id == 4_001_890)
+        .expect("Released_DESC rediscovery must force an authoritative store refresh");
+    assert!(target.needs_store_details);
+
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+    assert!(
+        repo.list_enrichment_targets_after_filtered(10, None, "CN", "schinese", store_only)
+            .unwrap()
+            .is_empty(),
+        "the same Released_DESC signal must not cause repeated 6-hour polling after it was checked"
+    );
+}
+
+#[test]
 fn future_pre_release_refresh_does_not_get_p0_lifecycle_priority() {
     use crate::repo::PRICE_REFRESH_INTERVAL_MS;
 

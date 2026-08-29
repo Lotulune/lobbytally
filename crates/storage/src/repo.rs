@@ -588,8 +588,12 @@ impl Repository {
 
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "WITH candidates(app_id) AS (
-                     SELECT evidence.app_id
+                "WITH candidate_sources(app_id, released_search_seen_at_ms) AS (
+                     SELECT
+                         evidence.app_id,
+                         CASE WHEN evidence.source_type = 'store_search_category'
+                                   AND instr(evidence.value_json, '\"sort\":\"Released_DESC\"') > 0
+                              THEN evidence.observed_at_ms ELSE NULL END
                      FROM feature_evidence evidence
                           INDEXED BY idx_feature_evidence_enrichment_candidates
                      CROSS JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
@@ -597,8 +601,8 @@ impl Repository {
                        AND evidence.feature_name = 'category_hint'
                        AND evidence.is_active = 1
                        AND evidence.confidence >= 0.3
-                     UNION
-                     SELECT profile.app_id
+                     UNION ALL
+                     SELECT profile.app_id, NULL
                      FROM multiplayer_profiles profile
                      CROSS JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
@@ -611,6 +615,10 @@ impl Repository {
                            OR profile.crossplay IS NOT NULL
                            OR profile.recommended_max_players IS NOT NULL
                        )
+                 ), candidates(app_id, released_search_seen_at_ms) AS (
+                     SELECT app_id, MAX(released_search_seen_at_ms)
+                     FROM candidate_sources
+                     GROUP BY app_id
                  ), released_transitions AS (
                      SELECT app_id, MAX(observed_at_ms) AS released_at_ms
                      FROM release_events INDEXED BY idx_release_events_to_released
@@ -620,18 +628,40 @@ impl Repository {
                  ), due AS (
                      SELECT
                          candidates.app_id,
-                         CASE WHEN (
-                                    a.release_state IN ('upcoming', 'coming_soon', 'unknown')
-                                    AND a.release_date IS NOT NULL
-                                    AND a.release_date <= ?20
-                                  ) AND NOT EXISTS (
-                                      SELECT 1 FROM store_detail_refresh_state lifecycle_refresh
-                                      WHERE lifecycle_refresh.app_id = candidates.app_id
-                                        AND lifecycle_refresh.country_code = ?5
-                                        AND lifecycle_refresh.language = ?7
-                                        AND lifecycle_refresh.status IN ('succeeded', 'not_found')
-                                        AND lifecycle_refresh.store_checked_at_ms >= ?19
-                                  )
+                         CASE WHEN a.release_state IN ('upcoming', 'coming_soon', 'unknown')
+                                   AND (
+                                       (
+                                           a.release_date IS NOT NULL
+                                           AND a.release_date <= ?20
+                                           AND NOT EXISTS (
+                                               SELECT 1 FROM store_detail_refresh_state lifecycle_refresh
+                                               WHERE lifecycle_refresh.app_id = candidates.app_id
+                                                 AND lifecycle_refresh.country_code = ?5
+                                                 AND lifecycle_refresh.language = ?7
+                                                 AND lifecycle_refresh.status IN ('succeeded', 'not_found')
+                                                 AND lifecycle_refresh.store_checked_at_ms >= ?19
+                                           )
+                                       )
+                                       OR (
+                                           a.release_date IS NULL
+                                           AND (
+                                               a.release_state IN ('upcoming', 'coming_soon')
+                                               OR (
+                                                   a.release_state = 'unknown'
+                                                   AND NULLIF(trim(a.release_date_raw), '') IS NOT NULL
+                                               )
+                                           )
+                                           AND candidates.released_search_seen_at_ms IS NOT NULL
+                                           AND NOT EXISTS (
+                                               SELECT 1 FROM store_detail_refresh_state signal_refresh
+                                               WHERE signal_refresh.app_id = candidates.app_id
+                                                 AND signal_refresh.country_code = ?5
+                                                 AND signal_refresh.language = ?7
+                                                 AND signal_refresh.status IN ('succeeded', 'not_found')
+                                                 AND signal_refresh.store_checked_at_ms >= candidates.released_search_seen_at_ms
+                                           )
+                                       )
+                                   )
                               THEN 1 ELSE 0 END AS release_transition_overdue,
                           CASE WHEN (
                                      a.release_state IN ('upcoming', 'coming_soon')
@@ -666,6 +696,9 @@ impl Repository {
                                                   ) THEN CASE
                                                  WHEN a.release_date IS NOT NULL
                                                       AND a.release_date <= ?20 THEN ?19
+                                                 WHEN a.release_date IS NULL
+                                                      AND candidates.released_search_seen_at_ms IS NOT NULL
+                                                      THEN MAX(?4, candidates.released_search_seen_at_ms)
                                                  ELSE ?4
                                              END
                                              WHEN refresh.store_core_empty = 1 THEN ?18
