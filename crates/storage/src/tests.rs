@@ -2835,6 +2835,155 @@ fn release_transition_invalidates_prelaunch_review_and_ccu_snapshots() {
 }
 
 #[test]
+fn fresh_release_transition_outranks_popular_backlog_until_dynamic_data_arrives() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let now_ms = 10 * day_ms;
+    let released_at_ms = now_ms - 1_000;
+    let (repo, _) = repo_with_clock(now_ms);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 10,
+                name: "Fresh Launch".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 20,
+                name: "Popular Backlog".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "post-release-priority".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'released' WHERE app_id IN (10, 20)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO release_events (
+                     app_id, old_release_state, new_release_state, source, observed_at_ms
+                 ) VALUES (10, 'coming_soon', 'released', 'test', ?1)",
+                [released_at_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO review_snapshots (
+                     app_id, region_scope, language_scope, captured_at_ms,
+                     total_positive, total_negative, total_reviews, review_score,
+                     review_score_desc, wilson_lower, filter_offtopic_activity,
+                     parameter_hash, content_hash, source
+                 ) VALUES (20, 'all', 'all', 1, 9000, 1000, 10000, 8,
+                     'Very Positive', 0.9, 1, 'params', 'reviews', 'test')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO player_snapshots (
+                     app_id, captured_at_ms, player_count, result_code,
+                     missing_reason, content_hash, source
+                 ) VALUES (20, 1, 50000, 1, NULL, 'ccu', 'test')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO popular_review_refresh_state (
+                     app_id, captured_at_ms, result_count, source
+                 ) VALUES (20, 1, 10, 'test')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    for filter in [
+        crate::models::EnrichmentNeedFilter {
+            store: false,
+            reviews: true,
+            review_excerpts: false,
+            ccu: false,
+            price: false,
+            media_backfill: false,
+            english_name: false,
+        },
+        crate::models::EnrichmentNeedFilter {
+            store: false,
+            reviews: false,
+            review_excerpts: true,
+            ccu: false,
+            price: false,
+            media_backfill: false,
+            english_name: false,
+        },
+        crate::models::EnrichmentNeedFilter {
+            store: false,
+            reviews: false,
+            review_excerpts: false,
+            ccu: true,
+            price: false,
+            media_backfill: false,
+            english_name: false,
+        },
+    ] {
+        let targets = repo
+            .list_enrichment_targets_after_filtered(1, Some(0), "CN", "schinese", filter)
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].app_id, 10);
+    }
+
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO review_snapshots (
+                     app_id, region_scope, language_scope, captured_at_ms,
+                     total_positive, total_negative, total_reviews, review_score,
+                     review_score_desc, wilson_lower, filter_offtopic_activity,
+                     parameter_hash, content_hash, source
+                 ) VALUES (10, 'all', 'all', ?1, 1, 0, 1, 9,
+                     'Positive', 1.0, 1, 'params', 'fresh-reviews', 'test')",
+                [now_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO player_snapshots (
+                     app_id, captured_at_ms, player_count, result_code,
+                     missing_reason, content_hash, source
+                 ) VALUES (10, ?1, 1, 1, NULL, 'fresh-ccu', 'test')",
+                [now_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO popular_review_refresh_state (
+                     app_id, captured_at_ms, result_count, source
+                 ) VALUES (10, ?1, 0, 'test')",
+                [now_ms],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let targets = repo
+        .list_enrichment_targets_after_filtered(
+            1,
+            Some(0),
+            "CN",
+            "schinese",
+            crate::models::EnrichmentNeedFilter {
+                store: false,
+                reviews: true,
+                review_excerpts: false,
+                ccu: false,
+                price: false,
+                media_backfill: false,
+                english_name: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].app_id, 20);
+}
+
+#[test]
 fn enrichment_targets_prioritize_apps_missing_the_most_dynamic_dimensions() {
     let (repo, _) = repo_with_clock(10 * 24 * 60 * 60 * 1_000);
     repo.ingest_store_search_page(&StoreSearchPage {
