@@ -2984,6 +2984,77 @@ fn fresh_release_transition_outranks_popular_backlog_until_dynamic_data_arrives(
 }
 
 #[test]
+fn post_release_dynamic_backlog_uses_cursor_fairness_before_popularity() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let now_ms = 10 * day_ms;
+    let released_at_ms = now_ms - 1_000;
+    let (repo, _) = repo_with_clock(now_ms);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 10,
+                name: "Popular Fresh Launch".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 20,
+                name: "Zero Signal Fresh Launch".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "post-release-cursor-fairness".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'released' WHERE app_id IN (10, 20)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO release_events (
+                     app_id, old_release_state, new_release_state, source, observed_at_ms
+                 ) VALUES
+                     (10, 'coming_soon', 'released', 'test', ?1),
+                     (20, 'coming_soon', 'released', 'test', ?1)",
+                [released_at_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO player_snapshots (
+                     app_id, captured_at_ms, player_count, result_code,
+                     missing_reason, content_hash, source
+                 ) VALUES (10, 1, 50000, 1, NULL, 'old-popular-ccu', 'test')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let review_only = crate::models::EnrichmentNeedFilter {
+        store: false,
+        reviews: true,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: false,
+    };
+    let targets = repo
+        .list_enrichment_targets_after_filtered(1, Some(10), "CN", "schinese", review_only)
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].app_id, 20);
+
+    let wrapped = repo
+        .list_enrichment_targets_after_filtered(1, Some(20), "CN", "schinese", review_only)
+        .unwrap();
+    assert_eq!(wrapped.len(), 1);
+    assert_eq!(wrapped[0].app_id, 10);
+}
+
+#[test]
 fn enrichment_targets_prioritize_apps_missing_the_most_dynamic_dimensions() {
     let (repo, _) = repo_with_clock(10 * 24 * 60 * 60 * 1_000);
     repo.ingest_store_search_page(&StoreSearchPage {
