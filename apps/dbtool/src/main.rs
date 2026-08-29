@@ -15,11 +15,12 @@ use mpgs_ai::{EmbeddingInput, embedding_provider_from_env, encode_f32_le};
 use mpgs_steam_source::{
     APP_LIST_ADAPTER_VERSION, APP_LIST_MAX_RESULTS, APP_LIST_SOURCE_NAME, AppListCursor,
     AppListRequest, CcuRequest, DEFAULT_STORE_COUNTRY, DEFAULT_STORE_LANGUAGE, DEFAULT_USER_AGENT,
-    GoldenSet, RawResponse, ReviewSummaryRequest, STEAM_STORE_HOST, STEAM_WEB_API_HOST,
-    STORE_ADAPTER_VERSION, STORE_SEARCH_ADAPTER_VERSION, STORE_SEARCH_SOURCE_NAME,
-    STORE_SOURCE_NAME, SourceError, StoreDetailsRequest, StoreSearchPage, StoreSearchRequest,
-    StoreSearchSort, apply_page_to_cursor, http_not_found_proposal, parse_app_list_page, parse_ccu,
-    parse_popular_reviews, parse_review_summary, parse_store_details, parse_store_search_page,
+    GoldenSet, RawResponse, ReleaseStateProposal, ReviewSummaryRequest, STEAM_STORE_HOST,
+    STEAM_WEB_API_HOST, STORE_ADAPTER_VERSION, STORE_SEARCH_ADAPTER_VERSION,
+    STORE_SEARCH_SOURCE_NAME, STORE_SOURCE_NAME, SourceError, StoreDetailsRequest, StoreSearchPage,
+    StoreSearchRequest, StoreSearchSort, apply_page_to_cursor, http_not_found_proposal,
+    parse_app_list_page, parse_ccu, parse_popular_reviews, parse_review_summary,
+    parse_store_details, parse_store_search_page,
 };
 use mpgs_storage::{
     Clock, Database, EnrichmentNeedFilter, HASH_EMBED_MODEL, MediaCoverageStats, PutEmbedding,
@@ -2822,9 +2823,30 @@ fn enrich_steam_candidates(
     for (index, target) in targets.iter().enumerate() {
         stats.apps_attempted = stats.apps_attempted.saturating_add(1);
         let mut app_ok = 0_i64;
+        let mut effective_target = *target;
 
         // Price/media come from appdetails; re-fetch store when those dimensions are due.
         if !skip_store && target.needs_store_fetch() {
+            // Dynamic needs are calculated before this appdetails request. If
+            // the request itself observes the pre-release -> released
+            // transition, force the first launch reviews/CCU in this same
+            // pass instead of sending the app back through the general
+            // enrichment backlog.
+            let was_released = match repo.get_app(target.app_id) {
+                Ok(Some(app)) => app.release_state == "released",
+                Ok(None) => false,
+                Err(error) => {
+                    // Conservatively treat an unavailable pre-fetch state as
+                    // not released. A false positive only performs an extra
+                    // dynamic refresh; a false negative can recreate release
+                    // starvation.
+                    eprintln!(
+                        "warn app_id={} release_state_probe: {}",
+                        target.app_id, error
+                    );
+                    false
+                }
+            };
             if target.needs_media_backfill {
                 let _ = repo.begin_media_backfill_attempt(target.app_id);
             }
@@ -2836,9 +2858,17 @@ fn enrich_steam_candidates(
                 language,
                 &mut stats,
             ) {
-                Ok(StoreDetailsOutcome::Ingested { media_unusable }) => {
+                Ok(StoreDetailsOutcome::Ingested {
+                    media_unusable,
+                    released,
+                }) => {
                     stats.store_ok = stats.store_ok.saturating_add(1);
                     app_ok = app_ok.saturating_add(1);
+                    effective_target = promote_release_transition_dynamic_needs(
+                        effective_target,
+                        was_released,
+                        released,
+                    );
                     if target.needs_media_backfill {
                         let has_media = repo.app_has_media_assets(target.app_id).unwrap_or(false);
                         let outcome = if has_media {
@@ -2908,7 +2938,7 @@ fn enrich_steam_candidates(
             }
         }
 
-        if target.needs_reviews && !skip_reviews {
+        if effective_target.needs_reviews && !skip_reviews {
             match enrich_reviews(&client, repo, target.app_id, &mut stats) {
                 Ok(()) => {
                     stats.reviews_ok = stats.reviews_ok.saturating_add(1);
@@ -2925,7 +2955,7 @@ fn enrich_steam_candidates(
             thread::sleep(Duration::from_millis(inter_request_ms));
         }
 
-        if target.needs_review_excerpts && !skip_reviews {
+        if effective_target.needs_review_excerpts && !skip_reviews {
             match enrich_popular_reviews(&client, repo, target.app_id, &mut stats) {
                 Ok(()) => {
                     stats.popular_reviews_ok = stats.popular_reviews_ok.saturating_add(1);
@@ -2942,7 +2972,7 @@ fn enrich_steam_candidates(
             thread::sleep(Duration::from_millis(inter_request_ms));
         }
 
-        if target.needs_ccu && !skip_ccu {
+        if effective_target.needs_ccu && !skip_ccu {
             match enrich_ccu(&client, repo, target.app_id, &mut stats) {
                 Ok(()) => {
                     stats.ccu_ok = stats.ccu_ok.saturating_add(1);
@@ -2959,7 +2989,9 @@ fn enrich_steam_candidates(
             // CCU uses the separate Steam Web API host. When this app also had
             // Store work, the preceding Store delay already spaces the next
             // appdetails request. Preserve pacing for CCU-only refresh passes.
-            if !(target.needs_store_fetch() || target.needs_reviews || target.needs_review_excerpts)
+            if !(target.needs_store_fetch()
+                || effective_target.needs_reviews
+                || effective_target.needs_review_excerpts)
             {
                 thread::sleep(Duration::from_millis(inter_request_ms));
             }
@@ -3014,8 +3046,24 @@ struct SoftEnrichError {
 }
 
 enum StoreDetailsOutcome {
-    Ingested { media_unusable: bool },
+    Ingested {
+        media_unusable: bool,
+        released: bool,
+    },
     NotFound,
+}
+
+fn promote_release_transition_dynamic_needs(
+    mut target: mpgs_storage::EnrichmentTarget,
+    was_released: bool,
+    store_reports_released: bool,
+) -> mpgs_storage::EnrichmentTarget {
+    if store_reports_released && !was_released {
+        target.needs_reviews = true;
+        target.needs_review_excerpts = true;
+        target.needs_ccu = true;
+    }
+    target
 }
 
 fn enrich_store_details(
@@ -3057,6 +3105,7 @@ fn enrich_store_details(
     let media_unusable = (parsed.details.screenshots.is_none()
         && media_stats.screenshots_rejected > 0)
         || (parsed.details.movies.is_none() && media_stats.movies_rejected > 0);
+    let released = parsed.details.release_state == ReleaseStateProposal::Released;
     if media_stats.screenshots_rejected > 0
         || media_stats.movies_rejected > 0
         || media_stats.urls_rejected > 0
@@ -3074,7 +3123,10 @@ fn enrich_store_details(
         );
     }
     persist_with_retry(|| repo.ingest_store_details(&parsed.details, &parsed.relations))?;
-    Ok(StoreDetailsOutcome::Ingested { media_unusable })
+    Ok(StoreDetailsOutcome::Ingested {
+        media_unusable,
+        released,
+    })
 }
 
 /// Fetch English store name into `app_localizations` for dual-name search.
@@ -3851,6 +3903,37 @@ mod tests {
         assert!(target.needs_ccu);
         assert!(!target.needs_media_backfill);
         assert!(!target.needs_english_name);
+    }
+
+    #[test]
+    fn store_release_transition_promotes_dynamic_work_in_the_same_pass() {
+        let pre_release_target = mpgs_storage::EnrichmentTarget {
+            app_id: 4001890,
+            needs_store_details: true,
+            needs_reviews: false,
+            needs_review_excerpts: false,
+            needs_ccu: false,
+            needs_price: false,
+            needs_media_backfill: false,
+            needs_english_name: false,
+        };
+
+        let promoted = promote_release_transition_dynamic_needs(pre_release_target, false, true);
+        assert!(promoted.needs_reviews);
+        assert!(promoted.needs_review_excerpts);
+        assert!(promoted.needs_ccu);
+
+        let already_released =
+            promote_release_transition_dynamic_needs(pre_release_target, true, true);
+        assert!(!already_released.needs_reviews);
+        assert!(!already_released.needs_review_excerpts);
+        assert!(!already_released.needs_ccu);
+
+        let still_pre_release =
+            promote_release_transition_dynamic_needs(pre_release_target, false, false);
+        assert!(!still_pre_release.needs_reviews);
+        assert!(!still_pre_release.needs_review_excerpts);
+        assert!(!still_pre_release.needs_ccu);
     }
 
     #[test]

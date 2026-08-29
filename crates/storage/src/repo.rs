@@ -828,6 +828,12 @@ impl Repository {
                  ORDER BY
                      release_transition_overdue DESC,
                      post_release_dynamic_overdue DESC,
+                     CASE
+                         WHEN post_release_dynamic_overdue = 1 AND app_id > ?6 THEN 0
+                         WHEN post_release_dynamic_overdue = 1 THEN 1
+                         ELSE 0
+                     END,
+                     CASE WHEN post_release_dynamic_overdue = 1 THEN app_id END ASC,
                      CASE WHEN (needs_reviews = 1 AND ?9 = 1)
                                   OR (needs_review_excerpts = 1 AND ?10 = 1)
                          THEN last_known_ccu ELSE 0 END DESC,
