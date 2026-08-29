@@ -30,6 +30,10 @@ use std::{
 pub const REVIEW_REFRESH_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub const CCU_REFRESH_INTERVAL_MS: i64 = 2 * 24 * 60 * 60 * 1_000;
 pub const PRICE_REFRESH_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
+/// Once a known release date has arrived, lifecycle state is substantially
+/// more important than ordinary price/media freshness. Recheck Steam on a
+/// short cadence until the app transitions to `released`.
+pub const RELEASE_TRANSITION_REFRESH_INTERVAL_MS: i64 = 6 * 60 * 60 * 1_000;
 pub const STORE_EMPTY_RETRY_INTERVAL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 pub const ENGLISH_NAME_RETRY_INTERVAL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const MEDIA_BACKFILL_CLAIM_TIMEOUT_MS: i64 = 5 * 60 * 1_000;
@@ -552,8 +556,10 @@ impl Repository {
         let review_cutoff = now.saturating_sub(REVIEW_REFRESH_INTERVAL_MS);
         let ccu_cutoff = now.saturating_sub(CCU_REFRESH_INTERVAL_MS);
         let price_cutoff = now.saturating_sub(PRICE_REFRESH_INTERVAL_MS);
+        let release_transition_cutoff = now.saturating_sub(RELEASE_TRANSITION_REFRESH_INTERVAL_MS);
         let store_empty_cutoff = now.saturating_sub(STORE_EMPTY_RETRY_INTERVAL_MS);
         let english_name_cutoff = now.saturating_sub(ENGLISH_NAME_RETRY_INTERVAL_MS);
+        let today = crate::util::day_utc_from_ms(now);
         let after_app_id = i64::from(after_app_id.unwrap_or(0));
         let country_code = country_code.trim().to_ascii_uppercase();
         let language = language.trim().to_ascii_lowercase();
@@ -582,8 +588,12 @@ impl Repository {
 
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "WITH candidates(app_id) AS (
-                     SELECT evidence.app_id
+                "WITH candidate_sources(app_id, released_search_seen_at_ms) AS (
+                     SELECT
+                         evidence.app_id,
+                         CASE WHEN evidence.source_type = 'store_search_category'
+                                   AND instr(evidence.value_json, '\"sort\":\"Released_DESC\"') > 0
+                              THEN evidence.observed_at_ms ELSE NULL END
                      FROM feature_evidence evidence
                           INDEXED BY idx_feature_evidence_enrichment_candidates
                      CROSS JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
@@ -591,8 +601,8 @@ impl Repository {
                        AND evidence.feature_name = 'category_hint'
                        AND evidence.is_active = 1
                        AND evidence.confidence >= 0.3
-                     UNION
-                     SELECT profile.app_id
+                     UNION ALL
+                     SELECT profile.app_id, NULL
                      FROM multiplayer_profiles profile
                      CROSS JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
@@ -605,11 +615,63 @@ impl Repository {
                            OR profile.crossplay IS NOT NULL
                            OR profile.recommended_max_players IS NOT NULL
                        )
+                 ), candidates(app_id, released_search_seen_at_ms) AS (
+                     SELECT app_id, MAX(released_search_seen_at_ms)
+                     FROM candidate_sources
+                     GROUP BY app_id
+                 ), released_transitions AS (
+                     SELECT app_id, MAX(observed_at_ms) AS released_at_ms
+                     FROM release_events INDEXED BY idx_release_events_to_released
+                     WHERE new_release_state = 'released'
+                       AND old_release_state <> 'released'
+                     GROUP BY app_id
                  ), due AS (
                      SELECT
                          candidates.app_id,
+                         CASE WHEN a.release_state IN ('upcoming', 'coming_soon', 'unknown')
+                                   AND (
+                                       (
+                                           a.release_date IS NOT NULL
+                                           AND a.release_date <= ?20
+                                           AND NOT EXISTS (
+                                               SELECT 1 FROM store_detail_refresh_state lifecycle_refresh
+                                               WHERE lifecycle_refresh.app_id = candidates.app_id
+                                                 AND lifecycle_refresh.country_code = ?5
+                                                 AND lifecycle_refresh.language = ?7
+                                                 AND lifecycle_refresh.status IN ('succeeded', 'not_found')
+                                                 AND lifecycle_refresh.store_checked_at_ms >= ?19
+                                           )
+                                       )
+                                       OR (
+                                           a.release_date IS NULL
+                                           AND (
+                                               a.release_state IN ('upcoming', 'coming_soon')
+                                               OR (
+                                                   a.release_state = 'unknown'
+                                                   AND NULLIF(trim(a.release_date_raw), '') IS NOT NULL
+                                               )
+                                           )
+                                           AND candidates.released_search_seen_at_ms IS NOT NULL
+                                           AND NOT EXISTS (
+                                               SELECT 1 FROM store_detail_refresh_state signal_refresh
+                                               WHERE signal_refresh.app_id = candidates.app_id
+                                                 AND signal_refresh.country_code = ?5
+                                                 AND signal_refresh.language = ?7
+                                                 AND signal_refresh.status IN ('succeeded', 'not_found')
+                                                 AND signal_refresh.store_checked_at_ms >= candidates.released_search_seen_at_ms
+                                           )
+                                       )
+                                   )
+                              THEN 1 ELSE 0 END AS release_transition_overdue,
                           CASE WHEN (
                                      a.release_state IN ('upcoming', 'coming_soon')
+                                     OR (
+                                         a.release_state = 'unknown'
+                                         AND (
+                                             a.release_date IS NOT NULL
+                                             OR NULLIF(trim(a.release_date_raw), '') IS NOT NULL
+                                         )
+                                     )
                                      OR COALESCE(v.platforms_json, '[]') = '[]'
                                      OR COALESCE(v.languages_json, '[]') = '[]'
                                     OR NOT EXISTS (
@@ -624,7 +686,21 @@ impl Repository {
                                         AND refresh.language = ?7
                                         AND refresh.status IN ('succeeded', 'not_found')
                                          AND refresh.store_checked_at_ms >= CASE
-                                             WHEN a.release_state IN ('upcoming', 'coming_soon') THEN ?4
+                                             WHEN a.release_state IN ('upcoming', 'coming_soon')
+                                                  OR (
+                                                      a.release_state = 'unknown'
+                                                      AND (
+                                                          a.release_date IS NOT NULL
+                                                          OR NULLIF(trim(a.release_date_raw), '') IS NOT NULL
+                                                      )
+                                                  ) THEN CASE
+                                                 WHEN a.release_date IS NOT NULL
+                                                      AND a.release_date <= ?20 THEN ?19
+                                                 WHEN a.release_date IS NULL
+                                                      AND candidates.released_search_seen_at_ms IS NOT NULL
+                                                      THEN MAX(?4, candidates.released_search_seen_at_ms)
+                                                 ELSE ?4
+                                             END
                                              WHEN refresh.store_core_empty = 1 THEN ?18
                                              ELSE ?4
                                          END
@@ -633,17 +709,23 @@ impl Repository {
                          CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM review_snapshots review
                              WHERE review.app_id = candidates.app_id
-                               AND review.captured_at_ms >= ?2
+                               AND review.captured_at_ms >= MAX(
+                                   ?2, COALESCE(released_transition.released_at_ms, 0)
+                               )
                          ) THEN 1 ELSE 0 END AS needs_reviews,
                          CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM popular_review_refresh_state review
                              WHERE review.app_id = candidates.app_id
-                               AND review.captured_at_ms >= ?2
+                               AND review.captured_at_ms >= MAX(
+                                   ?2, COALESCE(released_transition.released_at_ms, 0)
+                               )
                          ) THEN 1 ELSE 0 END AS needs_review_excerpts,
                          CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM player_snapshots player
                              WHERE player.app_id = candidates.app_id
-                               AND player.captured_at_ms >= ?3
+                               AND player.captured_at_ms >= MAX(
+                                   ?3, COALESCE(released_transition.released_at_ms, 0)
+                               )
                          ) THEN 1 ELSE 0 END AS needs_ccu,
                          CASE WHEN NOT EXISTS (
                              SELECT 1 FROM price_snapshots price
@@ -709,6 +791,8 @@ impl Repository {
                      LEFT JOIN app_availability v ON v.app_id = candidates.app_id
                      LEFT JOIN app_media_backfill_state backfill
                          ON backfill.app_id = candidates.app_id
+                     LEFT JOIN released_transitions released_transition
+                         ON released_transition.app_id = candidates.app_id
                  )
                  SELECT
                      app_id, needs_store_details, needs_reviews, needs_review_excerpts,
@@ -722,6 +806,7 @@ impl Repository {
                     OR (needs_media_backfill = 1 AND ?13 = 1)
                     OR (needs_english_name = 1 AND ?16 = 1)
                  ORDER BY
+                     release_transition_overdue DESC,
                      CASE WHEN (needs_reviews = 1 AND ?9 = 1)
                                   OR (needs_review_excerpts = 1 AND ?10 = 1)
                          THEN last_known_ccu ELSE 0 END DESC,
@@ -760,6 +845,8 @@ impl Repository {
                     want_english_name,
                     english_name_cutoff,
                     store_empty_cutoff,
+                    release_transition_cutoff,
+                    today,
                 ],
                 |row| {
                     Ok(EnrichmentTarget {

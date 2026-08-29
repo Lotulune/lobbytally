@@ -1388,6 +1388,10 @@ fn integrated_ingestion_retry_delay_ms(category: &str, stage_attempts: i64) -> i
     WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent)
 }
 
+fn integrated_stage_is_dynamic(stage: &str) -> bool {
+    matches!(stage, "review_summary" | "popular_reviews" | "ccu")
+}
+
 fn process_integrated_game_ingestion_with(
     repo: &Repository,
     owner: &str,
@@ -1418,6 +1422,25 @@ fn process_integrated_game_ingestion_with(
                     repo.advance_game_ingestion_stage(task.app_id, owner)
                 })?;
                 continue;
+            }
+
+            // A pre-release Steam app cannot provide meaningful launch reviews
+            // or CCU yet. Mark those first-ingestion stages complete without a
+            // network request; steady-state enrichment will run them as soon as
+            // store_details records the transition to `released`.
+            if integrated_stage_is_dynamic(&task.stage) {
+                let explicitly_pre_release = repo
+                    .get_app(task.app_id)
+                    .map_err(worker_storage_error)?
+                    .is_some_and(|app| {
+                        matches!(app.release_state.as_str(), "upcoming" | "coming_soon")
+                    });
+                if explicitly_pre_release {
+                    task = worker_storage_with_retry(|| {
+                        repo.advance_game_ingestion_stage(task.app_id, owner)
+                    })?;
+                    continue;
+                }
             }
 
             match run_stage(task.app_id, &task.stage) {
@@ -3846,6 +3869,15 @@ mod tests {
         };
         repo.ingest_store_search_page_and_queue_new_games(&page)
             .unwrap();
+        repo.database()
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    "UPDATE apps SET release_state = 'released' WHERE app_id = 632360",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
         let mut calls = Vec::new();
         let mut fail_review_once = true;
@@ -3884,6 +3916,47 @@ mod tests {
                 (632360, "ccu".into()),
             ]
         );
+        assert!(repo.pending_game_ingestion_app_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn integrated_ingestion_skips_dynamic_stages_until_release() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let repo = Repository::new(db);
+        let page = StoreSearchPage {
+            candidates: vec![mpgs_steam_source::StoreSearchCandidate {
+                app_id: 4001890,
+                name: "How to Fish".into(),
+            }],
+            start: 0,
+            result_count: 1,
+            total_count: 1,
+            content_hash: "pre-release-ingestion-fixture".into(),
+            sort: StoreSearchSort::ReleasedAsc,
+        };
+        repo.ingest_store_search_page_and_queue_new_games(&page)
+            .unwrap();
+        repo.database()
+            .with_conn_mut(|conn| {
+                conn.execute(
+                    "UPDATE apps SET release_state = 'coming_soon' WHERE app_id = 4001890",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut calls = Vec::new();
+        let stats =
+            process_integrated_game_ingestion_with(&repo, "worker-a", 1, |app_id, stage| {
+                calls.push((app_id, stage.to_owned()));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(stats.completed_apps, 1);
+        assert_eq!(calls, vec![(4001890, "store_details".into())]);
         assert!(repo.pending_game_ingestion_app_ids().unwrap().is_empty());
     }
 
