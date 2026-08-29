@@ -208,6 +208,13 @@ Backup API，但只执行有界的结构/schema 校验，不在公网停机窗�
 脚本会保留失败数据库副本、恢复这个停服后的精确回滚快照，并把旧容器的精确本地
 image ID 临时标记为标准回滚镜像引用后自动重启，避免依赖已经移动的旧 tag。
 
+注意：systemd 的 `ExecStart` 指向**当前工作树**里的 `deploy/update.sh`，而源码
+fast-forward 发生在容器和数据库都验证成功之后。因此，如果某个 release 本身修改了
+`deploy/update.sh`，该 release 的首次切换仍由升级前版本的 updater 完成；新 updater
+从下一次部署周期才开始生效。修改 updater 后必须安排后续 release 做一次真实生产切换
+验收，不能把“修改 updater 的那次 rollout”当作新逻辑已执行的证据。验收时应同时记录
+旧 SHA 最后一次 200、新 SHA 第一次 200，以及两者之间真实的 502 窗口。
+
 更新器在任何停服动作前获取主机级非阻塞 `flock`；定时任务与手工触发重叠时，后到
 实例会退出并把控制权留给已经运行的部署。生产手工触发应优先执行
 `sudo systemctl start mpgs-update.service`，并用 `journalctl -u mpgs-update.service`
