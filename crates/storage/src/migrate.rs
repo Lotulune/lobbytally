@@ -154,6 +154,11 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[
         "0030_worker_candidate_scope_index",
         include_str!("../../../migrations/0030_worker_candidate_scope_index.sql"),
     ),
+    (
+        31,
+        "0031_release_transition_refresh",
+        include_str!("../../../migrations/0031_release_transition_refresh.sql"),
+    ),
 ];
 
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {
@@ -496,6 +501,31 @@ mod tests {
         assert!(
             evidence_scan < app_lookup,
             "partial evidence index must drive the candidate join: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn released_transition_lookup_uses_partial_index() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate_to_latest(&mut conn, 1).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT app_id, MAX(observed_at_ms)
+                 FROM release_events INDEXED BY idx_release_events_to_released
+                 WHERE new_release_state = 'released'
+                   AND old_release_state <> 'released'
+                 GROUP BY app_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_release_events_to_released")),
+            "released transition lookup did not use partial index: {plan:?}"
         );
     }
 
