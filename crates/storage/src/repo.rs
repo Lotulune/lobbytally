@@ -1583,6 +1583,10 @@ impl Repository {
         backup::backup_to_path(&self.db, dest)
     }
 
+    pub fn backup_to_quiesced(&self, dest: impl AsRef<Path>) -> StorageResult<()> {
+        backup::backup_to_path_quiesced(&self.db, dest)
+    }
+
     pub fn restore_backup(
         backup_path: impl AsRef<Path>,
         dest_path: impl AsRef<Path>,

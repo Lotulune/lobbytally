@@ -197,12 +197,16 @@ Schema 30 另增加 `idx_feature_evidence_enrichment_candidates` 部分索引；
 配置并拉取两个对应的 `sha-*` 镜像；镜像、数据库与健康检查全部成功后才把源码
 fast-forward 到同一 SHA。更新器从临时副本运行，因此源码切换不会替换执行中的
 脚本；旧、新 Compose 快照共用显式项目名但分开执行，失败时源码仍停留在旧提交，
-旧镜像也只由旧 Compose 配置恢复。切换前脚本停止 Web/worker/server 写入，使用
-**当前旧镜像**中的 `mpgs-dbtool`
-生成并验证 `deploy/runtime/backups/pre-update-*.db`。新版本必须同时通过数据库
-完整性、readiness、`/v1/meta.build_git_sha` 和 worker 健康检查；任一失败时，脚本会
-保留失败数据库副本、恢复升级前备份，并把旧容器的精确本地 image ID 临时标记为
-标准回滚镜像引用后自动重启，避免依赖已经移动的旧 tag。
+旧镜像也只由旧 Compose 配置恢复。数据库备份采用两阶段切换：首先在旧版本仍在线时，
+使用**当前旧镜像**中的 `mpgs-dbtool backup` 生成临时 Online Backup，并完成完整
+`integrity_check`；只有该预检成功后才停止 Web/worker/server。停服后先回收 worker
+租约，再用 `mpgs-dbtool backup-quiesced` 生成真正的
+`deploy/runtime/backups/pre-update-*.db` 回滚点。该最终快照仍使用 SQLite Online
+Backup API，但只执行有界的结构/schema 校验，不在公网停机窗口重复 O(database size)
+完整性扫描。它包含预检结束后、正式停服前已接受的所有写入以及 lease recovery 写入。
+新版本必须通过 readiness、`/v1/meta.build_git_sha` 和 worker 健康检查；任一失败时，
+脚本会保留失败数据库副本、恢复这个停服后的精确回滚快照，并把旧容器的精确本地
+image ID 临时标记为标准回滚镜像引用后自动重启，避免依赖已经移动的旧 tag。
 
 更新器在任何停服动作前获取主机级非阻塞 `flock`；定时任务与手工触发重叠时，后到
 实例会退出并把控制权留给已经运行的部署。生产手工触发应优先执行
@@ -212,6 +216,9 @@ fast-forward 到同一 SHA。更新器从临时副本运行，因此源码切换
 成功部署后更新器默认只保留最近 3 份 `pre-update-*.db`，可在 `deploy/.env` 中用
 `MPGS_BACKUP_RETENTION_COUNT` 调整（范围 `1..100`）。`MPGS_DEPLOY_HEALTH_TIMEOUT_SECS`
 默认 600 秒，用于低配主机上的一次性迁移/索引构建；它不会改变 systemd 的总超时。
+`MPGS_DEPLOY_QUIESCED_BACKUP_TIMEOUT_SECS` 默认 300 秒，只限制停服后的最终一致性快照；
+超时会放弃本次升级并重启旧版本。成功切换后 updater 会输出实测 `Public cutover window`
+秒数，生产验收应记录该值而不是用整个 update service 运行时长代替用户可见停机时间。
 
 PR 2 镜像部署并稳定观察新游入库至少 24 小时后，先保持所有应用 writer 停止并验证
 最新备份，再从同一 immutable server 镜像运行存量清理 dry-run：

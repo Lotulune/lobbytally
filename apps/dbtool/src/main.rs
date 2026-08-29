@@ -1145,6 +1145,28 @@ fn run() -> Result<(), String> {
             println!("backed up {} -> {}", db_path.display(), out_path.display());
             Ok(())
         }
+        "backup-quiesced" => {
+            let db_path = required_path(args.next(), "--db path")?;
+            let out_path = required_path(args.next(), "--out path")?;
+            if args.next().is_some() {
+                return Err("backup-quiesced accepts only db-path and backup-path".into());
+            }
+            let db = Database::open(&db_path).map_err(err)?;
+            // Deployment-only fast path: update.sh has already produced a
+            // fully verified online backup before stopping writers. Keep this
+            // final exact rollback snapshot bounded by avoiding another full
+            // integrity scan inside the public cutover window. Do not require
+            // the source to match this binary's latest schema: the command is
+            // intentionally used before the new release performs migrations.
+            let repo = Repository::new(db);
+            repo.backup_to_quiesced(&out_path).map_err(err)?;
+            println!(
+                "quiesced backup {} -> {}",
+                db_path.display(),
+                out_path.display()
+            );
+            Ok(())
+        }
         "restore" => {
             let backup_path = required_path(args.next(), "--from path")?;
             let dest_path = required_path(args.next(), "--to path")?;
@@ -3517,6 +3539,7 @@ fn usage() -> &'static str {
        run-steam-worker-once <db-path> [job-limit=1] [enrich-limit=100]\n\
        import-golden-profiles <db-path>\n\
        backup <db-path> <backup-path>\n\
+       backup-quiesced <db-path> <backup-path>\n\
        restore <backup-path> <dest-db-path>\n\n\
      Enrichment environment:\n\
        MPGS_STEAM_WEB_API_KEY (required by collect-steam-catalog; server-side only)\n\

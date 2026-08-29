@@ -41,8 +41,17 @@ old_compose_file=
 release_compose_file=
 new_compose_file=
 rollback_armed=0
+quiesced_backup_container=
 
 cleanup_temp_files() {
+  if [ -n "${quiesced_backup_container:-}" ]; then
+    docker rm -f "$quiesced_backup_container" >/dev/null 2>&1 || true
+    quiesced_backup_container=
+  fi
+  if [ "${preflight_backup_created:-0}" -eq 1 ] \
+    && command -v cleanup_preflight_backup >/dev/null 2>&1; then
+    cleanup_preflight_backup || true
+  fi
   if [ -n "${release_compose_file:-}" ]; then
     rm -f -- "$release_compose_file"
   fi
@@ -84,6 +93,7 @@ branch=${MPGS_DEPLOY_BRANCH:-main}
 mode=${MPGS_DEPLOY_MODE:-full}
 backup_retention_count=${MPGS_BACKUP_RETENTION_COUNT:-3}
 health_timeout_secs=${MPGS_DEPLOY_HEALTH_TIMEOUT_SECS:-600}
+quiesced_backup_timeout_secs=${MPGS_DEPLOY_QUIESCED_BACKUP_TIMEOUT_SECS:-300}
 
 require_bounded_positive_integer() {
   name=$1
@@ -105,6 +115,8 @@ require_bounded_positive_integer MPGS_BACKUP_RETENTION_COUNT \
   "$backup_retention_count" 100
 require_bounded_positive_integer MPGS_DEPLOY_HEALTH_TIMEOUT_SECS \
   "$health_timeout_secs" 3600
+require_bounded_positive_integer MPGS_DEPLOY_QUIESCED_BACKUP_TIMEOUT_SECS \
+  "$quiesced_backup_timeout_secs" 3600
 
 case "$mode" in
   backend)
@@ -476,6 +488,41 @@ restart_previous_release() {
 
 backup_rel=
 backup_created=0
+preflight_backup_rel=
+preflight_backup_created=0
+quiesce_started_epoch=0
+
+cleanup_preflight_backup() {
+  [ "$preflight_backup_created" -eq 1 ] || return 0
+  [ -n "$preflight_backup_rel" ] || return 0
+  [ -n "$old_server_image" ] || return 0
+  case "$preflight_backup_rel" in
+    backups/.preflight-*.db) ;;
+    *)
+      printf 'Refusing to remove unexpected preflight backup path: %s\n' \
+        "$preflight_backup_rel" >&2
+      return 1
+      ;;
+  esac
+  if docker run --rm --user 0:0 --network none --read-only \
+    --entrypoint /bin/sh \
+    --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs" \
+    "$old_server_image" \
+    -c 'rm -f -- "/var/lib/mpgs/$1"' sh "$preflight_backup_rel"; then
+    preflight_backup_created=0
+    return 0
+  fi
+  return 1
+}
+
+report_quiesce_window() {
+  [ "$quiesce_started_epoch" -gt 0 ] || return 0
+  quiesce_finished_epoch=$(date +%s)
+  quiesce_elapsed_secs=$((quiesce_finished_epoch - quiesce_started_epoch))
+  printf 'Public cutover window: %ss (quiesced backup timeout: %ss).\n' \
+    "$quiesce_elapsed_secs" "$quiesced_backup_timeout_secs"
+  quiesce_started_epoch=0
+}
 
 # The init container deliberately makes the bind-mounted runtime private to the
 # in-container mpgs user. The host deployment user may therefore be unable to
@@ -501,9 +548,45 @@ case "$runtime_db_state" in
 esac
 
 if [ -n "$old_server_container" ]; then
-  # Quiesce every writer before the backup so rollback cannot lose requests
-  # accepted between an online backup and container replacement.
+  if [ "$runtime_db_state" = present ]; then
+    if ! command -v timeout >/dev/null 2>&1; then
+      printf 'timeout is required to bound the quiesced backup window.\n' >&2
+      exit 2
+    fi
+    old_short=unknown
+    if validate_release_sha "$old_release_sha" >/dev/null 2>&1; then
+      old_short=$(printf '%s' "$old_release_sha" | cut -c1-12)
+    fi
+    backup_rel="backups/pre-update-${timestamp}-${old_short}-$$.db"
+    preflight_backup_rel="backups/.preflight-${timestamp}-${old_short}-$$.db"
+    if ! docker run --rm --user 0:0 \
+      --entrypoint /bin/sh \
+      --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs" \
+      "$old_server_image" \
+      -c 'install -d -o mpgs -g mpgs -m 0750 /var/lib/mpgs/backups'; then
+      printf 'Could not prepare the backup directory; leaving the current deployment online.\n' >&2
+      exit 1
+    fi
+    # Perform the expensive Online Backup + full integrity_check while the old
+    # release still serves traffic. This proves the current source and backup
+    # path are healthy without spending O(database size) verification time in
+    # the public cutover window.
+    if ! docker run --rm \
+      --entrypoint /usr/local/bin/mpgs-dbtool \
+      --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs" \
+      "$old_server_image" \
+      backup /var/lib/mpgs/mpgs.db "/var/lib/mpgs/$preflight_backup_rel"; then
+      printf 'Online preflight backup failed; leaving the current deployment online.\n' >&2
+      exit 1
+    fi
+    preflight_backup_created=1
+  fi
+
+  # The verified preflight above may be older than writes accepted while it
+  # ran, so it is never the rollback point. Quiesce writers only now, recover
+  # any worker lease writes, then take one exact final SQLite snapshot.
   rollback_armed=1
+  quiesce_started_epoch=$(date +%s)
   if ! old_compose stop $stop_services; then
     rollback_armed=0
     printf 'Could not stop the current deployment cleanly; restoring its service set.\n' >&2
@@ -525,33 +608,25 @@ if [ -n "$old_server_container" ]; then
     fi
   fi
   if [ "$runtime_db_state" = present ]; then
-    old_short=unknown
-    if validate_release_sha "$old_release_sha" >/dev/null 2>&1; then
-      old_short=$(printf '%s' "$old_release_sha" | cut -c1-12)
-    fi
-    backup_rel="backups/pre-update-${timestamp}-${old_short}-$$.db"
-    if ! docker run --rm --user 0:0 \
-      --entrypoint /bin/sh \
-      --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs" \
-      "$old_server_image" \
-      -c 'install -d -o mpgs -g mpgs -m 0750 /var/lib/mpgs/backups'; then
-      printf 'Could not prepare the backup directory; restarting the previous release.\n' >&2
-      restart_previous_release || true
-      exit 1
-    fi
-    if ! docker run --rm \
+    quiesced_backup_container="mpgs-backup-cutover-${timestamp}-$$"
+    if ! timeout "$quiesced_backup_timeout_secs" docker run \
+      --name "$quiesced_backup_container" --rm \
       --entrypoint /usr/local/bin/mpgs-dbtool \
       --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs" \
-      "$old_server_image" \
-      backup /var/lib/mpgs/mpgs.db "/var/lib/mpgs/$backup_rel"; then
-      printf 'Pre-upgrade backup failed; restarting the previous release.\n' >&2
+      "$new_server_image" \
+      backup-quiesced /var/lib/mpgs/mpgs.db "/var/lib/mpgs/$backup_rel"; then
+      docker rm -f "$quiesced_backup_container" >/dev/null 2>&1 || true
+      quiesced_backup_container=
+      printf 'Quiesced rollback snapshot failed or exceeded %ss; restarting the previous release.\n' \
+        "$quiesced_backup_timeout_secs" >&2
       restart_previous_release || true
       exit 1
     fi
-    # `backup` verifies the temporary database before publishing the final file;
-    # the command's source probe is intentionally lightweight because all
-    # application writers are already quiesced here.
+    quiesced_backup_container=
     backup_created=1
+    if ! cleanup_preflight_backup; then
+      printf 'Warning: could not remove the verified online preflight backup.\n' >&2
+    fi
   fi
 elif [ "$runtime_db_state" = present ]; then
   printf 'Database exists but mpgs-server is not running; refusing an unbacked upgrade.\n' >&2
@@ -648,6 +723,7 @@ if ! validate_deployment; then
   rollback || true
   exit 1
 fi
+report_quiesce_window
 
 if [ "$advance_source" -eq 1 ]; then
   # Only advance the checkout after the exact target Compose configuration and
