@@ -663,6 +663,26 @@ impl Repository {
                                        )
                                    )
                               THEN 1 ELSE 0 END AS release_transition_overdue,
+                         CASE WHEN a.release_state = 'released'
+                                   AND released_transition.released_at_ms IS NOT NULL
+                                   AND (
+                                       (?9 = 1 AND NOT EXISTS (
+                                           SELECT 1 FROM review_snapshots post_release_review
+                                           WHERE post_release_review.app_id = candidates.app_id
+                                             AND post_release_review.captured_at_ms >= released_transition.released_at_ms
+                                       ))
+                                       OR (?10 = 1 AND NOT EXISTS (
+                                           SELECT 1 FROM popular_review_refresh_state post_release_excerpt
+                                           WHERE post_release_excerpt.app_id = candidates.app_id
+                                             AND post_release_excerpt.captured_at_ms >= released_transition.released_at_ms
+                                       ))
+                                       OR (?11 = 1 AND NOT EXISTS (
+                                           SELECT 1 FROM player_snapshots post_release_player
+                                           WHERE post_release_player.app_id = candidates.app_id
+                                             AND post_release_player.captured_at_ms >= released_transition.released_at_ms
+                                       ))
+                                   )
+                              THEN 1 ELSE 0 END AS post_release_dynamic_overdue,
                           CASE WHEN (
                                      a.release_state IN ('upcoming', 'coming_soon')
                                      OR (
@@ -807,6 +827,7 @@ impl Repository {
                     OR (needs_english_name = 1 AND ?16 = 1)
                  ORDER BY
                      release_transition_overdue DESC,
+                     post_release_dynamic_overdue DESC,
                      CASE WHEN (needs_reviews = 1 AND ?9 = 1)
                                   OR (needs_review_excerpts = 1 AND ?10 = 1)
                          THEN last_known_ccu ELSE 0 END DESC,

@@ -159,6 +159,19 @@ struct EnrichmentQuota {
     limit: u32,
 }
 
+fn forced_app_enrichment_target(app_id: u32) -> mpgs_storage::EnrichmentTarget {
+    mpgs_storage::EnrichmentTarget {
+        app_id,
+        needs_store_details: true,
+        needs_reviews: true,
+        needs_review_excerpts: true,
+        needs_ccu: true,
+        needs_price: true,
+        needs_media_backfill: false,
+        needs_english_name: false,
+    }
+}
+
 fn enrichment_quota_plan(
     limit: u32,
     filter: EnrichmentNeedFilter,
@@ -855,16 +868,7 @@ fn run() -> Result<(), String> {
                     )),
                 )
                 .map_err(err)?;
-            let target = mpgs_storage::EnrichmentTarget {
-                app_id,
-                needs_store_details: true,
-                needs_reviews: false,
-                needs_review_excerpts: false,
-                needs_ccu: false,
-                needs_price: true,
-                needs_media_backfill: false,
-                needs_english_name: false,
-            };
+            let target = forced_app_enrichment_target(app_id);
             match enrich_steam_candidates(&repo, &[target], &country_code, &language, Some(run_id))
             {
                 Ok(stats) => {
@@ -3835,6 +3839,19 @@ fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_app_enrichment_repairs_all_launch_dynamic_dimensions() {
+        let target = forced_app_enrichment_target(4001890);
+        assert_eq!(target.app_id, 4001890);
+        assert!(target.needs_store_details);
+        assert!(target.needs_price);
+        assert!(target.needs_reviews);
+        assert!(target.needs_review_excerpts);
+        assert!(target.needs_ccu);
+        assert!(!target.needs_media_backfill);
+        assert!(!target.needs_english_name);
+    }
 
     #[test]
     fn controlled_deploy_lease_recovery_supports_the_pre_queue_schema() {
