@@ -306,20 +306,7 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
-          case "$BEFORE_SHA" in
-            0000000000000000000000000000000000000000)
-              runtime_changed=true
-              ;;
-            *)
-              if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
-                git fetch --no-tags --depth=1 origin "$BEFORE_SHA"
-              fi
-              runtime_changed=$(
-                git diff --name-only "$BEFORE_SHA" "$RELEASE_SHA" -- \
-                  | sh scripts/release_scope.sh
-              )
-              ;;
-          esac
+          runtime_changed=$(sh scripts/release_scope_from_git.sh "$BEFORE_SHA" "$RELEASE_SHA")
           case "$runtime_changed" in
             true|false) ;;
             *)

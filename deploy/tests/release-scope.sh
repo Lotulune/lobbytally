@@ -3,6 +3,7 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 classifier="$repo_root/scripts/release_scope.sh"
+git_classifier="$repo_root/scripts/release_scope_from_git.sh"
 
 scope() {
   printf '%s\n' "$@" | sh "$classifier" 2>/dev/null
@@ -50,5 +51,50 @@ expect_scope true deploy/mpgs-web.nginx.conf
 # Mixed changes and newly introduced/unclassified paths fail safe to release.
 expect_scope true docs/OPERATIONS.md crates/domain/src/lib.rs
 expect_scope true future-production-input.bin
+
+fixture=$(mktemp -d)
+trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+git -C "$fixture" init -q
+git -C "$fixture" config user.name release-scope-test
+git -C "$fixture" config user.email release-scope-test@example.invalid
+
+mkdir -p "$fixture/docs" "$fixture/deploy"
+printf 'baseline\n' >"$fixture/docs/notes.md"
+printf 'runtime\n' >"$fixture/deploy/update.sh"
+git -C "$fixture" add .
+git -C "$fixture" commit -qm baseline
+baseline=$(git -C "$fixture" rev-parse HEAD)
+
+# A docs-only commit stays non-runtime.
+printf 'docs only\n' >>"$fixture/docs/notes.md"
+git -C "$fixture" add docs/notes.md
+git -C "$fixture" commit -qm docs-only
+docs_commit=$(git -C "$fixture" rev-parse HEAD)
+actual=$(CDPATH= cd -- "$fixture" && sh "$git_classifier" "$baseline" "$docs_commit" 2>/dev/null)
+[ "$actual" = false ] || {
+  printf 'git release scope should ignore docs-only commit, got %s\n' "$actual" >&2
+  exit 1
+}
+
+# Renaming a production path into an exempt directory must still release. The
+# --no-renames diff exposes the deleted deploy/update.sh path as well as the
+# new docs path.
+git -C "$fixture" mv deploy/update.sh docs/old-update.sh
+git -C "$fixture" commit -qm rename-runtime-into-docs
+rename_commit=$(git -C "$fixture" rev-parse HEAD)
+actual=$(CDPATH= cd -- "$fixture" && sh "$git_classifier" "$docs_commit" "$rename_commit" 2>/dev/null)
+[ "$actual" = true ] || {
+  printf 'runtime-to-docs rename must release, got %s\n' "$actual" >&2
+  exit 1
+}
+
+# Missing history/fetch errors must also fail safe to publishing. The fixture
+# intentionally has no origin remote.
+actual=$(CDPATH= cd -- "$fixture" && sh "$git_classifier" \
+  1111111111111111111111111111111111111111 "$rename_commit" 2>/dev/null)
+[ "$actual" = true ] || {
+  printf 'missing previous SHA must fail safe to release, got %s\n' "$actual" >&2
+  exit 1
+}
 
 printf 'release scope tests passed\n'
