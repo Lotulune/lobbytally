@@ -10,9 +10,39 @@ use crate::db::Database;
 use crate::error::{StorageError, StorageResult};
 use crate::migrate;
 
-/// Online backup of the active database into `dest_path`.
+/// Online backup of the active database into `dest_path` with a full integrity
+/// verification before the file is published.
 pub fn backup_to_path(db: &Database, dest_path: impl AsRef<Path>) -> StorageResult<()> {
+    backup_to_path_with_verification(db, dest_path, BackupVerification::Full)
+}
+
+/// Consistent SQLite snapshot intended for a deployment cutover after the same
+/// source database has already passed a fully verified online backup.
+///
+/// This deliberately avoids `PRAGMA integrity_check`, which is O(database
+/// size), and instead performs bounded structural/schema checks. The caller
+/// must quiesce every writer before invoking this path so the resulting
+/// snapshot is the exact rollback point for the cutover.
+pub fn backup_to_path_quiesced(db: &Database, dest_path: impl AsRef<Path>) -> StorageResult<()> {
+    backup_to_path_with_verification(db, dest_path, BackupVerification::Structural)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BackupVerification {
+    Full,
+    Structural,
+}
+
+fn backup_to_path_with_verification(
+    db: &Database,
+    dest_path: impl AsRef<Path>,
+    verification: BackupVerification,
+) -> StorageResult<()> {
     let dest_path = dest_path.as_ref();
+    let source_schema_version = match verification {
+        BackupVerification::Full => None,
+        BackupVerification::Structural => Some(db.schema_version()?),
+    };
     prepare_destination(dest_path, "backup")?;
     let mut temporary = TemporaryDatabase::create_for(dest_path)?;
 
@@ -26,7 +56,13 @@ pub fn backup_to_path(db: &Database, dest_path: impl AsRef<Path>) -> StorageResu
         }
         Ok(())
     })?;
-    verify_backup_source(temporary.path())?;
+    match verification {
+        BackupVerification::Full => verify_backup_source(temporary.path())?,
+        BackupVerification::Structural => verify_backup_structure(
+            temporary.path(),
+            source_schema_version.expect("structural backup source version"),
+        )?,
+    }
     temporary.publish_noclobber(dest_path, "backup")
 }
 
@@ -94,6 +130,19 @@ fn verify_backup_source(path: &Path) -> StorageResult<()> {
     if checks != ["ok".to_owned()] {
         return Err(StorageError::migration(format!(
             "backup integrity_check failed: {checks:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_backup_structure(path: &Path, expected_schema_version: i64) -> StorageResult<()> {
+    let conn = open_readonly(path)?;
+    let value: i64 = conn.query_row("SELECT 1", [], |row| row.get(0))?;
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let version = migrate::current_version(&conn)?;
+    if value != 1 || page_count <= 0 || version != expected_schema_version {
+        return Err(StorageError::migration(format!(
+            "backup structural verification failed: value={value} page_count={page_count} schema_version={version} expected_schema_version={expected_schema_version}"
         )));
     }
     Ok(())
@@ -236,6 +285,66 @@ mod tests {
         accounts::{RegisterAccount, register_account},
         users,
     };
+
+    #[test]
+    fn quiesced_snapshot_captures_writes_after_verified_preflight() {
+        let directory = tempfile::tempdir().unwrap();
+        let live_path = directory.path().join("live.db");
+        let preflight_path = directory.path().join("preflight.db");
+        let final_path = directory.path().join("final.db");
+        let live = Database::open(&live_path).unwrap();
+        live.migrate().unwrap();
+        live.with_conn_mut(|conn| {
+            conn.execute_batch(
+                "CREATE TABLE deployment_backup_probe (value INTEGER NOT NULL);\n\
+                 INSERT INTO deployment_backup_probe (value) VALUES (1);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        backup_to_path(&live, &preflight_path).unwrap();
+        live.with_conn_mut(|conn| {
+            conn.execute("INSERT INTO deployment_backup_probe (value) VALUES (2)", [])?;
+            Ok(())
+        })
+        .unwrap();
+        backup_to_path_quiesced(&live, &final_path).unwrap();
+
+        let preflight = open_readonly(&preflight_path).unwrap();
+        let final_snapshot = open_readonly(&final_path).unwrap();
+        let preflight_rows: i64 = preflight
+            .query_row("SELECT COUNT(*) FROM deployment_backup_probe", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let final_rows: i64 = final_snapshot
+            .query_row("SELECT COUNT(*) FROM deployment_backup_probe", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(preflight_rows, 1);
+        assert_eq!(final_rows, 2);
+        verify_backup_source(&final_path).unwrap();
+    }
+
+    #[test]
+    fn quiesced_snapshot_preserves_pre_upgrade_schema_without_migrating_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let live_path = directory.path().join("old-schema.db");
+        let final_path = directory.path().join("old-schema-final.db");
+        let live = Database::open(&live_path).unwrap();
+        let old_version = migrate::latest_version() - 1;
+        live.with_conn_mut(|conn| migrate::migrate_to(conn, old_version, 1))
+            .unwrap();
+
+        backup_to_path_quiesced(&live, &final_path).unwrap();
+
+        assert_eq!(live.schema_version().unwrap(), old_version);
+        let copied = open_readonly(&final_path).unwrap();
+        assert_eq!(migrate::current_version(&copied).unwrap(), old_version);
+        verify_backup_source(&final_path).unwrap();
+    }
 
     #[test]
     fn restored_database_invalidates_account_and_anonymous_tokens() {
