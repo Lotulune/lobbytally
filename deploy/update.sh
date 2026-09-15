@@ -41,9 +41,21 @@ old_compose_file=
 release_compose_file=
 new_compose_file=
 rollback_armed=0
+web_rollback_armed=0
 quiesced_backup_container=
+preflight_backup_container=
+preflight_backup_pid=
 
 cleanup_temp_files() {
+  if [ -n "${preflight_backup_container:-}" ]; then
+    docker rm -f "$preflight_backup_container" >/dev/null 2>&1 || true
+    preflight_backup_container=
+  fi
+  if [ -n "${preflight_backup_pid:-}" ]; then
+    kill "$preflight_backup_pid" >/dev/null 2>&1 || true
+    wait "$preflight_backup_pid" >/dev/null 2>&1 || true
+    preflight_backup_pid=
+  fi
   if [ -n "${quiesced_backup_container:-}" ]; then
     docker rm -f "$quiesced_backup_container" >/dev/null 2>&1 || true
     quiesced_backup_container=
@@ -65,6 +77,9 @@ cleanup_temp_files() {
 
 handle_signal() {
   trap - HUP INT TERM
+  if [ "${web_rollback_armed:-0}" -eq 1 ]; then
+    rollback_web_only || true
+  fi
   if [ "${rollback_armed:-0}" -eq 1 ]; then
     rollback_armed=0
     if command -v rollback >/dev/null 2>&1; then
@@ -94,6 +109,11 @@ mode=${MPGS_DEPLOY_MODE:-full}
 backup_retention_count=${MPGS_BACKUP_RETENTION_COUNT:-3}
 health_timeout_secs=${MPGS_DEPLOY_HEALTH_TIMEOUT_SECS:-600}
 quiesced_backup_timeout_secs=${MPGS_DEPLOY_QUIESCED_BACKUP_TIMEOUT_SECS:-300}
+preflight_backup_timeout_secs=${MPGS_DEPLOY_PREFLIGHT_BACKUP_TIMEOUT_SECS:-1800}
+case "${MPGS_DEPLOY_FORCE_FULL:-0}" in
+  0|1) ;;
+  *) printf 'MPGS_DEPLOY_FORCE_FULL must be 0 or 1.\n' >&2; exit 2 ;;
+esac
 
 require_bounded_positive_integer() {
   name=$1
@@ -117,6 +137,8 @@ require_bounded_positive_integer MPGS_DEPLOY_HEALTH_TIMEOUT_SECS \
   "$health_timeout_secs" 3600
 require_bounded_positive_integer MPGS_DEPLOY_QUIESCED_BACKUP_TIMEOUT_SECS \
   "$quiesced_backup_timeout_secs" 3600
+require_bounded_positive_integer MPGS_DEPLOY_PREFLIGHT_BACKUP_TIMEOUT_SECS \
+  "$preflight_backup_timeout_secs" 2700
 
 case "$mode" in
   backend)
@@ -324,12 +346,12 @@ deployment_healthcheck() {
     return 1
   fi
   if ! printf '%s' "$meta" \
-    | grep -F "\"build_git_sha\":\"$release_sha\"" >/dev/null; then
+    | grep -F "\"build_git_sha\":\"${health_release_sha:-$release_sha}\"" >/dev/null; then
     # The old service set has already been stopped before the replacement is
     # started, so a responsive endpoint with another immutable revision cannot
     # become the requested release by waiting. Distinguish this fatal mismatch
     # from temporary startup/worker-health failures.
-    deployment_health_detail="metadata does not report target revision ${release_sha}"
+    deployment_health_detail="metadata does not report expected backend revision ${health_release_sha:-$release_sha}"
     return 2
   fi
   worker_health_result=0
@@ -393,6 +415,7 @@ advance_source_checkout() {
     # The source and validated deployment now point at the same immutable SHA;
     # a later signal must not roll containers back behind the checkout.
     rollback_armed=0
+    web_rollback_armed=0
   else
     transition_result=1
   fi
@@ -486,6 +509,91 @@ restart_previous_release() {
   old_compose up -d --no-build --pull never --remove-orphans $old_services
 }
 
+can_update_web_only() {
+  [ "$mode" = full ] || return 1
+  [ "${MPGS_DEPLOY_FORCE_FULL:-0}" != 1 ] || return 1
+  [ -n "$old_web_image_id" ] && [ -n "$old_worker_image_id" ] || return 1
+  validate_release_sha "$old_release_sha" >/dev/null 2>&1 || return 1
+  # Compare with the actually running backend, not the checkout or previous
+  # Web revision. Unknown/build/container/backend changes always take the full
+  # database-safe path. Disable renames so removed server paths stay visible.
+  changed_paths=$(git diff --no-renames --name-only "$old_release_sha" "$release_sha" --) \
+    || return 1
+  has_web_change=0
+  while IFS= read -r changed_path; do
+    case "$changed_path" in
+      web/*) has_web_change=1 ;;
+      README.md|CHANGELOG.md|docs/*|.github/workflows/ci.yml|deploy/tests/*|deploy/update.sh|scripts/release_scope.sh|scripts/release_scope_from_git.sh) ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$changed_paths
+EOF
+  [ "$has_web_change" -eq 1 ]
+}
+
+rollback_web_only() {
+  web_rollback_armed=0
+  export MPGS_SERVER_IMAGE="$old_server_image"
+  export MPGS_WEB_IMAGE="$old_web_image"
+  printf 'Web-only validation failed; restoring the previous Web image.\n' >&2
+  old_compose up -d --no-deps --no-build --pull never mpgs-web
+}
+
+web_only_healthcheck() {
+  deployment_healthcheck new_compose || return $?
+  running_web=$(new_compose ps -q mpgs-web) || return 1
+  [ -n "$running_web" ] || return 1
+  running_web_image=$(docker inspect --format '{{.Image}}' "$running_web") || return 1
+  [ "$running_web_image" = "$target_web_image_id" ] || return 1
+  curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+    "http://127.0.0.1:${health_port}/" >/dev/null || return 1
+}
+
+if can_update_web_only; then
+  health_release_sha=$old_release_sha
+  # A broken backend must not be hidden by a successful frontend replacement.
+  if ! retry_deployment_healthcheck old_compose 5 2; then
+    printf 'Backend is not healthy; refusing a Web-only update.\n' >&2
+    exit 1
+  fi
+  target_web_image_id=$(docker image inspect --format '{{.Id}}' "$new_web_image")
+  if [ -z "$target_web_image_id" ]; then
+    printf 'Cannot identify the target Web image; refusing the update.\n' >&2
+    exit 1
+  fi
+  export MPGS_SERVER_IMAGE="$old_server_image"
+  export MPGS_WEB_IMAGE="$new_web_image"
+  web_rollback_armed=1
+  # --no-deps is essential: never restart server/worker/init or touch SQLite.
+  if ! new_compose up -d --no-deps --no-build --pull never mpgs-web; then
+    rollback_web_only || true
+    exit 1
+  fi
+  web_attempt=0
+  web_healthy=0
+  while [ "$web_attempt" -lt 30 ]; do
+    if web_only_healthcheck; then
+      web_healthy=1
+      break
+    fi
+    web_attempt=$((web_attempt + 1))
+    sleep 2
+  done
+  if [ "$web_healthy" -ne 1 ]; then
+    rollback_web_only || true
+    exit 1
+  fi
+  if ! advance_source_checkout; then
+    rollback_web_only || true
+    exit 1
+  fi
+  web_rollback_armed=0
+  printf 'Web-only deployment healthy: web=%s backend=%s; database and worker unchanged.\n' \
+    "$release_sha" "$old_release_sha"
+  exit 0
+fi
+
 backup_rel=
 backup_created=0
 preflight_backup_rel=
@@ -571,15 +679,27 @@ if [ -n "$old_server_container" ]; then
     # release still serves traffic. This proves the current source and backup
     # path are healthy without spending O(database size) verification time in
     # the public cutover window.
-    if ! docker run --rm \
+    # Wait on a background child so TERM interrupts the shell immediately and
+    # the EXIT trap can remove the named container even during verification.
+    preflight_backup_container="mpgs-backup-preflight-${timestamp}-$$"
+    printf 'Starting online backup and full verification (timeout: %ss).\n' \
+      "$preflight_backup_timeout_secs"
+    timeout --kill-after=10 "$preflight_backup_timeout_secs" docker run \
+      --name "$preflight_backup_container" --rm \
       --entrypoint /usr/local/bin/mpgs-dbtool \
       --mount "type=bind,src=$runtime_dir,dst=/var/lib/mpgs" \
       "$old_server_image" \
-      backup /var/lib/mpgs/mpgs.db "/var/lib/mpgs/$preflight_backup_rel"; then
-      printf 'Online preflight backup failed; leaving the current deployment online.\n' >&2
+      backup /var/lib/mpgs/mpgs.db "/var/lib/mpgs/$preflight_backup_rel" &
+    preflight_backup_pid=$!
+    if ! wait "$preflight_backup_pid"; then
+      printf 'Online preflight backup failed or exceeded %ss; leaving the current deployment online.\n' \
+        "$preflight_backup_timeout_secs" >&2
       exit 1
     fi
+    preflight_backup_pid=
+    preflight_backup_container=
     preflight_backup_created=1
+    printf 'Online backup and full verification completed.\n'
   fi
 
   # The verified preflight above may be older than writes accepted while it
