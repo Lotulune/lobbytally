@@ -27,6 +27,9 @@ expect_scope false apps/desktop/src-tauri/tauri.conf.json e2e-tests/package.json
 expect_scope false packaging/linux/install.sh scripts/package_server.ps1
 expect_scope false deploy/.env.example deploy/mpgs-update.service deploy/mpgs-host.nginx.conf
 expect_scope false README.md .gitignore rustfmt.toml
+expect_scope false README.en.md
+expect_scope false README.md README.en.md docs/images/lobbytally-feed-zh.png
+expect_scope true README.en.md web/src/App.tsx
 
 # Every file that can change the server/web images or automatic host cutover
 # remains release-scoped.
@@ -65,9 +68,10 @@ git -C "$fixture" add .
 git -C "$fixture" commit -qm baseline
 baseline=$(git -C "$fixture" rev-parse HEAD)
 
-# A docs-only commit stays non-runtime.
+# A docs-only commit including a new English README stays non-runtime.
 printf 'docs only\n' >>"$fixture/docs/notes.md"
-git -C "$fixture" add docs/notes.md
+printf 'English documentation\n' >"$fixture/README.en.md"
+git -C "$fixture" add docs/notes.md README.en.md
 git -C "$fixture" commit -qm docs-only
 docs_commit=$(git -C "$fixture" rev-parse HEAD)
 actual=$(CDPATH= cd -- "$fixture" && sh "$git_classifier" "$baseline" "$docs_commit" 2>/dev/null)
