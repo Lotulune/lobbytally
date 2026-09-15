@@ -197,7 +197,13 @@ Schema 30 另增加 `idx_feature_evidence_enrichment_candidates` 部分索引；
 配置并拉取两个对应的 `sha-*` 镜像；镜像、数据库与健康检查全部成功后才把源码
 fast-forward 到同一 SHA。更新器从临时副本运行，因此源码切换不会替换执行中的
 脚本；旧、新 Compose 快照共用显式项目名但分开执行，失败时源码仍停留在旧提交，
-旧镜像也只由旧 Compose 配置恢复。数据库备份采用两阶段切换：首先在旧版本仍在线时，
+旧镜像也只由旧 Compose 配置恢复。
+
+`full` 模式会先比较**实际运行的后端镜像版本**与目标版本。仅有 `web/` 改动，加上明确列出的文档、CI 门禁、部署测试或更新器文件时，更新器只替换 `mpgs-web`，使用 `--no-deps` 保持 API、worker、init 和数据库不变。构建输入、Compose、数据库迁移、后端文件、任何未知路径发生变化，或 Git 历史无法读取时，均回到完整备份部署；`MPGS_DEPLOY_FORCE_FULL=1` 可强制完整部署。
+
+仅前端发布同时校验 Web 容器的实际 image ID、首页、API readiness、API 原版本 SHA 和 worker 健康；失败只回退旧 Web 镜像。此时 `/v1/meta.build_git_sha` 表示仍在运行的后端版本，Web 的版本以容器镜像 revision 为准，两者可以不同。日志会同时打印 `web=... backend=...`。后续发布仍从实际后端版本比较，不能只比较上次 Web 发布或源码 checkout，以免漏掉后端变化。
+
+完整部署的数据库备份采用两阶段切换：首先在旧版本仍在线时，
 使用**当前旧镜像**中的 `mpgs-dbtool backup` 生成临时 Online Backup，并完成完整
 `integrity_check`；只有该预检成功后才停止 Web/worker/server。停服后先回收 worker
 租约，再用 `mpgs-dbtool backup-quiesced` 生成真正的
@@ -216,8 +222,9 @@ image ID 临时标记为标准回滚镜像引用后自动重启，避免依赖�
 成功部署后更新器默认只保留最近 3 份 `pre-update-*.db`，可在 `deploy/.env` 中用
 `MPGS_BACKUP_RETENTION_COUNT` 调整（范围 `1..100`）。`MPGS_DEPLOY_HEALTH_TIMEOUT_SECS`
 默认 600 秒，用于低配主机上的一次性迁移/索引构建；它不会改变 systemd 的总超时。
-`MPGS_DEPLOY_QUIESCED_BACKUP_TIMEOUT_SECS` 默认 300 秒，只限制停服后的最终一致性快照；
-超时会放弃本次升级并重启旧版本。成功切换后 updater 会输出实测 `Public cutover window`
+`MPGS_DEPLOY_QUIESCED_BACKUP_TIMEOUT_SECS` 默认 300 秒，只限制停服后的最终一致性快照，超时会放弃本次升级并重启旧版本。
+`MPGS_DEPLOY_PREFLIGHT_BACKUP_TIMEOUT_SECS` 默认 1800 秒（最大 2700），单独限制在线预检并为总超时内的清理预留时间。在线备份使用有名容器，超时、失败或收到终止信号时清理该容器，保持旧版本在线；不会把仍在校验的临时文件当成已验证备份。
+完整部署成功切换后 updater 会输出实测 `Public cutover window`
 秒数，生产验收应记录该值而不是用整个 update service 运行时长代替用户可见停机时间。
 
 main 分支仍对每次 push 执行常规 CI，但 `release-main` 只在生产 runtime 路径发生变化时

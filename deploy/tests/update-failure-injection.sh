@@ -69,6 +69,18 @@ if [ "${1:-}" = rev-parse ] && [ "${2:-}" = --is-inside-work-tree ]; then
   printf 'true\n'
   exit 0
 fi
+if [ "${1:-}" = diff ]; then
+  case "$FAKE_SCENARIO" in
+    web_missing_history) exit 128 ;;
+    web_container_change) printf 'web/src/App.tsx\ndeploy/docker-compose.yml\n' ;;
+    web_build_change) printf 'web/src/App.tsx\nDockerfile\n' ;;
+    web_backend_change) printf 'web/src/App.tsx\ncrates/storage/src/db.rs\n' ;;
+    web_unknown_change) printf 'web/src/App.tsx\nnew-runtime-input\n' ;;
+    web_*) printf 'web/src/App.tsx\ndocs/OPERATIONS.md\ndeploy/update.sh\n' ;;
+    *) printf 'crates/storage/src/db.rs\n' ;;
+  esac
+  exit 0
+fi
 printf 'unexpected fake git invocation: %s\n' "$*" >&2
 exit 97
 EOF
@@ -80,7 +92,12 @@ write_fake_timeout() {
   cat >"$path" <<'EOF'
 #!/bin/sh
 set -eu
+case "${1:-}" in --kill-after=*) shift ;; esac
 shift
+if [ "$FAKE_SCENARIO" = preflight_timeout ]; then
+  printf 'preflight_timeout\n' >>"$FAKE_EVENTS"
+  exit 124
+fi
 exec "$@"
 EOF
   chmod +x "$path"
@@ -105,7 +122,15 @@ if [ "$FAKE_SCENARIO" = health_timeout ]; then
   exit 22
 fi
 case "$*" in
-  */v1/meta*) printf '{"build_git_sha":"%s"}\n' "$FAKE_NEW_SHA" ;;
+  */v1/meta*)
+    case "$FAKE_SCENARIO" in
+      web_*) printf '{"build_git_sha":"%s"}\n' "$FAKE_OLD_SHA" ;;
+      *) printf '{"build_git_sha":"%s"}\n' "$FAKE_NEW_SHA" ;;
+    esac
+    ;;
+  *18082/)
+    [ "$FAKE_SCENARIO" != web_health_failure ] || exit 22
+    ;;
 esac
 exit 0
 EOF
@@ -149,7 +174,14 @@ case "$verb" in
       *'{{.Image}}'*)
         case "$container" in
           old-server|old-worker) printf 'sha256:old-server-image\n' ;;
-          old-web) printf 'sha256:old-web-image\n' ;;
+          old-web)
+            if [ "$FAKE_SCENARIO" != web_wrong_image ] \
+              && grep -F "web=example.invalid/mpgs-web:sha-$FAKE_NEW_SHA" "$FAKE_EVENTS" >/dev/null; then
+              printf 'sha256:new-web-image\n'
+            else
+              printf 'sha256:old-web-image\n'
+            fi
+            ;;
           *) printf 'sha256:unknown\n' ;;
         esac
         ;;
@@ -161,6 +193,10 @@ case "$verb" in
     exit 0
     ;;
   image)
+    if [ "${2:-}" = inspect ]; then
+      printf 'sha256:new-web-image\n'
+      exit 0
+    fi
     event "image:${2:-}:${3:-}:${4:-}"
     exit 0
     ;;
@@ -192,6 +228,15 @@ case "$verb" in
         ;;
       up)
         event "compose_up:server=${MPGS_SERVER_IMAGE:-unset}:web=${MPGS_WEB_IMAGE:-unset}:services=$*"
+        if [ "$FAKE_SCENARIO" = web_signal ] \
+          && [ "${MPGS_WEB_IMAGE:-}" = "example.invalid/mpgs-web:sha-$FAKE_NEW_SHA" ]; then
+          kill -TERM "$PPID"
+          exit 143
+        fi
+        if [ "$FAKE_SCENARIO" = web_up_failure ] \
+          && [ "${MPGS_WEB_IMAGE:-}" = "example.invalid/mpgs-web:sha-$FAKE_NEW_SHA" ]; then
+          exit 1
+        fi
         case "${MPGS_SERVER_IMAGE:-}" in
           *":sha-$FAKE_NEW_SHA")
             if [ "$FAKE_SCENARIO" = new_up_failure ]; then
@@ -234,9 +279,10 @@ case "$verb" in
         ;;
       *' backup /var/lib/mpgs/mpgs.db '*'.preflight-'*)
         event "preflight_backup:$args"
-        if [ "$FAKE_SCENARIO" = preflight_failure ]; then
-          exit 1
-        fi
+        case "$FAKE_SCENARIO" in
+          preflight_failure|web_backend_change|web_unknown_change|web_container_change|web_build_change|web_missing_history) exit 1 ;;
+          preflight_signal) kill -TERM "$PPID"; exit 143 ;;
+        esac
         ;;
       *'rm -f -- '*'.preflight-'*)
         event 'cleanup_preflight'
@@ -290,6 +336,7 @@ MPGS_DEPLOY_MODE=full
 MPGS_BACKUP_RETENTION_COUNT=3
 MPGS_DEPLOY_HEALTH_TIMEOUT_SECS=1
 MPGS_DEPLOY_QUIESCED_BACKUP_TIMEOUT_SECS=5
+MPGS_DEPLOY_PREFLIGHT_BACKUP_TIMEOUT_SECS=5
 EOF
   : >"$fixture/events"
   write_fake_git "$fixture/bin/git"
@@ -318,7 +365,11 @@ run_scenario() {
   else
     status=$?
   fi
-  [ "$status" -ne 0 ] || fail "$scenario unexpectedly succeeded"
+  if [ "$scenario" = web_success ]; then
+    [ "$status" -eq 0 ] || { cat "$output"; fail "$scenario failed"; }
+  else
+    [ "$status" -ne 0 ] || fail "$scenario unexpectedly succeeded"
+  fi
   SCENARIO_FIXTURE=$fixture
   SCENARIO_EVENTS="$fixture/events"
   SCENARIO_OUTPUT=$output
@@ -329,8 +380,44 @@ assert_contains "$SCENARIO_EVENTS" 'preflight_backup:'
 assert_not_contains "$SCENARIO_EVENTS" 'compose_stop:'
 assert_not_contains "$SCENARIO_EVENTS" 'final_backup:'
 assert_not_contains "$SCENARIO_EVENTS" 'restore_final:'
-assert_contains "$SCENARIO_OUTPUT" 'Online preflight backup failed; leaving the current deployment online.'
+assert_contains "$SCENARIO_OUTPUT" 'Online preflight backup failed or exceeded 5s; leaving the current deployment online.'
+assert_contains "$SCENARIO_EVENTS" 'container_rm:rm -f mpgs-backup-preflight-'
 rm -rf "$SCENARIO_FIXTURE"
+
+for scenario in preflight_timeout preflight_signal; do
+  run_scenario "$scenario"
+  assert_contains "$SCENARIO_EVENTS" 'container_rm:rm -f mpgs-backup-preflight-'
+  assert_not_contains "$SCENARIO_EVENTS" 'compose_stop:'
+  assert_not_contains "$SCENARIO_EVENTS" 'final_backup:'
+  rm -rf "$SCENARIO_FIXTURE"
+done
+
+run_scenario web_success
+assert_contains "$SCENARIO_OUTPUT" "Web-only deployment healthy: web=$new_sha backend=$old_sha"
+assert_event_contains_all "$SCENARIO_EVENTS" "web=example.invalid/mpgs-web:sha-$new_sha" \
+  '--no-deps' 'mpgs-web'
+assert_not_contains "$SCENARIO_EVENTS" 'preflight_backup:'
+assert_not_contains "$SCENARIO_EVENTS" 'runtime_probe'
+assert_not_contains "$SCENARIO_EVENTS" 'compose_stop:'
+assert_not_contains "$SCENARIO_EVENTS" 'recover_leases'
+rm -rf "$SCENARIO_FIXTURE"
+
+for scenario in web_up_failure web_health_failure web_wrong_image web_signal; do
+  run_scenario "$scenario"
+  assert_contains "$SCENARIO_OUTPUT" 'restoring the previous Web image.'
+  assert_event_contains_all "$SCENARIO_EVENTS" 'web=mpgs-rollback-web:' '--no-deps' 'mpgs-web'
+  assert_not_contains "$SCENARIO_EVENTS" 'preflight_backup:'
+  assert_not_contains "$SCENARIO_EVENTS" 'compose_stop:'
+  assert_not_contains "$SCENARIO_EVENTS" 'restore_final:'
+  rm -rf "$SCENARIO_FIXTURE"
+done
+
+for scenario in web_backend_change web_unknown_change web_container_change web_build_change web_missing_history; do
+  run_scenario "$scenario"
+  assert_contains "$SCENARIO_EVENTS" 'preflight_backup:'
+  assert_not_contains "$SCENARIO_EVENTS" 'compose_up:'
+  rm -rf "$SCENARIO_FIXTURE"
+done
 
 run_scenario quiesced_failure
 assert_contains "$SCENARIO_EVENTS" 'preflight_backup:'
