@@ -11,7 +11,8 @@
 <p align="center">
   <a href="https://mpgs.lunafleur.dpdns.org/">Try it online</a> ·
   <a href="#preview">Preview</a> ·
-  <a href="#run-locally">Run locally</a> ·
+  <a href="#install-with-docker">Docker installation (recommended)</a> ·
+  <a href="#development-from-source">Development</a> ·
   <a href="https://github.com/Lotulune/lobbytally/issues">Report an issue</a>
 </p>
 
@@ -53,7 +54,82 @@ Browsing recommendations does not require linking a Steam account. LobbyTally ac
 - Prices, reviews, online player counts and release dates change. Confirm purchase details on Steam.
 - Steam friend syncing, shared-library matching and automatic matchmaking are not currently provided. See [Known limitations](docs/KNOWN_LIMITATIONS.md) for more detail.
 
-## Run locally
+## Install with Docker
+
+**Docker is the recommended way to self-host LobbyTally.** Use prebuilt images without installing Rust or Node.js, or compiling on your server. The default configuration runs the Web UI, API and continuous ingestion worker.
+
+These commands target a **Linux x86_64 / amd64** host. Prepare Docker Engine, the Docker Compose plugin (`docker compose`), Git, curl, OpenSSL, and system tools providing `flock` and `timeout`. Your current user must be able to run Docker.
+
+### 1. Prepare the installation directory
+
+For a first installation in a new directory:
+
+```bash
+git clone https://github.com/Lotulune/lobbytally.git
+cd lobbytally
+cp deploy/.env.example deploy/.env
+cp deploy/mpgs.env.example deploy/mpgs.env
+mkdir -p deploy/runtime
+chmod 600 deploy/.env deploy/mpgs.env
+```
+
+### 2. Configure your instance
+
+Keep `MPGS_DEPLOY_MODE=full` in `deploy/.env` to run the Web UI, API and worker together. Edit `deploy/mpgs.env` and configure at least the following:
+
+| Setting | What to use |
+| --- | --- |
+| `MPGS_ADMIN_TOKEN` | A strong random token, generated with the command below. Do not leave it empty or use an example token. |
+| `MPGS_CORS_ALLOWED_ORIGINS` | For local access, use `http://localhost:18082,http://127.0.0.1:18082,http://tauri.localhost,tauri://localhost`. When using your own domain, add its actual HTTPS origin and replace the hosted demo's domain from the template. |
+| `MPGS_TRUST_PROXY_HEADERS` | Set to `false` for direct local access. Enable it according to the operations guide after configuring a trusted reverse proxy. |
+| `MPGS_AI_PROVIDER` | Add `MPGS_AI_PROVIDER=disabled` if you are not configuring AI yet. Basic recommendations remain available. |
+
+```bash
+openssl rand -hex 32
+```
+
+`MPGS_STEAM_WEB_API_KEY` is optional and enables official Steam catalog synchronization. AI endpoints, credentials and models are also optional. Keep credentials in the instance's environment files.
+
+### 3. Install a published release
+
+Read the validated image revision from the release pointer, then let the repository's updater pull matching server and Web images and run health checks:
+
+```bash
+set -eu
+docker pull ghcr.io/lotulune/mpgs-server:release-main
+release_sha="$(docker image inspect \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+  ghcr.io/lotulune/mpgs-server:release-main)"
+test -n "$release_sha"
+MPGS_RELEASE_SHA="$release_sha" ./deploy/update.sh
+```
+
+This revision applies only to the installation command and is not saved as a permanent pin. It lets you install a published release even when documentation on `main` is newer than the latest image. If GHCR requires authentication, run `docker login ghcr.io` and retry the pull.
+
+### 4. Open and check the app
+
+```bash
+curl --fail http://127.0.0.1:18082/health/ready
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps
+```
+
+Open [http://localhost:18082](http://localhost:18082) on the installation host. On a VPS, configure your HTTPS domain to reverse-proxy to `127.0.0.1:18082`. Ports bind to loopback by default, so the app is not directly accessible through the VPS's public IP. The standalone API listens on `127.0.0.1:18081`.
+
+The database, avatars and backups persist in `deploy/runtime/`; retain this directory when updating containers. A new instance starts with an empty catalog that the worker gradually populates. It does not copy the hosted site's catalog automatically.
+
+### Updates and maintenance
+
+Run from the existing installation directory:
+
+```bash
+./deploy/update.sh
+```
+
+The updater checks the validated release pointer for updates; documentation-only commits may have no new images. On systemd hosts, you can also configure automatic checks every five minutes. See the [Operations guide](docs/OPERATIONS.md) for HTTPS, automatic updates, backups and recovery, and backend-only mode.
+
+## Development from source
+
+Use this path when changing the code or developing the desktop client. For everyday self-hosting, prefer the Docker installation above.
 
 Requirements: **Rust 1.97+, Node.js 22, pnpm 9.15.9 and Git**. The PowerShell example below starts a local environment with demo data and requires no Steam or AI API keys.
 
@@ -100,7 +176,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Desktop development requires additional platform dependencies; see the [Desktop / Web client guide](web/README.md). Self-hosting uses Docker Compose, GHCR images and an HTTPS reverse proxy; follow the [Operations guide](docs/OPERATIONS.md).
+Desktop development requires additional platform dependencies; see the [Desktop / Web client guide](web/README.md).
 
 ## Technology and layout
 
