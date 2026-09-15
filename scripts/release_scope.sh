@@ -23,6 +23,7 @@ while IFS= read -r path || [ -n "$path" ]; do
     deploy/mpgs-api-host.nginx.conf | \
     deploy/mpgs-host.nginx.conf | \
     README.md | \
+    README.en.md | \
     .gitignore | \
     rustfmt.toml)
       ;;
