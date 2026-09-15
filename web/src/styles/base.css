@@ -380,6 +380,17 @@ body::before {
   flex-shrink: 0;
 }
 
+.github-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  text-decoration: none;
+}
+
 /* Theme menu: one full-hit trigger + token-styled list (replaces native select). */
 .theme-menu {
   position: relative;
