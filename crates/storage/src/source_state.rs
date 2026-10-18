@@ -1,11 +1,11 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::pg::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::DataRefreshStatus;
 
 pub fn load_cursor(conn: &Connection, cursor_key: &str) -> StorageResult<Option<String>> {
     conn.query_row(
-        "SELECT cursor_json FROM source_cursors WHERE cursor_key = ?1",
+        "SELECT cursor_json FROM source_cursors WHERE cursor_key = $1",
         params![cursor_key],
         |row| row.get(0),
     )
@@ -30,7 +30,7 @@ pub fn save_cursor(
     conn.execute(
         "INSERT INTO source_cursors (
             cursor_key, source, cursor_json, last_success_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?4)
+         ) VALUES ($1, $2, $3, $4, $4)
          ON CONFLICT(cursor_key) DO UPDATE SET
             source = excluded.source,
             cursor_json = excluded.cursor_json,
@@ -58,27 +58,31 @@ pub fn start_run(
             return Err(StorageError::validation(format!("{label} is required")));
         }
     }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // A process killed or replaced mid-run cannot finalize its audit row. Do
     // not leave such historical rows looking perpetually active forever.
     // Only one invocation of a given source/task is supported at a time.
-    conn.execute(
+    tx.execute(
         "UPDATE source_runs SET
-             status = 'failed', finished_at_ms = ?1,
+             status = 'failed', finished_at_ms = $1,
              error_category = COALESCE(error_category, 'interrupted'),
              notes = CASE
                  WHEN notes IS NULL OR TRIM(notes) = '' THEN 'superseded by a newer run'
                  ELSE notes || '; superseded by a newer run'
              END
-         WHERE source = ?2 AND task_type = ?3 AND status = 'running'",
+         WHERE source = $2 AND task_type = $3 AND status = 'running'",
         params![now_ms, source, task_type],
     )?;
-    conn.execute(
+    let run_id = tx.query_row(
         "INSERT INTO source_runs (
             source, task_type, status, started_at_ms, parser_version, notes
-         ) VALUES (?1, ?2, 'running', ?3, ?4, ?5)",
+         ) VALUES ($1, $2, 'running', $3, $4, $5)
+         RETURNING run_id",
         params![source, task_type, now_ms, parser_version, notes],
+        |row| row.get(0),
     )?;
-    Ok(conn.last_insert_rowid())
+    tx.commit()?;
+    Ok(run_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -104,9 +108,9 @@ pub fn finish_run(
     }
     let changed = conn.execute(
         "UPDATE source_runs SET
-            status = ?1, finished_at_ms = ?2, request_count = ?3,
-            success_count = ?4, error_category = ?5, notes = ?6
-         WHERE run_id = ?7 AND status = 'running'",
+            status = $1, finished_at_ms = $2, request_count = $3,
+            success_count = $4, error_category = $5, notes = $6
+         WHERE run_id = $7 AND status = 'running'",
         params![
             status,
             now_ms,
@@ -139,8 +143,8 @@ pub fn update_run_progress(
     }
     let changed = conn.execute(
         "UPDATE source_runs
-         SET request_count = ?1, success_count = ?2, notes = ?3
-         WHERE run_id = ?4 AND status = 'running'",
+         SET request_count = $1, success_count = $2, notes = $3
+         WHERE run_id = $4 AND status = 'running'",
         params![request_count, success_count, notes, run_id],
     )?;
     if changed != 1 {
@@ -185,10 +189,11 @@ pub fn ensure_data_refresh_tasks(conn: &Connection, now_ms: i64) -> StorageResul
         "pipeline_snapshot",
     ] {
         conn.execute(
-            "INSERT OR IGNORE INTO data_refresh_state (
+            "INSERT INTO data_refresh_state (
                 task_name, last_success_at_ms, next_run_at_ms, last_error_category,
                 cursor_value, coverage_ratio, updated_at_ms
-             ) VALUES (?1, NULL, ?2, NULL, NULL, NULL, ?2)",
+             ) VALUES ($1, NULL, $2, NULL, NULL, NULL, $2)
+             ON CONFLICT(task_name) DO NOTHING",
             params![task_name, now_ms],
         )?;
     }
@@ -220,7 +225,7 @@ pub fn update_data_refresh_status(
         "INSERT INTO data_refresh_state (
             task_name, last_success_at_ms, next_run_at_ms, last_error_category,
             cursor_value, coverage_ratio, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT(task_name) DO UPDATE SET
             last_success_at_ms = excluded.last_success_at_ms,
             next_run_at_ms = excluded.next_run_at_ms,

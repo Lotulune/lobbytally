@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::pg::{Connection, OptionalExtension, params};
 
 use crate::catalog::{
     self, set_availability_integer_field, set_availability_string_list_field,
@@ -20,21 +20,23 @@ pub fn create_override(
         return Err(StorageError::not_found(format!("game {app_id}")));
     }
     let tx = conn.transaction()?;
+    lock_app(&tx, app_id)?;
     let value_json = serde_json::to_string(&request.value_json)?;
 
     // Revoke any existing active override for the same feature before creating a new one.
     tx.execute(
         "UPDATE curation_overrides
-         SET revoked_at_ms = ?1, revoked_by = ?2, revoke_reason = 'superseded'
-         WHERE app_id = ?3 AND feature_name = ?4 AND revoked_at_ms IS NULL",
+         SET revoked_at_ms = $1, revoked_by = $2, revoke_reason = 'superseded'
+         WHERE app_id = $3 AND feature_name = $4 AND revoked_at_ms IS NULL",
         params![now_ms, request.operator, app_id, request.feature_name],
     )?;
 
-    tx.execute(
+    let override_id: i64 = tx.query_row(
         "INSERT INTO curation_overrides (
             app_id, feature_name, value_json, reason, external_evidence,
             operator, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING override_id",
         params![
             app_id,
             request.feature_name,
@@ -44,8 +46,8 @@ pub fn create_override(
             request.operator,
             now_ms
         ],
+        |row| row.get(0),
     )?;
-    let override_id = tx.last_insert_rowid();
 
     apply_override_to_profile(
         &tx,
@@ -58,7 +60,7 @@ pub fn create_override(
     tx.execute(
         "INSERT INTO audit_events (
             actor, action, entity_type, entity_key, before_json, after_json, reason, request_id, created_at_ms
-         ) VALUES (?1, 'create_override', 'app_feature', ?2, NULL, ?3, ?4, ?5, ?6)",
+         ) VALUES ($1, 'create_override', 'app_feature', $2, NULL, $3, $4, $5, $6)",
         params![
             request.operator,
             format!("{app_id}:{}", request.feature_name),
@@ -86,6 +88,10 @@ pub fn revoke_override(
     validate_text("operator", operator, 128)?;
     validate_text("reason", reason, 2_000)?;
     let tx = conn.transaction()?;
+    let app_id = get_override(&tx, override_id)?
+        .ok_or_else(|| StorageError::not_found(format!("override {override_id}")))?
+        .app_id;
+    lock_app(&tx, app_id)?;
     let existing = get_override(&tx, override_id)?
         .ok_or_else(|| StorageError::not_found(format!("override {override_id}")))?;
     if existing.revoked_at_ms.is_some() {
@@ -96,8 +102,8 @@ pub fn revoke_override(
 
     tx.execute(
         "UPDATE curation_overrides
-         SET revoked_at_ms = ?1, revoked_by = ?2, revoke_reason = ?3
-         WHERE override_id = ?4",
+         SET revoked_at_ms = $1, revoked_by = $2, revoke_reason = $3
+         WHERE override_id = $4",
         params![now_ms, operator, reason, override_id],
     )?;
 
@@ -107,7 +113,7 @@ pub fn revoke_override(
     tx.execute(
         "INSERT INTO audit_events (
             actor, action, entity_type, entity_key, before_json, after_json, reason, request_id, created_at_ms
-         ) VALUES (?1, 'revoke_override', 'override', ?2, ?3, NULL, ?4, ?5, ?6)",
+         ) VALUES ($1, 'revoke_override', 'override', $2, $3, NULL, $4, $5, $6)",
         params![
             operator,
             override_id.to_string(),
@@ -131,7 +137,7 @@ pub fn get_override(
     conn.query_row(
         "SELECT override_id, app_id, feature_name, value_json, reason, external_evidence,
                 operator, created_at_ms, revoked_at_ms
-         FROM curation_overrides WHERE override_id = ?1",
+         FROM curation_overrides WHERE override_id = $1",
         params![override_id],
         |row| {
             Ok(CurationOverride {
@@ -160,7 +166,7 @@ pub fn active_override(
         "SELECT override_id, app_id, feature_name, value_json, reason, external_evidence,
                 operator, created_at_ms, revoked_at_ms
          FROM curation_overrides
-         WHERE app_id = ?1 AND feature_name = ?2 AND revoked_at_ms IS NULL
+         WHERE app_id = $1 AND feature_name = $2 AND revoked_at_ms IS NULL
          ORDER BY created_at_ms DESC, override_id DESC
          LIMIT 1",
         params![app_id, feature_name],
@@ -269,12 +275,14 @@ pub fn insert_feature_evidence_with_document(
             "confidence must be between 0 and 1",
         ));
     }
-    catalog::ensure_app_stub(conn, app_id, &format!("app-{app_id}"), now_ms)?;
+    let tx = conn.unchecked_transaction()?;
+    catalog::ensure_app_stub(&tx, app_id, &format!("app-{app_id}"), now_ms)?;
+    lock_app(&tx, app_id)?;
     let value_json = serde_json::to_string(value_json)?;
-    let existing = conn
+    let existing = tx
         .query_row(
             "SELECT evidence_id, value_json FROM feature_evidence
-             WHERE app_id = ?1 AND feature_name = ?2 AND source_type = ?3 AND is_active = 1
+             WHERE app_id = $1 AND feature_name = $2 AND source_type = $3 AND is_active = 1
              ORDER BY observed_at_ms DESC, evidence_id DESC
              LIMIT 1",
             params![app_id, feature_name, source_type],
@@ -284,20 +292,22 @@ pub fn insert_feature_evidence_with_document(
     if let Some((evidence_id, active_value_json)) = existing
         && active_value_json == value_json
     {
+        tx.commit()?;
         return Ok(evidence_id);
     }
 
     // A changed fact creates one historical row and one new active row.
-    conn.execute(
+    tx.execute(
         "UPDATE feature_evidence SET is_active = 0
-         WHERE app_id = ?1 AND feature_name = ?2 AND source_type = ?3 AND is_active = 1",
+         WHERE app_id = $1 AND feature_name = $2 AND source_type = $3 AND is_active = 1",
         params![app_id, feature_name, source_type],
     )?;
-    conn.execute(
+    let evidence_id = tx.query_row(
         "INSERT INTO feature_evidence (
             app_id, feature_name, value_json, source_type, source_ref,
             source_document_id, confidence, observed_at_ms, is_active
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+         RETURNING evidence_id",
         params![
             app_id,
             feature_name,
@@ -308,8 +318,21 @@ pub fn insert_feature_evidence_with_document(
             confidence,
             now_ms
         ],
+        |row| row.get(0),
     )?;
-    Ok(conn.last_insert_rowid())
+    tx.commit()?;
+    Ok(evidence_id)
+}
+
+fn lock_app(conn: &Connection, app_id: u32) -> StorageResult<()> {
+    conn.query_row(
+        "SELECT app_id FROM apps WHERE app_id = $1 FOR UPDATE",
+        params![app_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()?
+    .ok_or_else(|| StorageError::not_found(format!("game {app_id}")))?;
+    Ok(())
 }
 
 fn latest_active_evidence(
@@ -319,7 +342,7 @@ fn latest_active_evidence(
 ) -> StorageResult<Option<(String, i64)>> {
     conn.query_row(
         "SELECT value_json, evidence_id FROM feature_evidence
-         WHERE app_id = ?1 AND feature_name = ?2 AND is_active = 1
+         WHERE app_id = $1 AND feature_name = $2 AND is_active = 1
          ORDER BY observed_at_ms DESC, evidence_id DESC
          LIMIT 1",
         params![app_id, feature_name],

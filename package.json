@@ -9,7 +9,7 @@
     "web:test": "pnpm --filter lobbytally-web test",
     "web:typecheck": "pnpm --filter lobbytally-web typecheck",
     "m4:accept": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/m4_acceptance.ps1",
-    "desktop:e2e:build": "cargo build -p mpgs-server --locked && tauri build --config apps/desktop/src-tauri/tauri.conf.json --config apps/desktop/src-tauri/tauri.e2e.conf.json --ci --no-sign --debug --no-bundle",
+    "desktop:e2e:build": "cargo build -p mpgs-server -p mpgs-dbtool --locked && tauri build --config apps/desktop/src-tauri/tauri.conf.json --config apps/desktop/src-tauri/tauri.e2e.conf.json --ci --no-sign --debug --no-bundle",
     "desktop:e2e": "pnpm --filter @lobbytally/e2e test",
     "desktop:build": "tauri build --config apps/desktop/src-tauri/tauri.conf.json --ci --no-sign --no-bundle",
     "desktop:nsis": "tauri build --config apps/desktop/src-tauri/tauri.conf.json --ci --no-sign -b nsis",

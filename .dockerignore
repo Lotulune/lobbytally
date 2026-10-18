@@ -1,11 +1,16 @@
 .git
 .github
+.tmp
+.agents
+.workbuddy
+.vercel
 .env
 .env.*
 **/.env
 **/.env.*
 **/mpgs.env
 **/mpgs.env.*
+**/cloud.env
 deploy/runtime
 data
 target

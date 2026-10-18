@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::pg::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -223,7 +223,7 @@ fn insert_run_row(
              context_schema_version, context_hash, candidate_set_hash,
              candidate_count, created_at_ms, expires_at_ms
          ) VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
          )",
         params![
             recommendation_run_id,
@@ -280,7 +280,7 @@ fn insert_items(
     let candidate_count: Option<i64> = tx
         .query_row(
             "SELECT candidate_count FROM recommendation_runs
-             WHERE recommendation_run_id = ?1",
+             WHERE recommendation_run_id = $1 FOR UPDATE",
             params![recommendation_run_id],
             |row| row.get(0),
         )
@@ -297,8 +297,8 @@ fn insert_items(
     insert_item_rows(&tx, recommendation_run_id, items, now_ms, expires_at_ms)?;
     tx.execute(
         "UPDATE recommendation_runs
-         SET expires_at_ms = MAX(expires_at_ms, ?2)
-         WHERE recommendation_run_id = ?1",
+         SET expires_at_ms = GREATEST(expires_at_ms, $2)
+         WHERE recommendation_run_id = $1",
         params![recommendation_run_id, expires_at_ms],
     )?;
     tx.commit()?;
@@ -352,7 +352,7 @@ fn insert_item_rows(
                  recommendation_run_id, app_id, rank, relevance_score,
                  recommendation_index, data_confidence, slot_reason,
                  score_components_json, recorded_at_ms, expires_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             params![
                 recommendation_run_id,
                 i64::from(item.app_id),
@@ -386,6 +386,22 @@ fn insert_event(
     let metadata_json = serde_json::to_string(&input.metadata)?;
 
     let tx = conn.transaction()?;
+    // Lock the run before checking idempotency. Concurrent requests for the
+    // same run must observe the first committed event instead of racing its
+    // unique key, and retention updates remain in the same transaction.
+    tx.query_row(
+        "SELECT recommendation_run_id FROM recommendation_runs
+         WHERE recommendation_run_id = $1 FOR UPDATE",
+        params![input.recommendation_run_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        StorageError::not_found(format!(
+            "recommendation run {}",
+            input.recommendation_run_id
+        ))
+    })?;
     if let Some(existing) =
         get_event_by_idempotency(&tx, &input.recommendation_run_id, &input.idempotency_key)?
     {
@@ -405,7 +421,7 @@ fn insert_event(
     let item_exists: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM recommendation_items
-             WHERE recommendation_run_id = ?1 AND app_id = ?2
+             WHERE recommendation_run_id = $1 AND app_id = $2
          )",
         params![input.recommendation_run_id, i64::from(input.app_id)],
         |row| row.get(0),
@@ -418,11 +434,12 @@ fn insert_event(
     }
 
     let expires_at_ms = retention_expiry(now_ms)?;
-    tx.execute(
+    let event_id: i64 = tx.query_row(
         "INSERT INTO recommendation_events (
              recommendation_run_id, app_id, event_type, idempotency_key,
              client_created_at_ms, metadata_json, created_at_ms, expires_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING recommendation_event_id",
         params![
             input.recommendation_run_id,
             i64::from(input.app_id),
@@ -433,12 +450,12 @@ fn insert_event(
             now_ms,
             expires_at_ms,
         ],
+        |row| row.get(0),
     )?;
-    let event_id = tx.last_insert_rowid();
     tx.execute(
         "UPDATE recommendation_items
-         SET expires_at_ms = MAX(expires_at_ms, ?3)
-         WHERE recommendation_run_id = ?1 AND app_id = ?2",
+         SET expires_at_ms = GREATEST(expires_at_ms, $3)
+         WHERE recommendation_run_id = $1 AND app_id = $2",
         params![
             input.recommendation_run_id,
             i64::from(input.app_id),
@@ -447,8 +464,8 @@ fn insert_event(
     )?;
     tx.execute(
         "UPDATE recommendation_runs
-         SET expires_at_ms = MAX(expires_at_ms, ?2)
-         WHERE recommendation_run_id = ?1",
+         SET expires_at_ms = GREATEST(expires_at_ms, $2)
+         WHERE recommendation_run_id = $1",
         params![input.recommendation_run_id, expires_at_ms],
     )?;
     let record = get_event(&tx, event_id)?
@@ -466,7 +483,7 @@ fn get_run(
                 algorithm_version, config_version, score_semantics,
                 context_schema_version, context_hash, candidate_set_hash,
                 candidate_count, created_at_ms, expires_at_ms
-         FROM recommendation_runs WHERE recommendation_run_id = ?1",
+         FROM recommendation_runs WHERE recommendation_run_id = $1",
         params![recommendation_run_id],
         |row| {
             Ok(RecommendationRunRecord {
@@ -506,14 +523,14 @@ fn get_item_attribution(
          FROM recommendation_items AS item
          JOIN recommendation_runs AS run
            ON run.recommendation_run_id = item.recommendation_run_id
-         WHERE item.recommendation_run_id = ?1 AND item.app_id = ?2",
+         WHERE item.recommendation_run_id = $1 AND item.app_id = $2",
         params![recommendation_run_id, i64::from(app_id)],
         |row| {
             let components_json: String = row.get(7)?;
             let score_components = serde_json::from_str(&components_json).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
+                crate::pg::Error::FromSqlConversionFailure(
                     7,
-                    rusqlite::types::Type::Text,
+                    crate::pg::types::Type::Text,
                     Box::new(error),
                 )
             })?;
@@ -550,7 +567,7 @@ fn get_event(conn: &Connection, event_id: i64) -> StorageResult<Option<Recommend
         "SELECT recommendation_event_id, recommendation_run_id, app_id,
                 event_type, idempotency_key, client_created_at_ms,
                 metadata_json, created_at_ms, expires_at_ms
-         FROM recommendation_events WHERE recommendation_event_id = ?1",
+         FROM recommendation_events WHERE recommendation_event_id = $1",
         params![event_id],
         map_event,
     )
@@ -568,7 +585,7 @@ fn get_event_by_idempotency(
                 event_type, idempotency_key, client_created_at_ms,
                 metadata_json, created_at_ms, expires_at_ms
          FROM recommendation_events
-         WHERE recommendation_run_id = ?1 AND idempotency_key = ?2",
+         WHERE recommendation_run_id = $1 AND idempotency_key = $2",
         params![recommendation_run_id, idempotency_key],
         map_event,
     )
@@ -576,10 +593,10 @@ fn get_event_by_idempotency(
     .map_err(Into::into)
 }
 
-fn map_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecommendationEventRecord> {
+fn map_event(row: &crate::pg::Row<'_>) -> crate::pg::Result<RecommendationEventRecord> {
     let metadata_json: String = row.get(6)?;
     let metadata = serde_json::from_str(&metadata_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+        crate::pg::Error::FromSqlConversionFailure(6, crate::pg::types::Type::Text, Box::new(error))
     })?;
     Ok(RecommendationEventRecord {
         recommendation_event_id: row.get(0)?,
@@ -600,15 +617,15 @@ fn purge_expired(
 ) -> StorageResult<PurgedRecommendationTelemetry> {
     let tx = conn.transaction()?;
     let events = tx.execute(
-        "DELETE FROM recommendation_events WHERE expires_at_ms <= ?1",
+        "DELETE FROM recommendation_events WHERE expires_at_ms <= $1",
         params![now_ms],
     )?;
     let items = tx.execute(
-        "DELETE FROM recommendation_items WHERE expires_at_ms <= ?1",
+        "DELETE FROM recommendation_items WHERE expires_at_ms <= $1",
         params![now_ms],
     )?;
     let runs = tx.execute(
-        "DELETE FROM recommendation_runs WHERE expires_at_ms <= ?1",
+        "DELETE FROM recommendation_runs WHERE expires_at_ms <= $1",
         params![now_ms],
     )?;
     tx.commit()?;
@@ -714,7 +731,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     use serde_json::json;
 
@@ -826,6 +843,44 @@ mod tests {
             repo.insert_recommendation_event(&changed),
             Err(StorageError::Conflict { .. })
         ));
+    }
+
+    #[test]
+    fn concurrent_event_retries_are_idempotent_across_database_handles() {
+        let (repo, _) = setup(1_000);
+        let run = repo
+            .insert_recommendation_run_with_items(&run_input(), &items())
+            .unwrap();
+        let input = InsertRecommendationEvent {
+            recommendation_run_id: run.recommendation_run_id,
+            app_id: 10,
+            event_type: "detail_open".into(),
+            idempotency_key: "concurrent-detail".into(),
+            client_created_at_ms: None,
+            metadata: json!({"source": "feed_card"}),
+        };
+        let handles: Vec<_> = (0..4)
+            .map(|_| repo.database().reconnect().unwrap())
+            .collect();
+        let barrier = Arc::new(Barrier::new(handles.len()));
+        let threads: Vec<_> = handles
+            .into_iter()
+            .map(|handle| {
+                let input = input.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle
+                        .with_conn_mut(|conn| insert_event(conn, &input, 2_000))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let records: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(records.iter().all(|record| record == &records[0]));
     }
 
     #[test]
@@ -941,7 +996,7 @@ mod tests {
         repo.database()
             .with_conn(|conn| {
                 let sql = "SELECT context_hash, candidate_set_hash
-                           FROM recommendation_runs WHERE recommendation_run_id = ?1";
+                           FROM recommendation_runs WHERE recommendation_run_id = $1";
                 let stored: (String, String) =
                     conn.query_row(sql, params![run.recommendation_run_id], |row| {
                         Ok((row.get(0)?, row.get(1)?))
@@ -955,10 +1010,10 @@ mod tests {
     }
 
     #[test]
-    fn migration_from_v17_is_additive_and_ready() {
+    fn postgres_migration_reapplication_preserves_existing_rows() {
         let db = Database::open_in_memory().unwrap();
         db.with_conn_mut(|conn| {
-            crate::migrate::migrate_to(conn, 17, 1_000)?;
+            crate::migrate::migrate_to_latest(conn, 1_000)?;
             conn.execute(
                 "INSERT INTO apps (
                      app_id, app_type, canonical_name, release_state,

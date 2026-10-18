@@ -1,11 +1,18 @@
-use std::collections::HashMap;
 use std::env;
-use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[cfg(test)]
+use std::{
+    collections::HashMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use axum::Json;
 use axum::body::Body;
@@ -13,9 +20,12 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use mpgs_storage::Repository;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 const WINDOW: Duration = Duration::from_secs(60);
+#[cfg(test)]
 const MAX_IDENTITIES: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,15 +122,31 @@ enum Bucket {
     Search,
     Session,
     Feedback,
+    #[cfg(test)]
     Global,
 }
 
+impl Bucket {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Search => "search",
+            Self::Session => "session",
+            Self::Feedback => "feedback",
+            #[cfg(test)]
+            Self::Global => "global",
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CounterKey {
     bucket: Bucket,
     identity: String,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct Counter {
     window_started: Instant,
@@ -130,7 +156,7 @@ struct Counter {
 #[derive(Debug, Clone, Copy)]
 struct Allowance {
     limit: u32,
-    remaining: u32,
+    remaining: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,29 +165,100 @@ struct Limited {
     retry_after_seconds: u64,
 }
 
+enum CheckError {
+    Limited(Limited),
+    Unavailable,
+}
+
 pub struct RateLimiter {
     config: RateLimitConfig,
+    repo: Option<Repository>,
+    #[cfg(test)]
     counters: Mutex<HashMap<CounterKey, Counter>>,
+    #[cfg(test)]
     requests: AtomicU64,
 }
 
 impl RateLimiter {
+    #[cfg(test)]
     pub fn new(config: RateLimitConfig) -> Self {
+        Self::with_repository(config, None)
+    }
+
+    pub fn with_repository(config: RateLimitConfig, repo: Option<Repository>) -> Self {
         Self {
             config,
+            repo,
+            #[cfg(test)]
             counters: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             requests: AtomicU64::new(0),
         }
     }
 
-    fn check(&self, request: &Request<Body>) -> Result<Option<Allowance>, Limited> {
+    async fn check(
+        &self,
+        bucket_limit: Option<(Bucket, u32)>,
+        identities: Vec<String>,
+    ) -> Result<Option<Allowance>, CheckError> {
         if !self.config.enabled {
             return Ok(None);
         }
-        let Some((bucket, limit)) = self.classify(request.method(), request.uri().path()) else {
+        let Some((bucket, limit)) = bucket_limit else {
             return Ok(None);
         };
-        let identities = self.identities(request);
+        if let Some(repo) = &self.repo {
+            let repo = repo.clone();
+            let keys: Vec<_> = identities
+                .into_iter()
+                .map(|identity| format!("http:{}:{identity}", bucket.key()))
+                .collect();
+            let global_limit = self.config.global_per_minute;
+            return match tokio::task::spawn_blocking(move || {
+                repo.consume_http_limit(
+                    &keys,
+                    u64::from(limit),
+                    u64::from(global_limit),
+                    WINDOW.as_secs() as i64,
+                )
+            })
+            .await
+            {
+                Ok(Ok(true)) => Ok(Some(Allowance {
+                    limit,
+                    // The shared admission transaction returns a decision only;
+                    // do not present a process-local remaining count as global.
+                    remaining: None,
+                })),
+                Ok(Ok(false)) => Err(CheckError::Limited(Limited {
+                    limit: limit.min(global_limit),
+                    retry_after_seconds: WINDOW.as_secs(),
+                })),
+                Ok(Err(_)) | Err(_) => {
+                    tracing::warn!("shared HTTP rate-limit admission unavailable");
+                    Err(CheckError::Unavailable)
+                }
+            };
+        }
+
+        #[cfg(test)]
+        {
+            self.check_local(bucket, limit, identities)
+                .map_err(CheckError::Limited)
+        }
+        #[cfg(not(test))]
+        {
+            Err(CheckError::Unavailable)
+        }
+    }
+
+    #[cfg(test)]
+    fn check_local(
+        &self,
+        bucket: Bucket,
+        limit: u32,
+        identities: Vec<String>,
+    ) -> Result<Option<Allowance>, Limited> {
         let now = Instant::now();
         let mut keys: Vec<_> = identities
             .into_iter()
@@ -224,7 +321,10 @@ impl RateLimiter {
             counter.count = counter.count.saturating_add(1);
             remaining = remaining.min(key_limit.saturating_sub(counter.count));
         }
-        Ok(Some(Allowance { limit, remaining }))
+        Ok(Some(Allowance {
+            limit,
+            remaining: Some(remaining),
+        }))
     }
 
     fn classify(&self, method: &Method, path: &str) -> Option<(Bucket, u32)> {
@@ -266,18 +366,18 @@ impl RateLimiter {
             .and_then(|value| value.to_str().ok())
             .filter(|value| valid_identity(value))
         {
-            identities.push(format!("device:{:016x}", stable_hash(device)));
+            identities.push(format!("device:{}", stable_hash(device)));
         } else if let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .filter(|value| !value.is_empty())
         {
-            identities.push(format!("session:{:016x}", stable_hash(token)));
+            identities.push(format!("session:{}", stable_hash(token)));
         }
 
         if let Some(ip) = self.client_ip(request) {
-            identities.push(format!("ip:{ip}"));
+            identities.push(format!("ip:{}", stable_hash(&ip.to_string())));
         }
         if identities.is_empty() {
             identities.push("unidentified".to_owned());
@@ -303,9 +403,12 @@ pub async fn middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let decision = limiter.check(&request);
+    let bucket_limit = limiter.classify(request.method(), request.uri().path());
+    let identities = limiter.identities(&request);
+    let decision = limiter.check(bucket_limit, identities).await;
     match decision {
-        Err(limited) => rate_limited_response(request.headers(), limited),
+        Err(CheckError::Limited(limited)) => rate_limited_response(request.headers(), limited),
+        Err(CheckError::Unavailable) => rate_limit_unavailable_response(request.headers()),
         Ok(allowance) => {
             let mut response = next.run(request).await;
             if let Some(allowance) = allowance {
@@ -332,18 +435,37 @@ fn rate_limited_response(headers: &HeaderMap, limited: Limited) -> Response {
         })),
     )
         .into_response();
-    insert_limit_headers(&mut response, limited.limit, 0);
+    insert_limit_headers(&mut response, limited.limit, Some(0));
     if let Ok(value) = HeaderValue::from_str(&limited.retry_after_seconds.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
 }
 
-fn insert_limit_headers(response: &mut Response, limit: u32, remaining: u32) {
+fn rate_limit_unavailable_response(headers: &HeaderMap) -> Response {
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok());
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "code": "service_unavailable",
+                "message": "request admission is temporarily unavailable",
+                "request_id": request_id,
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn insert_limit_headers(response: &mut Response, limit: u32, remaining: Option<u32>) {
     if let Ok(value) = HeaderValue::from_str(&limit.to_string()) {
         response.headers_mut().insert("x-ratelimit-limit", value);
     }
-    if let Ok(value) = HeaderValue::from_str(&remaining.to_string()) {
+    if let Some(remaining) = remaining
+        && let Ok(value) = HeaderValue::from_str(&remaining.to_string())
+    {
         response
             .headers_mut()
             .insert("x-ratelimit-remaining", value);
@@ -372,15 +494,41 @@ fn valid_identity(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
-fn stable_hash(value: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
+fn stable_hash(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persistent_identities_keep_ip_protection_without_storing_credentials() {
+        let mut request = Request::builder()
+            .uri("/v1/meta")
+            .header(header::AUTHORIZATION, "Bearer private-session-token")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 10], 1234))));
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+
+        let identities = limiter.identities(&request);
+        assert_eq!(identities.len(), 2);
+        assert!(identities[0].starts_with("session:"));
+        assert!(identities[1].starts_with("ip:"));
+        assert!(!identities.join("").contains("private-session-token"));
+        assert!(!identities.join("").contains("203.0.113.10"));
+
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer another-session-token"),
+        );
+        let rotated = limiter.identities(&request);
+        assert_ne!(rotated[0], identities[0]);
+        assert_eq!(rotated[1], identities[1]);
+    }
 
     #[test]
     fn proxy_headers_are_only_used_when_explicitly_trusted() {

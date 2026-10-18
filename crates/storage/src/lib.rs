@@ -1,4 +1,4 @@
-//! SQLite storage, migrations, ingest, jobs, curation, and backup for MPGS.
+//! PostgreSQL storage, migrations, ingest, jobs, and curation for MPGS.
 //!
 //! Network I/O never holds a write transaction. Source proposals from
 //! `mpgs-steam-source` are normalized before repository writes.
@@ -7,7 +7,6 @@
 
 pub mod accounts;
 pub mod ai_m8;
-pub mod backup;
 pub mod catalog;
 pub mod clock;
 pub mod community;
@@ -21,6 +20,7 @@ pub mod jobs;
 pub mod migrate;
 pub mod models;
 pub mod offline_features;
+pub mod pg;
 pub mod play_intent;
 pub mod quality;
 pub mod query;
@@ -28,6 +28,7 @@ pub mod recommendation_telemetry;
 pub mod repo;
 pub mod retrieval;
 pub mod seed;
+pub mod shared_limits;
 pub mod source_state;
 pub mod users;
 pub mod util;

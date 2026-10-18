@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::pg::{Connection, OptionalExtension, params};
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::AppRecord;
@@ -20,7 +20,7 @@ pub fn upsert_app(
         "INSERT INTO apps (
             app_id, app_type, canonical_name, release_state, release_date,
             release_date_precision, source_modified_at_ms, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
          ON CONFLICT(app_id) DO UPDATE SET
             app_type = excluded.app_type,
             canonical_name = excluded.canonical_name,
@@ -60,7 +60,7 @@ pub fn upsert_catalog_app(
         "INSERT INTO apps (
             app_id, app_type, canonical_name, release_state,
             source_modified_at_ms, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, 'unknown', ?4, ?5, ?5)
+         ) VALUES ($1, $2, $3, 'unknown', $4, $5, $5)
          ON CONFLICT(app_id) DO UPDATE SET
             app_type = CASE
                 WHEN apps.app_type = 'unknown'
@@ -114,7 +114,7 @@ pub fn upsert_catalog_app(
                 )
             )
             OR (
-                apps.canonical_name IS NOT excluded.canonical_name
+                apps.canonical_name IS DISTINCT FROM excluded.canonical_name
                 AND NOT (
                     apps.source_modified_at_ms IS NOT NULL
                     AND (
@@ -156,7 +156,7 @@ pub fn get_app(conn: &Connection, app_id: u32) -> StorageResult<Option<AppRecord
         "SELECT app_id, app_type, canonical_name, release_state, release_date,
                 release_date_raw, release_date_precision, is_early_access,
                 current_data_confidence, source_modified_at_ms, created_at_ms, updated_at_ms
-         FROM apps WHERE app_id = ?1",
+         FROM apps WHERE app_id = $1",
         params![app_id],
         |row| {
             Ok(AppRecord {
@@ -188,7 +188,7 @@ pub fn ensure_app_stub(
     conn.execute(
         "INSERT INTO apps (
              app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
-         ) VALUES (?1, 'unknown', ?2, 'unknown', ?3, ?3)
+         ) VALUES ($1, 'unknown', $2, 'unknown', $3, $3)
          ON CONFLICT(app_id) DO NOTHING",
         params![app_id, name, now_ms],
     )?;
@@ -215,7 +215,7 @@ pub fn upsert_app_localization(
     conn.execute(
         "INSERT INTO app_localizations (
              app_id, language, name, short_description, source, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ) VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT(app_id, language) DO UPDATE SET
              name = COALESCE(excluded.name, app_localizations.name),
              short_description = COALESCE(excluded.short_description, app_localizations.short_description),
@@ -241,10 +241,10 @@ pub fn upsert_relation(
         "INSERT INTO app_relations (
             source_app_id, target_app_id, relation_type, confidence,
             verified_by_human, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+         ) VALUES ($1, $2, $3, $4, $5, $6, $6)
          ON CONFLICT(source_app_id, target_app_id, relation_type) DO UPDATE SET
             confidence = excluded.confidence,
-            verified_by_human = MAX(app_relations.verified_by_human, excluded.verified_by_human),
+            verified_by_human = GREATEST(app_relations.verified_by_human, excluded.verified_by_human),
             updated_at_ms = excluded.updated_at_ms",
         params![
             source_app_id,
@@ -284,12 +284,12 @@ pub fn set_profile_bool_field(
     };
     ensure_app_stub(conn, app_id, &format!("app-{app_id}"), now_ms)?;
     conn.execute(
-        "INSERT INTO multiplayer_profiles (app_id, computed_at_ms) VALUES (?1, ?2)
+        "INSERT INTO multiplayer_profiles (app_id, computed_at_ms) VALUES ($1, $2)
          ON CONFLICT(app_id) DO NOTHING",
         params![app_id, now_ms],
     )?;
     let sql = format!(
-        "UPDATE multiplayer_profiles SET {column} = ?1, computed_at_ms = ?2 WHERE app_id = ?3"
+        "UPDATE multiplayer_profiles SET {column} = $1, computed_at_ms = $2 WHERE app_id = $3"
     );
     conn.execute(&sql, params![opt_bool_to_sql(value), now_ms, app_id])?;
     Ok(())
@@ -313,12 +313,12 @@ pub fn set_profile_text_field(
     };
     ensure_app_stub(conn, app_id, &format!("app-{app_id}"), now_ms)?;
     conn.execute(
-        "INSERT INTO multiplayer_profiles (app_id, computed_at_ms) VALUES (?1, ?2)
+        "INSERT INTO multiplayer_profiles (app_id, computed_at_ms) VALUES ($1, $2)
          ON CONFLICT(app_id) DO NOTHING",
         params![app_id, now_ms],
     )?;
     let sql = format!(
-        "UPDATE multiplayer_profiles SET {column} = ?1, computed_at_ms = ?2 WHERE app_id = ?3"
+        "UPDATE multiplayer_profiles SET {column} = $1, computed_at_ms = $2 WHERE app_id = $3"
     );
     conn.execute(&sql, params![value, now_ms, app_id])?;
     Ok(())
@@ -338,12 +338,12 @@ pub fn upsert_app_availability(
     conn.execute(
         "INSERT INTO app_availability (
             app_id, platforms_json, languages_json, is_free, updated_at_ms
-         ) VALUES (?1, COALESCE(?2, '[]'), COALESCE(?3, '[]'), ?4, ?5)
+         ) VALUES ($1, COALESCE($2, '[]'), COALESCE($3, '[]'), $4, $5)
          ON CONFLICT(app_id) DO UPDATE SET
-            platforms_json = COALESCE(?2, app_availability.platforms_json),
-            languages_json = COALESCE(?3, app_availability.languages_json),
-            is_free = COALESCE(?4, app_availability.is_free),
-            updated_at_ms = ?5",
+            platforms_json = COALESCE($2, app_availability.platforms_json),
+            languages_json = COALESCE($3, app_availability.languages_json),
+            is_free = COALESCE($4, app_availability.is_free),
+            updated_at_ms = $5",
         params![
             app_id,
             platforms_json,
@@ -370,17 +370,17 @@ pub fn restore_empty_availability_from_evidence(
                      SELECT evidence.value_json
                      FROM feature_evidence evidence
                      WHERE evidence.app_id = availability.app_id
-                       AND evidence.feature_name = ?1
+                       AND evidence.feature_name = $1
                        AND evidence.value_json <> '[]'
                      ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC
                      LIMIT 1
                  ),
-                 updated_at_ms = ?2
+                 updated_at_ms = $2
              WHERE {column} = '[]'
                AND EXISTS (
                    SELECT 1 FROM feature_evidence evidence
                    WHERE evidence.app_id = availability.app_id
-                     AND evidence.feature_name = ?1
+                     AND evidence.feature_name = $1
                      AND evidence.value_json <> '[]'
                )"
         );
@@ -408,7 +408,7 @@ pub fn set_availability_integer_field(
     upsert_app_availability(conn, app_id, None, None, None, now_ms)?;
     let (current_min, current_max): (Option<u32>, Option<u32>) = conn.query_row(
         "SELECT typical_session_minutes_min, typical_session_minutes_max
-         FROM app_availability WHERE app_id = ?1",
+         FROM app_availability WHERE app_id = $1",
         params![app_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -422,7 +422,7 @@ pub fn set_availability_integer_field(
         ));
     }
     let sql =
-        format!("UPDATE app_availability SET {column} = ?1, updated_at_ms = ?2 WHERE app_id = ?3");
+        format!("UPDATE app_availability SET {column} = $1, updated_at_ms = $2 WHERE app_id = $3");
     conn.execute(&sql, params![value, now_ms, app_id])?;
     Ok(())
 }
@@ -445,7 +445,7 @@ pub fn set_availability_string_list_field(
     };
     upsert_app_availability(conn, app_id, None, None, None, now_ms)?;
     let sql =
-        format!("UPDATE app_availability SET {column} = ?1, updated_at_ms = ?2 WHERE app_id = ?3");
+        format!("UPDATE app_availability SET {column} = $1, updated_at_ms = $2 WHERE app_id = $3");
     conn.execute(
         &sql,
         params![serde_json::to_string(values)?, now_ms, app_id],
@@ -461,7 +461,7 @@ pub fn get_multiplayer_profile(
         "SELECT app_id, dominant_mode, private_session, online_coop, self_hosted_server,
                 drop_in_out, crossplay, recommended_min_players, recommended_max_players,
                 profile_confidence, computed_at_ms
-         FROM multiplayer_profiles WHERE app_id = ?1",
+         FROM multiplayer_profiles WHERE app_id = $1",
         params![app_id],
         |row| {
             Ok(crate::models::MultiplayerProfile {

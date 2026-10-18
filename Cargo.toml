@@ -7,6 +7,7 @@ members = [
     "crates/recommender",
     "crates/steam-source",
     "crates/storage",
+    "crates/worker",
 ]
 resolver = "2"
 
@@ -19,8 +20,14 @@ rust-version = "1.97"
 aes-gcm = "0.10"
 argon2 = "0.5"
 axum = "0.8"
+bytes = "1"
 getrandom = "0.4"
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+native-tls = "0.2"
+postgres = "0.19"
+postgres-native-tls = "0.5"
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
+rust_decimal = { version = "1", features = ["db-postgres"] }
 scraper = "0.27"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

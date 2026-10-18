@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{Connection, params, params_from_iter};
+use crate::pg::{Connection, params, params_from_iter};
 
 use crate::error::StorageResult;
 use crate::play_intent::{PlayIntentEpoch, epoch};
@@ -82,7 +82,7 @@ pub struct CommunityPlayIntentPage {
 }
 
 pub fn page(
-    conn: &mut Connection,
+    conn: &Connection,
     current_user_id: Option<&str>,
     sort: CommunitySort,
     filters: &CommunityFilters,
@@ -90,7 +90,7 @@ pub fn page(
     offset: usize,
     now_ms: i64,
 ) -> StorageResult<CommunityPlayIntentPage> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = conn.read_transaction()?;
     let epoch = epoch(&tx)?;
     let trend_cutoff = now_ms.saturating_sub(7 * 24 * 60 * 60 * 1_000);
     let order = match sort {
@@ -105,7 +105,7 @@ pub fn page(
         "WITH votes AS (
              SELECT v.app_id,
                     COUNT(*) AS total_count,
-                    SUM(CASE WHEN v.created_at_ms >= ?1 THEN 1 ELSE 0 END) AS trending_count,
+                    SUM(CASE WHEN v.created_at_ms >= $1 THEN 1 ELSE 0 END) AS trending_count,
                     MAX(v.created_at_ms) AS latest_vote_at_ms
              FROM play_intent_votes AS v
              JOIN user_accounts AS account ON account.user_id = v.user_id
@@ -116,10 +116,10 @@ pub fn page(
                 apps.release_date, apps.release_date_raw, apps.release_date_precision,
                 media.capsule_url, media.updated_at_ms,
                 votes.total_count, votes.trending_count, votes.latest_vote_at_ms,
-                CASE WHEN ?2 IS NULL THEN 0 ELSE EXISTS (
+                CASE WHEN $2::TEXT IS NULL THEN FALSE ELSE EXISTS (
                     SELECT 1 FROM play_intent_votes AS own_vote
                     JOIN user_accounts AS own_account ON own_account.user_id = own_vote.user_id
-                    WHERE own_vote.app_id = apps.app_id AND own_vote.user_id = ?2
+                    WHERE own_vote.app_id = apps.app_id AND own_vote.user_id = $2
                       AND own_account.status = 'active'
                 ) END
          FROM votes
@@ -127,24 +127,24 @@ pub fn page(
          LEFT JOIN app_media AS media ON media.app_id = apps.app_id
          LEFT JOIN app_availability AS availability ON availability.app_id = apps.app_id
          LEFT JOIN multiplayer_profiles AS profile ON profile.app_id = apps.app_id
-         WHERE (?3 IS NULL OR apps.release_state = ?3)
-           AND (?4 = 0 OR apps.app_type IN ('demo', 'playtest') OR EXISTS (
+         WHERE ($3::TEXT IS NULL OR apps.release_state = $3)
+           AND ($4 = 0 OR apps.app_type IN ('demo', 'playtest') OR EXISTS (
                 SELECT 1 FROM app_relations AS demo_relation
                 WHERE demo_relation.target_app_id = apps.app_id
                   AND demo_relation.relation_type IN ('demo_of', 'playtest_of')
            ))
-           AND (?5 IS NULL OR EXISTS (
-                SELECT 1 FROM json_each(COALESCE(availability.platforms_json, '[]'))
-                WHERE lower(CAST(value AS TEXT)) = ?5
+           AND ($5::TEXT IS NULL OR EXISTS (
+                SELECT 1 FROM jsonb_array_elements_text(COALESCE(availability.platforms_json, '[]')::JSONB) AS platform(value)
+                WHERE lower(platform.value) = $5
            ))
-           AND (?6 IS NULL OR (
+           AND ($6::BIGINT IS NULL OR (
                 profile.recommended_min_players IS NOT NULL
                 AND profile.recommended_max_players IS NOT NULL
-                AND profile.recommended_min_players <= ?6
-                AND profile.recommended_max_players >= ?6
+                AND profile.recommended_min_players <= $6
+                AND profile.recommended_max_players >= $6
            ))
          ORDER BY {order}
-         LIMIT ?7 OFFSET ?8"
+         LIMIT $7 OFFSET $8"
     );
     let mut items = {
         let mut statement = tx.prepare(&query)?;
@@ -193,17 +193,17 @@ pub fn page(
 }
 
 pub fn previews_for_game(
-    conn: &mut Connection,
+    conn: &Connection,
     app_id: u32,
     current_user_id: Option<&str>,
 ) -> StorageResult<(PlayIntentEpoch, u32, bool, Vec<CommunityVoterPreview>, u32)> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = conn.read_transaction()?;
     let epoch = epoch(&tx)?;
     let total: i64 = tx.query_row(
         "SELECT COUNT(*)
          FROM play_intent_votes AS v
          JOIN user_accounts AS account ON account.user_id = v.user_id
-         WHERE v.app_id = ?1 AND account.status = 'active'",
+         WHERE v.app_id = $1 AND account.status = 'active'",
         params![app_id],
         |row| row.get(0),
     )?;
@@ -212,7 +212,7 @@ pub fn previews_for_game(
             "SELECT EXISTS(
                 SELECT 1 FROM play_intent_votes AS v
                 JOIN user_accounts AS account ON account.user_id = v.user_id
-                WHERE v.app_id = ?1 AND v.user_id = ?2 AND account.status = 'active'
+                WHERE v.app_id = $1 AND v.user_id = $2 AND account.status = 'active'
              )",
             params![app_id, user_id],
             |row| row.get(0),
@@ -256,7 +256,8 @@ fn populate_voter_previews(
         return Ok(());
     }
     let app_ids: Vec<u32> = items.iter().map(|item| item.app_id).collect();
-    let markers = std::iter::repeat_n("?", app_ids.len())
+    let markers = (2..=app_ids.len() + 1)
+        .map(|index| format!("${index}"))
         .collect::<Vec<_>>()
         .join(",");
     let query = format!(
@@ -265,7 +266,7 @@ fn populate_voter_previews(
                     COALESCE(avatar.version, 0) AS avatar_version, avatar.storage_key,
                     ROW_NUMBER() OVER (
                         PARTITION BY v.app_id
-                        ORDER BY CASE WHEN v.user_id = ? THEN 0 ELSE 1 END,
+                        ORDER BY CASE WHEN v.user_id = $1 THEN 0 ELSE 1 END,
                                  v.created_at_ms DESC, account.user_id ASC
                     ) AS row_number
              FROM play_intent_votes AS v
@@ -277,7 +278,7 @@ fn populate_voter_previews(
          FROM ranked WHERE row_number <= 5
          ORDER BY app_id ASC, row_number ASC"
     );
-    let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(app_ids.len() + 1);
+    let mut values: Vec<crate::pg::types::Value> = Vec::with_capacity(app_ids.len() + 1);
     values.push(current_user_id.unwrap_or("").to_owned().into());
     values.extend(app_ids.iter().map(|id| i64::from(*id).into()));
     let mut statement = conn.prepare(&query)?;
@@ -350,7 +351,7 @@ mod tests {
         repo.database()
             .with_conn_mut(|conn| {
                 conn.execute(
-                    "INSERT INTO play_intent_votes (app_id, user_id, created_at_ms) VALUES (1, ?1, 1)",
+                    "INSERT INTO play_intent_votes (app_id, user_id, created_at_ms) VALUES (1, $1, 1)",
                     params![anonymous.user_id],
                 )?;
                 Ok(())
@@ -362,7 +363,7 @@ mod tests {
         }
         let page = repo
             .database()
-            .with_conn_mut(|conn| {
+            .with_conn(|conn| {
                 page(
                     conn,
                     None,
@@ -416,7 +417,7 @@ mod tests {
         };
         let page = repo
             .database()
-            .with_conn_mut(|conn| page(conn, None, CommunitySort::Trending, &filters, 10, 0, 100))
+            .with_conn(|conn| page(conn, None, CommunitySort::Trending, &filters, 10, 0, 100))
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].app_id, 1);

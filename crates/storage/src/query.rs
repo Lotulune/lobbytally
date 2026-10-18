@@ -1,10 +1,10 @@
 //! Read models for feeds, search, calendar, and game detail.
 
+use crate::pg::{Connection, OptionalExtension, params, types::Type};
 use mpgs_domain::{
     CandidateAvailability, FeedSection, ModeFamily, MultiplayerSignals, RankingSignals,
     RecommendationConfig, SteamAppId,
 };
-use rusqlite::{Connection, OptionalExtension, named_params, params, types::Type};
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::AppRecord;
@@ -470,7 +470,7 @@ pub fn list_candidates(
     // Section windows and feed presentation use the current store `apps.release_date`
     // (not the earliest historical date from release_events). "近期正式发售" is ordered
     // and filtered by that store day so 1.0 / re-dated launches surface by calendar day.
-    // `section` is a trusted enum. Give SQLite one concrete predicate and sort
+    // `section` is a trusted enum. Give PostgreSQL one concrete predicate and sort
     // shape, then materialize that app scope before ranking snapshot history.
     // This preserves the full candidate limit without scanning unrelated
     // review, player, and daily rows for every feed request.
@@ -478,57 +478,57 @@ pub fn list_candidates(
         FeedSection::Upcoming => (
             "((a.release_state IN ('upcoming', 'coming_soon')
                  AND a.release_date IS NOT NULL
-                 AND a.release_date >= :today
-                 AND a.release_date <= date(:today, '+30 days'))
+                 AND a.release_date >= $2
+                 AND a.release_date <= (($2::text::date + 30)::text))
                OR a.app_type IN ('demo', 'playtest'))",
             "((a.release_state IN ('upcoming', 'coming_soon')
                  AND a.release_date IS NOT NULL
-                 AND a.release_date >= :today
-                 AND a.release_date <= date(:today, '+30 days'))
+                 AND a.release_date >= $2
+                 AND a.release_date <= (($2::text::date + 30)::text))
                OR a.app_type IN ('demo', 'playtest'))",
-            "a.release_date DESC",
+            "a.release_date DESC NULLS LAST",
         ),
         FeedSection::RecentRelease => (
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
-             AND a.release_date >= :cutoff
-             AND a.release_date <= :today",
+             AND a.release_date >= $1
+             AND a.release_date <= $2",
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
-             AND a.release_date >= :cutoff
-             AND a.release_date <= :today",
-            "a.release_date DESC",
+             AND a.release_date >= $1
+             AND a.release_date <= $2",
+            "a.release_date DESC NULLS LAST",
         ),
         FeedSection::PopularLegacy => (
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
-             AND a.release_date < :cutoff",
+             AND a.release_date < $1",
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
-             AND a.release_date < :cutoff
-             AND COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_min_ccu
+             AND a.release_date < $1
+             AND COALESCE(d.typical_ccu, lp.player_count, 0) >= $5
              AND COALESCE(r.wilson_lower, 0) >= CASE
-                 WHEN COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_high_ccu
-                     THEN :popular_high_ccu_min_wilson
-                 ELSE :popular_min_wilson
+                 WHEN COALESCE(d.typical_ccu, lp.player_count, 0) >= $6
+                     THEN $8
+                 ELSE $7
              END",
             "COALESCE(d.typical_ccu, lp.player_count, 0) DESC",
         ),
         FeedSection::ClassicLegacy => (
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
-             AND a.release_date < :cutoff",
+             AND a.release_date < $1",
             "a.release_state = 'released'
              AND a.release_date IS NOT NULL
-             AND a.release_date < :cutoff
-             AND COALESCE(r.total_reviews, 0) >= :classic_min_reviews
-             AND COALESCE(r.wilson_lower, 0) >= :classic_min_wilson
+             AND a.release_date < $1
+             AND COALESCE(r.total_reviews, 0) >= $9
+             AND COALESCE(r.wilson_lower, 0) >= $10
              AND NOT (
-                 COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_min_ccu
+                 COALESCE(d.typical_ccu, lp.player_count, 0) >= $5
                  AND COALESCE(r.wilson_lower, 0) >= CASE
-                     WHEN COALESCE(d.typical_ccu, lp.player_count, 0) >= :popular_high_ccu
-                         THEN :popular_high_ccu_min_wilson
-                     ELSE :popular_min_wilson
+                     WHEN COALESCE(d.typical_ccu, lp.player_count, 0) >= $6
+                         THEN $8
+                     ELSE $7
                  END
              )",
             "COALESCE(r.total_reviews, 0) DESC",
@@ -577,7 +577,7 @@ pub fn list_candidates(
                  FROM ranked_candidate_scope scope
                  JOIN apps a ON a.app_id = scope.app_id
                  JOIN latest_review_snapshots r ON r.app_id = a.app_id
-                    AND r.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
+                    AND r.captured_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 30)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
                  {player_join}
                  LEFT JOIN daily_typical d ON d.app_id = a.app_id
                  WHERE {section_predicate}
@@ -587,7 +587,19 @@ pub fn list_candidates(
         String::new()
     };
     let sql = format!(
-        "WITH candidate_scope AS MATERIALIZED (
+        "WITH request_parameters AS (
+             SELECT $1::text AS cutoff,
+                    $2::text AS today,
+                    $3::text AS currency,
+                    $4::text AS country,
+                    $5::bigint AS popular_min_ccu,
+                    $6::bigint AS popular_high_ccu,
+                    $7::double precision AS popular_min_wilson,
+                    $8::double precision AS popular_high_ccu_min_wilson,
+                    $9::bigint AS classic_min_reviews,
+                    $10::double precision AS classic_min_wilson,
+                    $11::bigint AS limit
+         ), candidate_scope AS MATERIALIZED (
              SELECT a.app_id
              FROM apps a
              WHERE a.app_type IN ('game', 'demo', 'playtest')
@@ -597,33 +609,33 @@ pub fn list_candidates(
              FROM player_daily daily
              JOIN {activity_scope} scope ON scope.app_id = daily.app_id
              WHERE daily.mean_ccu IS NOT NULL
-               AND daily.day_utc >= date(:today, '-9 days')
-               AND daily.day_utc <= :today
+               AND daily.day_utc >= (($2::text::date - 9)::text)
+               AND daily.day_utc <= $2
          ), daily_activity AS (
              SELECT app_id,
-                    CAST(AVG(CASE
-                        WHEN day_utc >= date(:today, '-6 days') THEN mean_ccu
-                    END) AS INTEGER) AS typical_ccu,
+                    CAST(TRUNC(AVG(CASE
+                        WHEN day_utc >= (($2::text::date - 6)::text) THEN mean_ccu
+                    END)) AS BIGINT) AS typical_ccu,
                     COUNT(DISTINCT day_utc) AS observed_days_10d,
-                    SUM(CASE WHEN day_utc >= date(:today, '-2 days') THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN day_utc >= (($2::text::date - 2)::text) THEN 1 ELSE 0 END)
                         AS recent_days,
-                    SUM(CASE WHEN day_utc < date(:today, '-2 days') THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN day_utc < (($2::text::date - 2)::text) THEN 1 ELSE 0 END)
                         AS baseline_days,
-                    AVG(CASE WHEN day_utc >= date(:today, '-2 days') THEN mean_ccu END)
+                    AVG(CASE WHEN day_utc >= (($2::text::date - 2)::text) THEN mean_ccu END)
                         AS recent_ccu,
-                    AVG(CASE WHEN day_utc < date(:today, '-2 days') THEN mean_ccu END)
+                    AVG(CASE WHEN day_utc < (($2::text::date - 2)::text) THEN mean_ccu END)
                         AS baseline_ccu,
                     MAX(day_utc) AS latest_day
              FROM daily_window
              GROUP BY app_id
          ), daily_typical AS (
              SELECT app_id, typical_ccu,
-                    CAST(strftime('%s', latest_day) AS INTEGER) * 1000 AS observed_at_ms,
+                    (EXTRACT(EPOCH FROM (latest_day::date::timestamp AT TIME ZONE 'UTC'))::bigint * 1000) AS observed_at_ms,
                     CASE
                         WHEN observed_days_10d >= 7 AND recent_days >= 2 AND baseline_days >= 4
-                        THEN MIN(1.0, MAX(0.0,
+                        THEN LEAST(1.0, GREATEST(0.0,
                             0.5 + 0.25 * (recent_ccu - baseline_ccu)
-                                / MAX(recent_ccu, baseline_ccu, 1.0)
+                                / GREATEST(recent_ccu, baseline_ccu, 1.0)
                         ))
                     END AS momentum
              FROM daily_activity
@@ -639,12 +651,12 @@ pub fn list_candidates(
                 (
                     SELECT price.final_price_minor FROM price_snapshots price
                     WHERE price.app_id = a.app_id
-                      AND price.currency = :currency
-                      AND price.country_code = :country
-                      AND price.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+                      AND price.currency = $3
+                      AND price.country_code = $4
+                      AND price.captured_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 2)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
                     ORDER BY price.captured_at_ms DESC LIMIT 1
                 ),
-                :currency,
+                $3,
                 (a.app_type IN ('demo', 'playtest') OR EXISTS (
                     SELECT 1 FROM app_relations demo_relation
                     WHERE demo_relation.target_app_id = a.app_id
@@ -654,39 +666,39 @@ pub fn list_candidates(
                  media.capsule_url, media.updated_at_ms, NULL,
                  p.drop_in_out, p.crossplay, p.service_status, d.momentum,
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feed_feature_evidence evidence
+                    )::text FROM feed_feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'matchmaking_core'
-                      AND evidence.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
-                      AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
+                      AND evidence.observed_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 180)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
+                      AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= (EXTRACT(EPOCH FROM ($2::text::date::timestamp AT TIME ZONE 'UTC'))::bigint * 1000))
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feed_feature_evidence evidence
+                    )::text FROM feed_feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'public_world_dependency'
-                      AND evidence.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
-                      AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
+                      AND evidence.observed_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 180)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
+                      AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= (EXTRACT(EPOCH FROM ($2::text::date::timestamp AT TIME ZONE 'UTC'))::bigint * 1000))
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feed_feature_evidence evidence
+                    )::text FROM feed_feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'service_shutdown_risk'
-                      AND evidence.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
-                      AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
+                      AND evidence.observed_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 180)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
+                      AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms >= (EXTRACT(EPOCH FROM ($2::text::date::timestamp AT TIME ZONE 'UTC'))::bigint * 1000))
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  (
@@ -694,8 +706,8 @@ pub fn list_candidates(
                     FROM feed_feature_evidence taxonomy
                     WHERE taxonomy.app_id = a.app_id
                       AND taxonomy.feature_name = 'catalog_taxonomy'
-                      AND taxonomy.observed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
-                      AND (taxonomy.expires_at_ms IS NULL OR taxonomy.expires_at_ms >= CAST(strftime('%s', :today) AS INTEGER) * 1000)
+                      AND taxonomy.observed_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 180)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
+                      AND (taxonomy.expires_at_ms IS NULL OR taxonomy.expires_at_ms >= (EXTRACT(EPOCH FROM ($2::text::date::timestamp AT TIME ZONE 'UTC'))::bigint * 1000))
                     ORDER BY taxonomy.observed_at_ms DESC, taxonomy.evidence_id DESC LIMIT 1
                  ),
                  p.computed_at_ms, r.captured_at_ms,
@@ -703,9 +715,9 @@ pub fn list_candidates(
                  (
                     SELECT price.captured_at_ms FROM price_snapshots price
                     WHERE price.app_id = a.app_id
-                      AND price.currency = :currency
-                      AND price.country_code = :country
-                      AND price.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+                      AND price.currency = $3
+                      AND price.country_code = $4
+                      AND price.captured_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 2)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
                     ORDER BY price.captured_at_ms DESC LIMIT 1
                  ),
                  a.updated_at_ms,
@@ -713,7 +725,7 @@ pub fn list_candidates(
          FROM {final_scope} scope
          JOIN apps a ON a.app_id = scope.app_id
          LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
-             AND p.computed_at_ms >= CAST(strftime('%s', date(:today, '-180 days')) AS INTEGER) * 1000
+             AND p.computed_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 180)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
          LEFT JOIN app_availability v ON v.app_id = a.app_id
          {review_join}
          {player_join}
@@ -724,37 +736,26 @@ pub fn list_candidates(
          ORDER BY
              {section_order},
              a.updated_at_ms DESC
-         LIMIT :limit"
+         LIMIT $11"
     );
     let mut stmt = conn.prepare(&sql)?;
-    {
-        let mut bind_if_present =
-            |name: &str, value: &dyn rusqlite::ToSql| -> rusqlite::Result<()> {
-                if let Some(index) = stmt.parameter_index(name)? {
-                    stmt.raw_bind_parameter(index, value)?;
-                }
-                Ok(())
-            };
-        bind_if_present(":cutoff", &cutoff_date)?;
-        bind_if_present(":today", &today)?;
-        bind_if_present(":currency", &budget_currency)?;
-        bind_if_present(":country", &budget_country)?;
-        bind_if_present(":popular_min_ccu", &config.popular_min_ccu)?;
-        bind_if_present(":popular_high_ccu", &config.popular_high_ccu)?;
-        bind_if_present(":popular_min_wilson", &config.popular_min_wilson)?;
-        bind_if_present(
-            ":popular_high_ccu_min_wilson",
-            &config.popular_high_ccu_min_wilson,
-        )?;
-        bind_if_present(":classic_min_reviews", &config.classic_min_reviews)?;
-        bind_if_present(":classic_min_wilson", &config.classic_min_wilson)?;
-        bind_if_present(":limit", &limit)?;
-    }
-    let mut rows = stmt.raw_query();
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(map_candidate_with_percentile(row)?);
-    }
+    let rows = stmt.query_map(
+        params![
+            cutoff_date,
+            today,
+            budget_currency,
+            budget_country,
+            config.popular_min_ccu,
+            config.popular_high_ccu,
+            config.popular_min_wilson,
+            config.popular_high_ccu_min_wilson,
+            config.classic_min_reviews,
+            config.classic_min_wilson,
+            limit
+        ],
+        map_candidate_with_percentile,
+    )?;
+    let mut out = rows.collect::<Result<Vec<_>, _>>()?;
     if !matches!(section, FeedSection::ClassicLegacy) {
         assign_activity_percentiles(&mut out);
     }
@@ -762,38 +763,39 @@ pub fn list_candidates(
 }
 
 const CLASSIC_REVIEW_JOIN: &str = "JOIN latest_review_snapshots r ON r.app_id = a.app_id
-    AND r.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000";
+    AND r.captured_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 30)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)";
 
 const CANDIDATE_REVIEW_JOIN: &str = "LEFT JOIN latest_review_snapshots r ON r.app_id = a.app_id
-    AND r.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000";
+    AND r.captured_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 30)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)";
 
 const CLASSIC_RANKED_SCOPE_CTE: &str = ", ranked_candidate_scope AS MATERIALIZED (
     SELECT a.app_id
     FROM candidate_scope scope
     JOIN apps a ON a.app_id = scope.app_id
     JOIN latest_review_snapshots r ON r.app_id = a.app_id
-       AND r.captured_at_ms >= CAST(strftime('%s', date(:today, '-30 days')) AS INTEGER) * 1000
+       AND r.captured_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 30)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
     ORDER BY COALESCE(r.total_reviews, 0) DESC, a.updated_at_ms DESC
-    LIMIT :limit
+    LIMIT $11
 )";
 
 const CLASSIC_ACTIVITY_PERCENTILE_CTES: &str = ", latest_players AS MATERIALIZED (
     SELECT scope.app_id,
            (
-               SELECT latest_player.rowid
+               SELECT latest_player.captured_at_ms
                FROM player_snapshots latest_player
                WHERE latest_player.app_id = scope.app_id
                  AND latest_player.player_count IS NOT NULL
-                 AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+                 AND latest_player.captured_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 2)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
                ORDER BY latest_player.captured_at_ms DESC
                LIMIT 1
-           ) AS player_rowid
+           ) AS player_captured_at_ms
     FROM ranked_candidate_scope scope
 ), ranked_activity_values AS MATERIALIZED (
     SELECT scope.app_id, COALESCE(d.typical_ccu, lp.player_count) AS activity_value
     FROM ranked_candidate_scope scope
     LEFT JOIN latest_players latest_scope ON latest_scope.app_id = scope.app_id
-    LEFT JOIN player_snapshots lp ON lp.rowid = latest_scope.player_rowid
+    LEFT JOIN player_snapshots lp ON lp.app_id = latest_scope.app_id
+        AND lp.captured_at_ms = latest_scope.player_captured_at_ms
     LEFT JOIN daily_typical d ON d.app_id = scope.app_id
 ), ranked_activity_percentiles AS MATERIALIZED (
     SELECT app_id,
@@ -803,21 +805,22 @@ const CLASSIC_ACTIVITY_PERCENTILE_CTES: &str = ", latest_players AS MATERIALIZED
                    2.0 * (RANK() OVER (ORDER BY activity_value) - 1)
                        + COUNT(*) OVER (PARTITION BY activity_value) - 1
                ) / (2.0 * (COUNT(*) OVER () - 1))
-           END AS activity_percentile
+           END::double precision AS activity_percentile
     FROM ranked_activity_values
     WHERE activity_value IS NOT NULL
 )";
 
 const CLASSIC_PLAYER_JOIN: &str = "LEFT JOIN latest_players latest_player_scope
     ON latest_player_scope.app_id = a.app_id
-LEFT JOIN player_snapshots lp ON lp.rowid = latest_player_scope.player_rowid";
+LEFT JOIN player_snapshots lp ON lp.app_id = latest_player_scope.app_id
+    AND lp.captured_at_ms = latest_player_scope.player_captured_at_ms";
 
-const CANDIDATE_PLAYER_JOIN: &str = "LEFT JOIN player_snapshots lp ON lp.rowid = (
-    SELECT latest_player.rowid
+const CANDIDATE_PLAYER_JOIN: &str = "LEFT JOIN player_snapshots lp ON lp.app_id = a.app_id AND lp.captured_at_ms = (
+    SELECT latest_player.captured_at_ms
     FROM player_snapshots latest_player
     WHERE latest_player.app_id = a.app_id
       AND latest_player.player_count IS NOT NULL
-      AND latest_player.captured_at_ms >= CAST(strftime('%s', date(:today, '-2 days')) AS INTEGER) * 1000
+      AND latest_player.captured_at_ms >= (EXTRACT(EPOCH FROM (($2::text::date - 2)::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
     ORDER BY latest_player.captured_at_ms DESC
     LIMIT 1
 )";
@@ -973,125 +976,9 @@ pub fn search_by_name(
         return Ok(Vec::new());
     }
     let pattern = format!("%{escaped}%");
-    let Some(fts_query) = trigram_match_query(trimmed) else {
-        return search_by_name_like(conn, &pattern, limit);
-    };
-
-    // The trigram index narrows the candidate app IDs. Keep the original LIKE
-    // predicate as an exact verification step so FTS ranking/tokenization can
-    // never alter the public substring semantics.
-    let mut stmt = conn.prepare(
-        "WITH name_matches AS MATERIALIZED (
-             SELECT DISTINCT app_id
-             FROM app_name_fts
-             WHERE app_name_fts MATCH :fts_query
-               AND language IN ('canonical', 'schinese', 'english', 'en')
-         ), selected_apps AS MATERIALIZED (
-             SELECT a.app_id
-             FROM name_matches matches
-             JOIN apps a ON a.app_id = matches.app_id
-             WHERE a.canonical_name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
-                OR EXISTS (
-                    SELECT 1 FROM app_localizations localization
-                    WHERE localization.app_id = a.app_id
-                      AND lower(localization.language) IN ('schinese', 'english', 'en')
-                      AND localization.name IS NOT NULL
-                      AND trim(localization.name) <> ''
-                      AND localization.name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
-                )
-             ORDER BY a.canonical_name, a.app_id
-             LIMIT :limit
-         )
-         SELECT a.app_id, a.canonical_name, a.app_type, a.release_state, a.release_date,
-                p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
-                p.recommended_min_players, p.recommended_max_players, p.profile_confidence,
-                NULL, NULL, NULL, NULL, NULL,
-                COALESCE(v.platforms_json, '[]'), COALESCE(v.languages_json, '[]'),
-                v.typical_session_minutes_min, v.typical_session_minutes_max, v.is_free,
-                NULL, NULL,
-                (a.app_type IN ('demo', 'playtest') OR EXISTS (
-                    SELECT 1 FROM app_relations demo_relation
-                    WHERE demo_relation.target_app_id = a.app_id
-                      AND demo_relation.relation_type IN ('demo_of', 'playtest_of')
-                )),
-                 a.release_date_raw, a.release_date_precision,
-                 media.capsule_url, media.updated_at_ms, NULL,
-                 p.drop_in_out, p.crossplay, p.service_status, NULL,
-                 (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
-                        'confidence', evidence.confidence,
-                        'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
-                    WHERE evidence.app_id = a.app_id
-                      AND evidence.feature_name = 'matchmaking_core'
-                      AND evidence.is_active = 1
-                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
-                 ),
-                 (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
-                        'confidence', evidence.confidence,
-                        'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
-                    WHERE evidence.app_id = a.app_id
-                      AND evidence.feature_name = 'public_world_dependency'
-                      AND evidence.is_active = 1
-                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
-                 ),
-                 (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
-                        'confidence', evidence.confidence,
-                        'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
-                    WHERE evidence.app_id = a.app_id
-                      AND evidence.feature_name = 'service_shutdown_risk'
-                      AND evidence.is_active = 1
-                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
-                 ),
-                 (
-                    SELECT evidence.value_json FROM feature_evidence evidence
-                    WHERE evidence.app_id = a.app_id
-                      AND evidence.feature_name = 'catalog_taxonomy'
-                      AND evidence.is_active = 1
-                    ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
-                 ),
-                 p.computed_at_ms, NULL, NULL, NULL, a.updated_at_ms
-         FROM selected_apps matches
-         JOIN apps a ON a.app_id = matches.app_id
-         LEFT JOIN multiplayer_profiles p ON p.app_id = a.app_id
-         LEFT JOIN app_availability v ON v.app_id = a.app_id
-         LEFT JOIN app_media media ON media.app_id = a.app_id
-         ORDER BY a.canonical_name, a.app_id",
-    )?;
-    let rows = stmt.query_map(
-        named_params! {
-            ":fts_query": fts_query,
-            ":pattern": pattern,
-            ":limit": limit,
-        },
-        map_candidate,
-    )?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    if out.is_empty() {
-        // Trigram tokenizers intentionally do not index one/two-character
-        // fragments and may reject punctuation-heavy input. Preserve the old
-        // behavior as a correctness fallback for those rare cases.
-        search_by_name_like(conn, &pattern, limit)
-    } else {
-        Ok(out)
-    }
-}
-
-fn trigram_match_query(query: &str) -> Option<String> {
-    if query.chars().count() < 3 {
-        return None;
-    }
-    Some(format!("\"{}\"", query.replace('\"', "\"\"")))
+    // PostgreSQL can use the pg_trgm indexes for longer patterns and keeps
+    // identical substring semantics for short CJK names and escaped wildcards.
+    search_by_name_like(conn, &pattern, limit)
 }
 
 fn search_by_name_like(
@@ -1105,20 +992,20 @@ fn search_by_name_like(
         "WITH name_matches AS MATERIALIZED (
              SELECT app_id
              FROM apps
-             WHERE canonical_name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
+             WHERE canonical_name ILIKE $1 ESCAPE '\\'
              UNION
              SELECT app_id
              FROM app_localizations
              WHERE lower(language) IN ('schinese', 'english', 'en')
                AND name IS NOT NULL
                AND trim(name) != ''
-               AND name LIKE :pattern ESCAPE '\\' COLLATE NOCASE
+               AND name ILIKE $1 ESCAPE '\\'
          ), selected_apps AS MATERIALIZED (
              SELECT a.app_id
              FROM name_matches matches
              JOIN apps a ON a.app_id = matches.app_id
              ORDER BY a.canonical_name, a.app_id
-             LIMIT :limit
+             LIMIT $2
          )
          SELECT a.app_id, a.canonical_name, a.app_type, a.release_state, a.release_date,
                 p.dominant_mode, p.private_session, p.online_coop, p.self_hosted_server,
@@ -1136,33 +1023,33 @@ fn search_by_name_like(
                  media.capsule_url, media.updated_at_ms, NULL,
                  p.drop_in_out, p.crossplay, p.service_status, NULL,
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    )::text FROM feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'matchmaking_core'
                       AND evidence.is_active = 1
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    )::text FROM feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'public_world_dependency'
                       AND evidence.is_active = 1
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    )::text FROM feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'service_shutdown_risk'
                       AND evidence.is_active = 1
@@ -1182,12 +1069,9 @@ fn search_by_name_like(
          LEFT JOIN app_availability v ON v.app_id = a.app_id
          LEFT JOIN app_media media ON media.app_id = a.app_id
          ORDER BY a.canonical_name, a.app_id
-         LIMIT :limit",
+         LIMIT $2",
     )?;
-    let rows = stmt.query_map(
-        named_params![":pattern": pattern, ":limit": limit],
-        map_candidate,
-    )?;
+    let rows = stmt.query_map(params![pattern, limit], map_candidate)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -1204,7 +1088,7 @@ pub fn list_game_media_assets(
         "SELECT kind, source_id, sort_order, title, thumbnail_url, full_url,
                 mp4_url, hls_h264_url, dash_h264_url, is_highlight, updated_at_ms
          FROM app_media_assets
-         WHERE app_id = ?1
+         WHERE app_id = $1
          ORDER BY kind ASC, sort_order ASC, source_id ASC",
     )?;
     let rows = stmt.query_map(params![app_id], |row| {
@@ -1243,12 +1127,12 @@ pub fn get_game_detail(conn: &Connection, app_id: u32) -> StorageResult<Option<G
                 ),
                 r.wilson_lower,
                 (
-                    SELECT CAST(AVG(d.mean_ccu) AS INTEGER) FROM player_daily d
+                    SELECT CAST(TRUNC(AVG(d.mean_ccu)) AS BIGINT) FROM player_daily d
                     WHERE d.app_id = a.app_id AND d.mean_ccu IS NOT NULL
-                      AND d.day_utc >= date((
+                      AND d.day_utc >= (((
                           SELECT MAX(anchor.day_utc) FROM player_daily anchor
                           WHERE anchor.app_id = a.app_id AND anchor.mean_ccu IS NOT NULL
-                      ), '-6 days')
+                      )::date - 6)::text)
                 ),
                 COALESCE(v.platforms_json, '[]'), COALESCE(v.languages_json, '[]'),
                 v.typical_session_minutes_min, v.typical_session_minutes_max, v.is_free,
@@ -1271,33 +1155,33 @@ pub fn get_game_detail(conn: &Connection, app_id: u32) -> StorageResult<Option<G
                  media.capsule_url, media.updated_at_ms, loc.short_description,
                  p.drop_in_out, p.crossplay, p.service_status, NULL,
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    )::text FROM feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'matchmaking_core'
                       AND evidence.is_active = 1
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    )::text FROM feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'public_world_dependency'
                       AND evidence.is_active = 1
                     ORDER BY evidence.observed_at_ms DESC, evidence.evidence_id DESC LIMIT 1
                  ),
                  (
-                    SELECT json_object(
-                        'value', json(evidence.value_json),
+                    SELECT json_build_object(
+                        'value', evidence.value_json::json,
                         'confidence', evidence.confidence,
                         'observed_at_ms', evidence.observed_at_ms
-                    ) FROM feature_evidence evidence
+                    )::text FROM feature_evidence evidence
                     WHERE evidence.app_id = a.app_id
                       AND evidence.feature_name = 'service_shutdown_risk'
                       AND evidence.is_active = 1
@@ -1314,7 +1198,7 @@ pub fn get_game_detail(conn: &Connection, app_id: u32) -> StorageResult<Option<G
                  r.captured_at_ms,
                  COALESCE(
                     (
-                       SELECT CAST(strftime('%s', MAX(d.day_utc)) AS INTEGER) * 1000
+                       SELECT (EXTRACT(EPOCH FROM (MAX(d.day_utc)::date::timestamp AT TIME ZONE 'UTC'))::bigint * 1000)
                        FROM player_daily d
                        WHERE d.app_id = a.app_id AND d.mean_ccu IS NOT NULL
                     ),
@@ -1346,7 +1230,7 @@ pub fn get_game_detail(conn: &Connection, app_id: u32) -> StorageResult<Option<G
               END
               LIMIT 1
           )
-          WHERE a.app_id = ?1",
+          WHERE a.app_id = $1",
         params![app_id],
         map_candidate,
     )
@@ -1363,7 +1247,7 @@ pub fn list_popular_reviews(
                 voted_up, votes_up, votes_funny, comment_count, playtime_forever_minutes,
                 playtime_at_review_minutes, created_at_s, written_during_early_access
          FROM popular_reviews
-         WHERE app_id = ?1
+         WHERE app_id = $1
          ORDER BY rank ASC
          LIMIT 10",
     )?;
@@ -1400,7 +1284,7 @@ pub fn list_evidence(
         let mut stmt = conn.prepare(
             "SELECT evidence_id, feature_name, value_json, source_type, source_ref, confidence, observed_at_ms
              FROM feature_evidence
-             WHERE app_id = ?1 AND feature_name = ?2 AND is_active = 1
+             WHERE app_id = $1 AND feature_name = $2 AND is_active = 1
              ORDER BY observed_at_ms DESC LIMIT 50",
         )?;
         let rows = stmt.query_map(params![app_id, feature], map_evidence)?;
@@ -1409,7 +1293,7 @@ pub fn list_evidence(
     let mut stmt = conn.prepare(
         "SELECT evidence_id, feature_name, value_json, source_type, source_ref, confidence, observed_at_ms
          FROM feature_evidence
-         WHERE app_id = ?1 AND is_active = 1
+         WHERE app_id = $1 AND is_active = 1
          ORDER BY observed_at_ms DESC LIMIT 50",
     )?;
     let rows = stmt.query_map(params![app_id], map_evidence)?;
@@ -1477,7 +1361,7 @@ pub fn list_calendar(
     let undated_predicate = if state == "upcoming" {
         "a.release_date IS NULL"
     } else {
-        "0"
+        "FALSE"
     };
     let eligibility_predicate = "(
         EXISTS (
@@ -1507,7 +1391,7 @@ pub fn list_calendar(
              FROM apps a
              WHERE {state_predicate}
                AND a.app_type IN ('game', 'demo', 'playtest')
-               AND a.release_date >= ?1 AND a.release_date <= ?2
+               AND a.release_date >= $1 AND a.release_date <= $2
                AND {eligibility_predicate}
          ),
          undated_scope AS MATERIALIZED (
@@ -1593,7 +1477,7 @@ pub fn resolve_display_dominant_mode(
     None
 }
 
-fn map_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameCandidateRow> {
+fn map_candidate(row: &crate::pg::Row<'_>) -> crate::pg::Result<GameCandidateRow> {
     let platforms_json: String = row.get(17)?;
     let languages_json: String = row.get(18)?;
     let final_price_minor: Option<i64> = row.get(22)?;
@@ -1670,7 +1554,7 @@ fn map_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameCandidateRow> 
         is_free: sql_to_opt_bool(row.get(21)?),
         final_price_minor,
         price_currency,
-        has_demo: row.get::<_, i64>(24)? != 0,
+        has_demo: row.get(24)?,
         profile_observed_at_ms,
         reviews_observed_at_ms: row.get(39)?,
         activity_observed_at_ms: row.get(40)?,
@@ -1679,7 +1563,7 @@ fn map_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameCandidateRow> 
     })
 }
 
-fn map_candidate_with_percentile(row: &rusqlite::Row<'_>) -> rusqlite::Result<GameCandidateRow> {
+fn map_candidate_with_percentile(row: &crate::pg::Row<'_>) -> crate::pg::Result<GameCandidateRow> {
     let mut candidate = map_candidate(row)?;
     candidate.activity_percentile = row.get(43)?;
     Ok(candidate)
@@ -1750,13 +1634,13 @@ fn parse_catalog_taxonomy(value: Option<&str>) -> (Vec<String>, Option<String>) 
     (tags, publisher)
 }
 
-fn parse_string_list(index: usize, value: &str) -> rusqlite::Result<Vec<String>> {
+fn parse_string_list(index: usize, value: &str) -> crate::pg::Result<Vec<String>> {
     serde_json::from_str(value).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+        crate::pg::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
     })
 }
 
-fn map_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceRow> {
+fn map_evidence(row: &crate::pg::Row<'_>) -> crate::pg::Result<EvidenceRow> {
     Ok(EvidenceRow {
         evidence_id: row.get(0)?,
         feature_name: row.get(1)?,
@@ -1777,11 +1661,11 @@ pub fn data_updated_at_ms(conn: &Connection) -> StorageResult<i64> {
              -- durable watermarks avoids full scans of every snapshot table.
              SELECT MAX(updated_at_ms) AS updated_at_ms FROM data_refresh_state
              UNION ALL SELECT MAX(updated_at_ms) FROM apps
-             UNION ALL SELECT MAX(started_at_ms, COALESCE(finished_at_ms, 0))
+             UNION ALL SELECT GREATEST(started_at_ms, COALESCE(finished_at_ms, 0))
                  FROM source_runs
                  WHERE run_id = (SELECT MAX(run_id) FROM source_runs)
-             UNION ALL SELECT MAX(MAX(created_at_ms, COALESCE(revoked_at_ms, 0))) FROM curation_overrides
-          )",
+             UNION ALL SELECT MAX(GREATEST(created_at_ms, COALESCE(revoked_at_ms, 0))) FROM curation_overrides
+          ) watermarks",
         [],
         |row| row.get(0),
     )?;
@@ -2215,7 +2099,7 @@ mod tests {
                     "INSERT INTO multiplayer_profiles (
                          app_id, dominant_mode, recommended_min_players,
                          profile_confidence, computed_at_ms
-                     ) VALUES (?1, 'generic_multiplayer', 2, 0.3, 1)",
+                     ) VALUES ($1, 'generic_multiplayer', 2, 0.3, 1)",
                     [app_id],
                 )?;
             }
@@ -2264,8 +2148,8 @@ mod tests {
                     "INSERT INTO multiplayer_profiles (
                          app_id, dominant_mode, recommended_min_players,
                          profile_confidence, computed_at_ms
-                     ) VALUES (?1, 'generic_multiplayer', 2, 0.3, ?2)",
-                    (app_id, app_id),
+                     ) VALUES ($1, 'generic_multiplayer', 2, 0.3, $2)",
+                    crate::pg::params![app_id, app_id],
                 )?;
             }
 
@@ -2333,8 +2217,8 @@ mod tests {
                     "INSERT INTO player_daily (
                         app_id, day_utc, mean_ccu, median_approx_ccu,
                         sample_count, missing_rate, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, 999999, 3, 0, 1)",
-                    rusqlite::params![42, format!("2026-07-{day:02}"), mean],
+                     ) VALUES ($1, $2, $3, 999999, 3, 0, 1)",
+                    crate::pg::params![42, format!("2026-07-{day:02}"), mean],
                 )?;
             }
 
@@ -2413,6 +2297,40 @@ mod tests {
     }
 
     #[test]
+    fn upcoming_candidates_keep_undated_demos_after_dated_releases() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn(|conn| {
+            for (app_id, app_type, date) in [(42, "game", Some("2026-08-10")), (43, "demo", None)] {
+                crate::catalog::upsert_app(
+                    conn,
+                    app_id,
+                    app_type,
+                    "Upcoming fixture",
+                    "coming_soon",
+                    date,
+                    date.map(|_| "day"),
+                    None,
+                    1,
+                )?;
+            }
+            let rows = list_candidates(
+                conn,
+                FeedSection::Upcoming,
+                CUTOFF,
+                TODAY,
+                "CNY",
+                &RecommendationConfig::default(),
+                1,
+            )?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].app_id, 42);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn classic_prefilter_keeps_activity_percentiles_from_the_full_ranked_scope() {
         let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
@@ -2436,17 +2354,17 @@ mod tests {
                      total_positive, total_negative, total_reviews, wilson_lower,
                      filter_offtopic_activity, parameter_hash, content_hash, source
                  ) VALUES
-                 (501, 'all', 'all', CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                 (501, 'all', 'all', (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-28' AT TIME ZONE 'UTC'))::bigint * 1000),
                     2800, 200, 3000, 0.83, 1, 'p1', 'r1', 'test'),
-                 (502, 'all', 'all', CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                 (502, 'all', 'all', (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-28' AT TIME ZONE 'UTC'))::bigint * 1000),
                     90, 10, 100, 0.90, 1, 'p2', 'r2', 'test');
                  INSERT INTO player_snapshots (
                      app_id, captured_at_ms, player_count, result_code,
                      content_hash, source
                  ) VALUES
-                 (501, CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                 (501, (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-28' AT TIME ZONE 'UTC'))::bigint * 1000),
                     100, 1, 'c1', 'test'),
-                 (502, CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                 (502, (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-28' AT TIME ZONE 'UTC'))::bigint * 1000),
                     1000, 1, 'c2', 'test');",
             )?;
 
@@ -2491,7 +2409,7 @@ mod tests {
                     profile_confidence, computed_at_ms
                  ) VALUES (
                     77, 'coop', 1, 1, 2, 4, 0.8,
-                    CAST(strftime('%s', '2026-07-01') AS INTEGER) * 1000
+                    (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-01' AT TIME ZONE 'UTC'))::bigint * 1000)
                  )",
                 [],
             )?;
@@ -2501,26 +2419,26 @@ mod tests {
                     confidence, observed_at_ms, expires_at_ms, is_active
                  ) VALUES
                  (77, 'matchmaking_core', 'true', 'test', 'stale', 0.95,
-                    CAST(strftime('%s', '2025-01-01') AS INTEGER) * 1000, NULL, 1),
+                    (EXTRACT(EPOCH FROM (TIMESTAMP '2025-01-01' AT TIME ZONE 'UTC'))::bigint * 1000), NULL, 1),
                  (77, 'public_world_dependency', 'false', 'test', 'fresh', 0.72,
-                    CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000, NULL, 1),
+                    (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-27' AT TIME ZONE 'UTC'))::bigint * 1000), NULL, 1),
                  (77, 'service_shutdown_risk', 'true', 'test', 'expired', 0.99,
-                    CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000,
-                    CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000, 1),
+                    (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-27' AT TIME ZONE 'UTC'))::bigint * 1000),
+                    (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-27' AT TIME ZONE 'UTC'))::bigint * 1000), 1),
                  (77, 'catalog_taxonomy',
                     '{\"categories\":[\"Co-op\"],\"genres\":[\"Action\"],\"publishers\":[\"Studio\"]}',
                     'test', 'taxonomy', 0.8,
-                    CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000, NULL, 1);
+                    (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-27' AT TIME ZONE 'UTC'))::bigint * 1000), NULL, 1);
                  INSERT INTO price_snapshots (
                     app_id, country_code, currency, captured_at_ms,
                     initial_price_minor, final_price_minor, discount_percent,
                     is_purchasable, package_id, source
                  ) VALUES
-                 (77, 'US', 'USD', CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000,
+                 (77, 'US', 'USD', (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-27' AT TIME ZONE 'UTC'))::bigint * 1000),
                     3000, 2500, 17, 1, NULL, 'test'),
-                 (77, 'CA', 'USD', CAST(strftime('%s', '2026-07-28') AS INTEGER) * 1000,
+                 (77, 'CA', 'USD', (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-28' AT TIME ZONE 'UTC'))::bigint * 1000),
                     1500, 1200, 20, 1, NULL, 'test'),
-                 (77, 'CN', 'CNY', CAST(strftime('%s', '2026-07-20') AS INTEGER) * 1000,
+                 (77, 'CN', 'CNY', (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-20' AT TIME ZONE 'UTC'))::bigint * 1000),
                     1000, 800, 20, 1, NULL, 'test');",
             )?;
 
@@ -2553,7 +2471,7 @@ mod tests {
 
             conn.execute(
                 "UPDATE feature_evidence
-                 SET expires_at_ms = CAST(strftime('%s', '2026-07-27') AS INTEGER) * 1000
+                 SET expires_at_ms = (EXTRACT(EPOCH FROM (TIMESTAMP '2026-07-27' AT TIME ZONE 'UTC'))::bigint * 1000)
                  WHERE app_id = 77 AND feature_name = 'catalog_taxonomy'",
                 [],
             )?;
@@ -2587,7 +2505,7 @@ mod tests {
 
             conn.execute(
                 "UPDATE multiplayer_profiles
-                 SET computed_at_ms = CAST(strftime('%s', '2026-01-01') AS INTEGER) * 1000
+                 SET computed_at_ms = (EXTRACT(EPOCH FROM (TIMESTAMP '2026-01-01' AT TIME ZONE 'UTC'))::bigint * 1000)
                  WHERE app_id = 77",
                 [],
             )?;

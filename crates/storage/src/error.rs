@@ -2,8 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    #[error("postgresql error: {0}")]
+    Database(#[from] crate::pg::Error),
 
     #[error("migration error: {message}")]
     Migration { message: String },

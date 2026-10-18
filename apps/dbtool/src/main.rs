@@ -1,12 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod e2e_fixture;
 mod golden_evaluation;
 mod recommendation_audit;
 
-use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
@@ -22,8 +21,8 @@ use mpgs_steam_source::{
     parse_popular_reviews, parse_review_summary, parse_store_details, parse_store_search_page,
 };
 use mpgs_storage::{
-    Clock, Database, EnrichmentNeedFilter, HASH_EMBED_MODEL, MediaCoverageStats, PutEmbedding,
-    Repository, StorageError, StorageResult, SystemClock,
+    Database, EnrichmentNeedFilter, HASH_EMBED_MODEL, PutEmbedding, Repository, StorageError,
+    StorageResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,11 +38,6 @@ const APP_LIST_PAGES_DEFAULT: u32 = 1;
 const APP_LIST_PAGES_MAX: u32 = 100;
 const APP_LIST_PAGE_SIZE_DEFAULT: u32 = 1_000;
 const APP_LIST_INTER_REQUEST_MS: u64 = 1_100;
-const WORKER_JOB_LIMIT_DEFAULT: i64 = 1;
-const WORKER_JOB_LIMIT_MAX: i64 = 10;
-const WORKER_LEASE_MS: i64 = 30 * 60 * 1_000;
-const WORKER_RETRY_BASE_MS: i64 = 60 * 1_000;
-const WORKER_PIPELINE_SNAPSHOT_INTERVAL_MS: i64 = 15 * 60 * 1_000;
 const STORE_SEARCH_TARGET_DEFAULT: u32 = 2_000;
 const STORE_SEARCH_TARGET_MAX: u32 = 10_000;
 const CANDIDATE_WORKER_PAGES_DEFAULT: u32 = 10;
@@ -59,7 +53,6 @@ const ENRICH_LIMIT_MAX: u32 = 5_000;
 const ENRICH_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ENRICH_INTER_REQUEST_MS: u64 = 2_500;
 const ENRICH_RATE_LIMIT_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
-const INTEGRATED_INGESTION_LIMIT: i64 = 10;
 const STORAGE_WRITE_RETRIES: u64 = 5;
 
 fn env_flag(name: &str) -> bool {
@@ -118,16 +111,6 @@ fn enrich_inter_request_ms() -> u64 {
         .unwrap_or(ENRICH_INTER_REQUEST_MS)
 }
 
-/// How many GetAppList pages each leased `sync_catalog` job consumes.
-/// Raise temporarily during catalog catch-up; keep at 1 for steady state.
-fn catalog_worker_pages() -> u32 {
-    env::var("MPGS_CATALOG_WORKER_PAGES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|value| (1..=APP_LIST_PAGES_MAX).contains(value))
-        .unwrap_or(APP_LIST_PAGES_DEFAULT)
-}
-
 fn configured_enrichment_need_filter(media_enabled: bool) -> EnrichmentNeedFilter {
     let store_only = env_flag("MPGS_ENRICH_STORE_ONLY");
     let skip_reviews = store_only || env_flag("MPGS_ENRICH_SKIP_REVIEWS");
@@ -142,212 +125,6 @@ fn configured_enrichment_need_filter(media_enabled: bool) -> EnrichmentNeedFilte
         media_backfill: !skip_store && media_enabled,
         english_name: !skip_store,
     }
-}
-
-fn media_backfill_due(
-    policy: mpgs_storage::MediaBackfillPolicy,
-    coverage: MediaCoverageStats,
-) -> bool {
-    policy.enabled
-        && coverage.candidate_apps > 0
-        && coverage.coverage_ratio + f64::EPSILON < policy.coverage_threshold
-}
-
-#[derive(Debug, Clone, Copy)]
-struct EnrichmentQuota {
-    filter: EnrichmentNeedFilter,
-    limit: u32,
-}
-
-fn enrichment_quota_plan(
-    limit: u32,
-    filter: EnrichmentNeedFilter,
-    rotation: u32,
-) -> Vec<EnrichmentQuota> {
-    let disabled = EnrichmentNeedFilter {
-        store: false,
-        reviews: false,
-        review_excerpts: false,
-        ccu: false,
-        price: false,
-        media_backfill: false,
-        english_name: false,
-    };
-    let mut groups = Vec::new();
-    if filter.store || filter.price {
-        groups.push(EnrichmentNeedFilter {
-            store: filter.store,
-            price: filter.price,
-            ..disabled
-        });
-    }
-    if filter.reviews || filter.review_excerpts {
-        groups.push(EnrichmentNeedFilter {
-            reviews: filter.reviews,
-            review_excerpts: filter.review_excerpts,
-            ..disabled
-        });
-    }
-    if filter.ccu {
-        groups.push(EnrichmentNeedFilter {
-            ccu: true,
-            ..disabled
-        });
-    }
-    if filter.english_name {
-        groups.push(EnrichmentNeedFilter {
-            english_name: true,
-            ..disabled
-        });
-    }
-    if filter.media_backfill {
-        groups.push(EnrichmentNeedFilter {
-            media_backfill: true,
-            ..disabled
-        });
-    }
-    if groups.is_empty() {
-        return Vec::new();
-    }
-
-    let group_count_usize = groups.len();
-    let group_count = u32::try_from(group_count_usize).unwrap_or(u32::MAX);
-    let base = limit / group_count;
-    let remainder = limit % group_count;
-    let start = usize::try_from(rotation % group_count).unwrap_or(0);
-    groups
-        .into_iter()
-        .enumerate()
-        .map(|(index, filter)| {
-            let rotated = (index + group_count_usize - start) % group_count_usize;
-            EnrichmentQuota {
-                filter,
-                limit: base + u32::from(rotated < usize::try_from(remainder).unwrap_or(0)),
-            }
-        })
-        .filter(|entry| entry.limit > 0)
-        .collect()
-}
-
-fn list_enrichment_targets_with_quotas(
-    repo: &Repository,
-    limit: u32,
-    after_app_id: u32,
-    country_code: &str,
-    language: &str,
-    filter: EnrichmentNeedFilter,
-    media_policy: mpgs_storage::MediaBackfillPolicy,
-) -> StorageResult<Vec<mpgs_storage::EnrichmentTarget>> {
-    const SHARED_SCAN_MULTIPLIER: u32 = 16;
-    const SHARED_SCAN_MIN: u32 = 256;
-    const SHARED_SCAN_MAX: u32 = 4_096;
-
-    let mut merged = BTreeMap::<u32, mpgs_storage::EnrichmentTarget>::new();
-    let quotas = enrichment_quota_plan(limit, filter, after_app_id);
-    if quotas.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // The due-target query scans the complete candidate pool and evaluates
-    // several correlated freshness probes. Run one bounded shared scan for the
-    // normal path instead of repeating that work once per dimension. A rare
-    // dimension absent from the shared window gets one focused fallback query.
-    let shared_limit = limit
-        .saturating_mul(SHARED_SCAN_MULTIPLIER)
-        .clamp(SHARED_SCAN_MIN, SHARED_SCAN_MAX);
-    let shared = repo.list_enrichment_targets_after_filtered_with_media(
-        shared_limit,
-        Some(after_app_id),
-        country_code,
-        language,
-        filter,
-        media_policy,
-    )?;
-
-    for quota in quotas {
-        let mut selected = merged
-            .values()
-            .filter(|target| target.matches_filter(quota.filter))
-            .count();
-        for target in &shared {
-            if selected >= usize::try_from(quota.limit).unwrap_or(usize::MAX) {
-                break;
-            }
-            let target = target.filtered(quota.filter);
-            if !target.needs_any()
-                || merged
-                    .get(&target.app_id)
-                    .is_some_and(|current| current.matches_filter(quota.filter))
-            {
-                continue;
-            }
-            merge_enrichment_target(&mut merged, target);
-            selected += 1;
-        }
-
-        if selected < usize::try_from(quota.limit).unwrap_or(usize::MAX) {
-            let focused_limit = quota
-                .limit
-                .saturating_add(u32::try_from(selected).unwrap_or(u32::MAX));
-            let focused = repo.list_enrichment_targets_after_filtered_with_media(
-                focused_limit,
-                Some(after_app_id),
-                country_code,
-                language,
-                quota.filter,
-                media_policy,
-            )?;
-            for target in focused {
-                if selected >= usize::try_from(quota.limit).unwrap_or(usize::MAX) {
-                    break;
-                }
-                let target = target.filtered(quota.filter);
-                if !target.needs_any()
-                    || merged
-                        .get(&target.app_id)
-                        .is_some_and(|current| current.matches_filter(quota.filter))
-                {
-                    continue;
-                }
-                merge_enrichment_target(&mut merged, target);
-                selected += 1;
-            }
-        }
-    }
-
-    // Empty dimensions do not waste their quota. Fill remaining app slots from
-    // the already-loaded shared window without another database scan.
-    let target_limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    for target in shared {
-        let target = target.filtered(filter);
-        if target.needs_any()
-            && (merged.contains_key(&target.app_id) || merged.len() < target_limit)
-        {
-            merge_enrichment_target(&mut merged, target);
-        }
-    }
-    let mut targets = merged.into_values().collect::<Vec<_>>();
-    targets.sort_by_key(|target| (target.app_id <= after_app_id, target.app_id));
-    targets.truncate(target_limit);
-    Ok(targets)
-}
-
-fn merge_enrichment_target(
-    merged: &mut BTreeMap<u32, mpgs_storage::EnrichmentTarget>,
-    target: mpgs_storage::EnrichmentTarget,
-) {
-    merged
-        .entry(target.app_id)
-        .and_modify(|current| {
-            current.needs_store_details |= target.needs_store_details;
-            current.needs_reviews |= target.needs_reviews;
-            current.needs_review_excerpts |= target.needs_review_excerpts;
-            current.needs_ccu |= target.needs_ccu;
-            current.needs_price |= target.needs_price;
-            current.needs_media_backfill |= target.needs_media_backfill;
-            current.needs_english_name |= target.needs_english_name;
-        })
-        .or_insert(target);
 }
 
 /// Continuation pages consumed per scheduled candidate-discovery channel.
@@ -441,35 +218,6 @@ struct CollectionError {
     stats: CollectionStats,
 }
 
-#[derive(Debug, Default)]
-struct SteamWorkerStats {
-    leased: usize,
-    completed: usize,
-    retried: usize,
-    dead: usize,
-}
-
-#[derive(Debug)]
-struct WorkerTaskError {
-    category: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct IntegratedIngestionStats {
-    claimed_apps: usize,
-    completed_apps: usize,
-    retried_apps: usize,
-    dead_apps: usize,
-}
-
-fn integrated_ingestion_should_continue(stats: &IntegratedIngestionStats, limit: i64) -> bool {
-    limit > 0
-        && stats.claimed_apps >= usize::try_from(limit).unwrap_or(usize::MAX)
-        && stats.completed_apps > 0
-        && stats.retried_apps == 0
-        && stats.dead_apps == 0
-}
-
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -485,58 +233,57 @@ fn run() -> Result<(), String> {
     let cmd = args.next().ok_or_else(|| usage().to_owned())?;
 
     match cmd.as_str() {
+        "e2e-fixture" => e2e_fixture::run_command(args),
         "recommendation-golden-evaluate" => golden_evaluation::run_command(args),
         "recommendation-audit" => recommendation_audit::run_command(args),
         "migrate" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let db = Database::open(&db_path).map_err(err)?;
             let version = db.migrate().map_err(err)?;
-            println!("migrated {} to schema version {version}", db_path.display());
+            println!("migrated PostgreSQL to schema version {version}");
             db.assert_ready().map_err(err)?;
             Ok(())
         }
-        "integrity" => {
-            let db_path = required_path(args.next(), "--db path")?;
+        "integrity" | "ready" => {
+            let db_path = required_database_url(args.next())?;
             let db = Database::open(&db_path).map_err(err)?;
             let version = db.schema_version().map_err(err)?;
-            // `assert_ready` already runs the full integrity check. Running it
-            // separately first doubled large production backup validation time.
             db.assert_ready().map_err(err)?;
-            println!("path={}", db_path.display());
+            println!("database=postgresql");
             println!("schema_version={version}");
-            println!("integrity_check=[\"ok\"]");
+            println!("postgres_readiness=ok");
             println!("ready=ok");
             Ok(())
         }
         "feature-evidence-retention" => run_feature_evidence_retention(args),
         "pipeline-retention" => run_pipeline_retention(args),
         "recover-steam-leases" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             if args.next().is_some() {
-                return Err("recover-steam-leases accepts only db-path".into());
+                return Err("recover-steam-leases accepts only database-url|env".into());
             }
-            // Deployment calls this after stopping every application writer and
-            // before taking the backup. Do not migrate the database here.
+            // Recovery is expiry-scoped and never takes a live lease from
+            // another Vercel invocation.
             let db = Database::open(&db_path).map_err(err)?;
             let schema_version = db.schema_version().map_err(err)?;
             let repo = Repository::new(db);
             let (recovered, recovered_game_ingestion) =
-                recover_controlled_deploy_leases(&repo).map_err(err)?;
-            println!("path={}", db_path.display());
+                recover_expired_steam_leases(&repo).map_err(err)?;
+            println!("database=postgresql");
             println!("schema_version={schema_version}");
             println!("steam_leases_recovered={recovered}");
             println!("game_ingestion_leases_recovered={recovered_game_ingestion}");
             Ok(())
         }
         "requeue-game-ingestion" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let app_id = required_app_id(args.next())?;
             let stage = args.next().ok_or("stage is required")?;
             let operator = args.next().ok_or("operator is required")?;
             let reason = args.next().ok_or("reason is required")?;
             if args.next().is_some() {
                 return Err(
-                    "requeue-game-ingestion accepts db-path, app-id, stage, operator, and reason only"
+                    "requeue-game-ingestion accepts database-url|env, app-id, stage, operator, and reason only"
                         .into(),
                 );
             }
@@ -546,31 +293,31 @@ fn run() -> Result<(), String> {
             let changed = repo
                 .requeue_dead_game_ingestion_task(app_id, &stage, &operator, &reason)
                 .map_err(err)?;
-            println!("path={}", db_path.display());
+            println!("database=postgresql");
             println!("app_id={app_id}");
             println!("stage={stage}");
             println!("requeued={changed}");
             Ok(())
         }
         "m3-audit" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let db = Database::open(&db_path).map_err(err)?;
             db.assert_ready().map_err(err)?;
             let repo = Repository::new(db);
             repo.readiness_check().map_err(err)?;
-            audit_m3(&repo, &db_path)
+            audit_m3(&repo)
         }
         "m7-data-audit" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let upcoming_shortfall_reason = parse_m7_audit_options(&mut args)?;
             let db = Database::open(&db_path).map_err(err)?;
             db.assert_ready().map_err(err)?;
             let repo = Repository::new(db);
             repo.readiness_check().map_err(err)?;
-            audit_m7(&repo, &db_path, upcoming_shortfall_reason.as_deref())
+            audit_m7(&repo, upcoming_shortfall_reason.as_deref())
         }
         "sync-retrieval" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let limit = args
                 .next()
                 .as_deref()
@@ -590,7 +337,7 @@ fn run() -> Result<(), String> {
             let stats = repo
                 .sync_retrieval_from_catalog(limit, after, true)
                 .map_err(err)?;
-            println!("path={}", db_path.display());
+            println!("database=postgresql");
             println!("apps_scanned={}", stats.apps_scanned);
             println!("documents_written={}", stats.documents_written);
             println!("documents_unchanged={}", stats.documents_unchanged);
@@ -601,7 +348,7 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "extract-offline-features" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let limit = args
                 .next()
                 .as_deref()
@@ -621,7 +368,7 @@ fn run() -> Result<(), String> {
             db.assert_ready().map_err(err)?;
             let repo = Repository::new(db);
             let stats = repo.extract_offline_features(limit, after).map_err(err)?;
-            println!("path={}", db_path.display());
+            println!("database=postgresql");
             println!("apps_scanned={}", stats.apps_scanned);
             println!("analyses_written={}", stats.analyses_written);
             println!("analyses_unchanged={}", stats.analyses_unchanged);
@@ -633,24 +380,24 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "materialize-store-profiles" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             if args.next().is_some() {
-                return Err("materialize-store-profiles accepts only db-path".into());
+                return Err("materialize-store-profiles accepts only database-url|env".into());
             }
             let db = Database::open(&db_path).map_err(err)?;
             db.migrate().map_err(err)?;
             let repo = Repository::new(db);
             repo.ensure_runtime_defaults().map_err(err)?;
             let applied = repo.materialize_store_category_profiles().map_err(err)?;
-            println!("path={}", db_path.display());
+            println!("database=postgresql");
             println!("store_profiles_applied={applied}");
             println!("materialize_store_profiles=ok");
             Ok(())
         }
         "repair-empty-availability" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             if args.next().is_some() {
-                return Err("repair-empty-availability accepts only db-path".into());
+                return Err("repair-empty-availability accepts only database-url|env".into());
             }
             let db = Database::open(&db_path).map_err(err)?;
             db.migrate().map_err(err)?;
@@ -659,13 +406,13 @@ fn run() -> Result<(), String> {
             let restored = repo
                 .restore_empty_availability_from_evidence()
                 .map_err(err)?;
-            println!("path={}", db_path.display());
+            println!("database=postgresql");
             println!("availability_fields_restored={restored}");
             println!("repair_empty_availability=ok");
             Ok(())
         }
         "embed-documents" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let limit = args
                 .next()
                 .as_deref()
@@ -696,7 +443,7 @@ fn run() -> Result<(), String> {
             let stats = rt
                 .block_on(embed_documents_batch(&repo, limit, batch))
                 .map_err(err_ai)?;
-            println!("path={}", db_path.display());
+            println!("database=postgresql");
             println!("provider={}", stats.provider);
             println!("model={}", stats.model);
             println!("targets={}", stats.targets);
@@ -708,12 +455,13 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "collect-steam-catalog" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let max_pages = optional_catalog_page_count(args.next())?;
             let page_size = optional_catalog_page_size(args.next())?;
             if args.next().is_some() {
                 return Err(
-                    "collect-steam-catalog accepts db-path, max-pages, and page-size only".into(),
+                    "collect-steam-catalog accepts database-url|env, max-pages, and page-size only"
+                        .into(),
                 );
             }
             let api_key = steam_web_api_key()?;
@@ -742,7 +490,7 @@ fn run() -> Result<(), String> {
                         Some("cursor persisted"),
                     )
                     .map_err(err)?;
-                    println!("path={}", db_path.display());
+                    println!("database=postgresql");
                     println!("requests={}", stats.request_count);
                     println!("apps_ingested={}", stats.success_count);
                     println!("catalog_apps={}", repo.count_apps().map_err(err)?);
@@ -775,10 +523,12 @@ fn run() -> Result<(), String> {
             }
         }
         "collect-steam-candidates" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let target = optional_target(args.next())?;
             if args.next().is_some() {
-                return Err("collect-steam-candidates accepts at most db-path and target".into());
+                return Err(
+                    "collect-steam-candidates accepts at most database-url|env and target".into(),
+                );
             }
             let db = Database::open(&db_path).map_err(err)?;
             db.migrate().map_err(err)?;
@@ -807,7 +557,7 @@ fn run() -> Result<(), String> {
                     )
                     .map_err(err)?;
                     let after = repo.m3_catalog_coverage().map_err(err)?;
-                    println!("path={}", db_path.display());
+                    println!("database=postgresql");
                     println!("requests={}", stats.request_count);
                     println!("rows_ingested={}", stats.success_count);
                     println!(
@@ -843,10 +593,10 @@ fn run() -> Result<(), String> {
             }
         }
         "enrich-steam-app" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let app_id = required_app_id(args.next())?;
             if args.next().is_some() {
-                return Err("enrich-steam-app accepts only db-path and app-id".into());
+                return Err("enrich-steam-app accepts only database-url|env and app-id".into());
             }
             let db = Database::open(&db_path).map_err(err)?;
             db.migrate().map_err(err)?;
@@ -905,7 +655,7 @@ fn run() -> Result<(), String> {
                             stats.error_count
                         ));
                     }
-                    println!("path={}", db_path.display());
+                    println!("database=postgresql");
                     println!("app_id={app_id}");
                     println!("steam_app_enrichment=ok");
                     Ok(())
@@ -927,10 +677,12 @@ fn run() -> Result<(), String> {
             }
         }
         "enrich-steam-candidates" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             let limit = optional_enrich_limit(args.next())?;
             if args.next().is_some() {
-                return Err("enrich-steam-candidates accepts at most db-path and limit".into());
+                return Err(
+                    "enrich-steam-candidates accepts at most database-url|env and limit".into(),
+                );
             }
             let db = Database::open(&db_path).map_err(err)?;
             db.migrate().map_err(err)?;
@@ -963,7 +715,7 @@ fn run() -> Result<(), String> {
                 .filter(|target| target.needs_any())
                 .collect();
             if targets.is_empty() {
-                println!("path={}", db_path.display());
+                println!("database=postgresql");
                 print_coverage(&before);
                 println!("steam_candidate_enrichment=already_satisfied");
                 return Ok(());
@@ -1023,7 +775,7 @@ fn run() -> Result<(), String> {
                     )
                     .map_err(err)?;
                     let after = repo.m3_catalog_coverage().map_err(err)?;
-                    println!("path={}", db_path.display());
+                    println!("database=postgresql");
                     println!("requests={}", stats.request_count);
                     println!("apps_attempted={}", stats.apps_attempted);
                     println!("store_details_ok={}", stats.store_ok);
@@ -1065,41 +817,45 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        "run-steam-worker-once" => {
-            let db_path = required_path(args.next(), "--db path")?;
-            let job_limit = optional_worker_job_limit(args.next())?;
-            let enrich_limit = optional_enrich_limit(args.next())?;
+        "run-steam-worker-once" | "run-maintenance-once" => {
+            let db_path = required_database_url(args.next())?;
+            let mut options = mpgs_worker::BatchOptions::from_env(configured_worker_owner()?)?;
+            if let Some(value) = args.next() {
+                options.job_limit = value
+                    .parse::<usize>()
+                    .map_err(|_| "job-limit must be an integer".to_owned())?;
+            }
+            if let Some(value) = args.next() {
+                options.stage_limit = value
+                    .parse::<usize>()
+                    .map_err(|_| "stage-limit must be an integer".to_owned())?;
+            }
             if args.next().is_some() {
                 return Err(
-                    "run-steam-worker-once accepts db-path, job-limit, and enrich-limit only"
+                    "run-maintenance-once accepts database-url|env, job-limit, and stage-limit only"
                         .into(),
                 );
             }
-            let api_key = optional_steam_web_api_key()?;
-            let owner = configured_worker_owner()?;
             let db = Database::open(&db_path).map_err(err)?;
-            db.migrate().map_err(err)?;
+            db.assert_ready().map_err(err)?;
             let repo = Repository::new(db);
-            repo.ensure_runtime_defaults().map_err(err)?;
-            let stats =
-                run_steam_worker_once(&repo, &owner, job_limit, enrich_limit, api_key.as_deref())?;
-            println!("path={}", db_path.display());
-            println!("worker={owner}");
-            println!("jobs_leased={}", stats.leased);
-            println!("jobs_completed={}", stats.completed);
-            println!("jobs_retried={}", stats.retried);
-            println!("jobs_dead={}", stats.dead);
+            let stats = mpgs_worker::run_batch(&repo, &options)?;
+            println!("database=postgresql");
+            println!("{}", serde_json::to_string(&stats).map_err(err)?);
             if stats.dead > 0 {
-                Err(format!("Steam worker marked {} job(s) dead", stats.dead))
+                Err(format!(
+                    "maintenance worker marked {} job(s) dead",
+                    stats.dead
+                ))
             } else {
-                println!("steam_worker=ok");
+                println!("maintenance=ok");
                 Ok(())
             }
         }
         "import-golden-profiles" => {
-            let db_path = required_path(args.next(), "--db path")?;
+            let db_path = required_database_url(args.next())?;
             if args.next().is_some() {
-                return Err("import-golden-profiles accepts only db-path".into());
+                return Err("import-golden-profiles accepts only database-url|env".into());
             }
             let db = Database::open(&db_path).map_err(err)?;
             db.migrate().map_err(err)?;
@@ -1114,7 +870,7 @@ fn run() -> Result<(), String> {
                 }
             }
             let after = repo.m3_catalog_coverage().map_err(err)?;
-            println!("path={}", db_path.display());
+            println!("database=postgresql");
             println!("golden_set_version={}", set.version);
             println!("golden_games={}", set.games.len());
             println!("profiles_applied={}", applied);
@@ -1133,34 +889,6 @@ fn run() -> Result<(), String> {
             println!("golden_profile_import=ok");
             Ok(())
         }
-        "backup" => {
-            let db_path = required_path(args.next(), "--db path")?;
-            let out_path = required_path(args.next(), "--out path")?;
-            let db = Database::open(&db_path).map_err(err)?;
-            // The backup implementation verifies the copied database with a
-            // full integrity check before publishing it. Avoid repeating the
-            // O(database size) integrity/FK scans against the quiesced source;
-            // deploys on the small production host otherwise spend most of
-            // their downtime here before the backup even starts.
-            db.readiness_check().map_err(err)?;
-            let repo = Repository::new(db);
-            repo.backup_to(&out_path).map_err(err)?;
-            println!("backed up {} -> {}", db_path.display(), out_path.display());
-            Ok(())
-        }
-        "restore" => {
-            let backup_path = required_path(args.next(), "--from path")?;
-            let dest_path = required_path(args.next(), "--to path")?;
-            let now = SystemClock.now_ms();
-            let repo = Repository::restore_backup(&backup_path, &dest_path, now).map_err(err)?;
-            repo.assert_ready().map_err(err)?;
-            println!(
-                "restored {} -> {} (schema ok)",
-                backup_path.display(),
-                dest_path.display()
-            );
-            Ok(())
-        }
         "help" | "-h" | "--help" => {
             println!("{}", usage());
             Ok(())
@@ -1169,38 +897,27 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn recover_controlled_deploy_leases(repo: &Repository) -> StorageResult<(usize, usize)> {
-    // The target image runs this before migrations, so it must also support the
-    // immediately preceding schema where the integrated queue does not exist.
-    let has_game_ingestion_queue = repo.database().with_conn(|conn| {
-        conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM sqlite_schema
-                 WHERE type = 'table' AND name = 'game_ingestion_queue'
-             )",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(Into::into)
-    })?;
-    let recovered = repo.recover_leased_jobs(Some("steam"))?;
-    let recovered_game_ingestion = if has_game_ingestion_queue {
-        repo.recover_game_ingestion_leases()?
-    } else {
-        0
+fn recover_expired_steam_leases(repo: &Repository) -> StorageResult<(usize, usize)> {
+    // In serverless deployments another invocation may still own a live lease.
+    // Repository recovery only releases expired leases.
+    Ok((
+        repo.recover_leased_jobs(Some("steam"))?,
+        repo.recover_game_ingestion_leases()?,
+    ))
+}
+
+fn required_database_url(arg: Option<String>) -> Result<String, String> {
+    let value = match arg.as_deref() {
+        None | Some("env") => env::var("MPGS_DATABASE_URL")
+            .or_else(|_| env::var("DATABASE_URL"))
+            .map_err(|_| "MPGS_DATABASE_URL must be configured".to_owned())?,
+        Some(value) => value.to_owned(),
     };
-    Ok((recovered, recovered_game_ingestion))
-}
-
-fn required_path(arg: Option<String>, label: &str) -> Result<PathBuf, String> {
-    let value = arg.ok_or_else(|| format!("missing {label}"))?;
-    // allow either bare path or --db path form
-    if value.starts_with("--") {
-        return Err(format!("expected path for {label}, got flag {value}"));
+    if !value.starts_with("postgres://") && !value.starts_with("postgresql://") {
+        return Err("database must be a PostgreSQL URL or 'env' to use MPGS_DATABASE_URL".into());
     }
-    Ok(PathBuf::from(value))
+    Ok(value)
 }
-
 fn optional_target(arg: Option<String>) -> Result<u32, String> {
     let target = match arg {
         Some(value) => value
@@ -1261,21 +978,6 @@ fn optional_catalog_page_size(arg: Option<String>) -> Result<u32, String> {
     Ok(page_size)
 }
 
-fn optional_worker_job_limit(arg: Option<String>) -> Result<i64, String> {
-    let limit = match arg {
-        Some(value) => value
-            .parse::<i64>()
-            .map_err(|_| format!("invalid worker job limit: {value}"))?,
-        None => WORKER_JOB_LIMIT_DEFAULT,
-    };
-    if !(1..=WORKER_JOB_LIMIT_MAX).contains(&limit) {
-        return Err(format!(
-            "worker job limit must be between 1 and {WORKER_JOB_LIMIT_MAX}"
-        ));
-    }
-    Ok(limit)
-}
-
 fn steam_web_api_key() -> Result<String, String> {
     optional_steam_web_api_key()?
         .ok_or_else(|| "MPGS_STEAM_WEB_API_KEY is required for collect-steam-catalog".to_owned())
@@ -1295,660 +997,16 @@ fn optional_steam_web_api_key() -> Result<Option<String>, String> {
 }
 
 fn configured_worker_owner() -> Result<String, String> {
-    let owner = env::var("MPGS_STEAM_WORKER_ID")
-        .unwrap_or_else(|_| format!("mpgs-dbtool-{}", std::process::id()));
+    let owner = env::var("MPGS_STEAM_WORKER_ID").unwrap_or_else(|_| "mpgs-dbtool".into());
     let owner = owner.trim().to_owned();
-    if owner.is_empty() || owner.len() > 96 {
-        return Err("MPGS_STEAM_WORKER_ID must be between 1 and 96 bytes".into());
+    if owner.is_empty() || owner.len() > 60 {
+        return Err("MPGS_STEAM_WORKER_ID must be between 1 and 60 bytes".into());
     }
-    Ok(owner)
-}
-
-fn worker_retry_delay_ms(category: &str, attempts: i64) -> i64 {
-    let exponent = attempts.clamp(1, 6) as u32 - 1;
-    let exponential = WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent);
-    if category == "rate_limited" {
-        exponential.max(i64::try_from(ENRICH_RATE_LIMIT_COOLDOWN_MS).unwrap_or(i64::MAX))
-    } else {
-        exponential
-    }
-}
-
-fn worker_task_status(task_type: &str) -> Option<(&'static str, &'static str)> {
-    match task_type {
-        "sync_catalog" => Some(("catalog_sync", APP_LIST_CURSOR_KEY)),
-        "collect_candidates" => Some(("candidate_continuation", STORE_SEARCH_STATUS_CURSOR_KEY)),
-        "collect_candidate_top" => Some(("candidate_top_refresh", STORE_SEARCH_STATUS_CURSOR_KEY)),
-        "collect_candidate_continuation" => {
-            Some(("candidate_continuation", STORE_SEARCH_STATUS_CURSOR_KEY))
-        }
-        "enrich_catalog" => Some(("enrichment", ENRICH_CURSOR_KEY)),
-        _ => None,
-    }
-}
-
-fn record_worker_refresh(
-    repo: &Repository,
-    task_name: &str,
-    cursor_key: &str,
-    error_category: Option<&str>,
-) -> StorageResult<()> {
-    let previous = repo
-        .data_refresh_status()?
-        .into_iter()
-        .find(|status| status.task_name == task_name);
-    let cursor = repo.source_cursor(cursor_key)?;
-    let now_ms = repo.database().now_ms();
-    repo.update_data_refresh_status(
-        task_name,
-        if error_category.is_none() {
-            Some(now_ms)
-        } else {
-            previous
-                .as_ref()
-                .and_then(|status| status.last_success_at_ms)
-        },
-        previous.as_ref().and_then(|status| status.next_run_at_ms),
-        error_category,
-        cursor.as_deref(),
-        None,
-    )
-}
-
-fn worker_storage_error(_error: impl std::fmt::Display) -> WorkerTaskError {
-    WorkerTaskError {
-        category: "network",
-    }
-}
-
-fn worker_storage_with_retry<T>(
-    write: impl FnMut() -> StorageResult<T>,
-) -> Result<T, WorkerTaskError> {
-    storage_write_with_retry(write).map_err(|_| WorkerTaskError {
-        category: "storage",
-    })
-}
-
-fn worker_task_error(category: &'static str, _message: impl Into<String>) -> WorkerTaskError {
-    WorkerTaskError { category }
-}
-
-fn worker_job_error_category(category: &'static str) -> &'static str {
-    match category {
-        "network" | "rate_limited" | "auth" | "not_found" | "parse_changed" | "invalid_payload" => {
-            category
-        }
-        // The job contract has no distinct oversized-response category; a
-        // response exceeding the adapter bound is treated as a source-shape
-        // change and requires operator review rather than blind retries.
-        "response_too_large" => "parse_changed",
-        // SQLite writer contention or a transient local filesystem issue must
-        // not make an otherwise valid collection job permanently dead.
-        "storage" => "network",
-        _ => "invalid_payload",
-    }
-}
-
-fn worker_completion_key(owner: &str, job_id: i64) -> String {
-    format!("worker:{owner}:{job_id}")
-}
-
-fn integrated_ingestion_retry_delay_ms(category: &str, stage_attempts: i64) -> i64 {
-    if category == "rate_limited" {
-        return i64::try_from(ENRICH_RATE_LIMIT_COOLDOWN_MS).unwrap_or(i64::MAX);
-    }
-    let exponent = u32::try_from(stage_attempts.clamp(0, 6)).unwrap_or(0);
-    WORKER_RETRY_BASE_MS.saturating_mul(1_i64 << exponent)
-}
-
-fn process_integrated_game_ingestion_with(
-    repo: &Repository,
-    owner: &str,
-    limit: i64,
-    mut run_stage: impl FnMut(u32, &str) -> Result<(), SoftEnrichError>,
-) -> Result<IntegratedIngestionStats, WorkerTaskError> {
-    let (country_code, language) = configured_store_locale()
-        .map_err(|_| worker_task_error("invalid_payload", "invalid Steam store locale"))?;
-    let claimed = worker_storage_with_retry(|| {
-        repo.claim_game_ingestion_tasks(owner, limit, WORKER_LEASE_MS)
-    })?;
-    let mut stats = IntegratedIngestionStats {
-        claimed_apps: claimed.len(),
-        ..IntegratedIngestionStats::default()
-    };
-
-    for mut task in claimed {
-        loop {
-            if task.stage == "complete" {
-                stats.completed_apps = stats.completed_apps.saturating_add(1);
-                break;
-            }
-            if matches!(
-                task.enrichment_profile.as_str(),
-                "basic_upcoming" | "basic_demo"
-            ) && task.stage != "store_details"
-            {
-                task = worker_storage_with_retry(|| {
-                    repo.advance_game_ingestion_stage(task.app_id, owner)
-                })?;
-                continue;
-            }
-            let observed = repo
-                .game_ingestion_stage_observed(task.app_id, &task.stage, &country_code, &language)
-                .map_err(worker_storage_error)?;
-            if observed {
-                task = worker_storage_with_retry(|| {
-                    repo.advance_game_ingestion_stage(task.app_id, owner)
-                })?;
-                continue;
-            }
-
-            match run_stage(task.app_id, &task.stage) {
-                Ok(()) => {
-                    task = worker_storage_with_retry(|| {
-                        repo.advance_game_ingestion_stage(task.app_id, owner)
-                    })?;
-                }
-                Err(failure) => {
-                    let retry_delay_ms = integrated_ingestion_retry_delay_ms(
-                        failure.category,
-                        task.stage_failure_attempts,
-                    );
-                    if matches!(failure.category, "auth" | "config") {
-                        worker_storage_with_retry(|| {
-                            repo.pause_game_ingestion_lane(
-                                owner,
-                                failure.category,
-                                &failure.message,
-                                retry_delay_ms,
-                            )
-                        })?;
-                        eprintln!(
-                            "error integrated ingestion lane paused category={} message={}",
-                            failure.category, failure.message
-                        );
-                        return Err(worker_task_error(failure.category, failure.message));
-                    }
-                    let retried = worker_storage_with_retry(|| {
-                        repo.retry_game_ingestion_stage(
-                            task.app_id,
-                            owner,
-                            failure.category,
-                            &failure.message,
-                            retry_delay_ms,
-                        )
-                    })?;
-                    eprintln!(
-                        "warn app_id={} integrated_stage={} category={} message={}",
-                        task.app_id, task.stage, failure.category, failure.message
-                    );
-                    if retried.status == "dead" {
-                        stats.dead_apps = stats.dead_apps.saturating_add(1);
-                    } else {
-                        stats.retried_apps = stats.retried_apps.saturating_add(1);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    Ok(stats)
-}
-
-fn process_integrated_game_ingestion(
-    repo: &Repository,
-    owner: &str,
-    limit: i64,
-) -> Result<IntegratedIngestionStats, WorkerTaskError> {
-    let (country_code, language) = configured_store_locale()
-        .map_err(|_| worker_task_error("invalid_payload", "invalid Steam store locale"))?;
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(DEFAULT_USER_AGENT)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(3))
-        .build()
-        .map_err(|error| worker_task_error("network", error.to_string()))?;
-    let mut enrich_stats = EnrichStats::default();
-    let inter_request_ms = enrich_inter_request_ms();
-
-    process_integrated_game_ingestion_with(repo, owner, limit, |app_id, stage| {
-        let result = match stage {
-            "store_details" => enrich_store_details(
-                &client,
-                repo,
-                app_id,
-                &country_code,
-                &language,
-                &mut enrich_stats,
-            )
-            .map(|_| ()),
-            "review_summary" => enrich_reviews(&client, repo, app_id, &mut enrich_stats),
-            "popular_reviews" => enrich_popular_reviews(&client, repo, app_id, &mut enrich_stats),
-            "ccu" => enrich_ccu(&client, repo, app_id, &mut enrich_stats),
-            _ => Err(SoftEnrichError {
-                category: "invalid_payload",
-                message: format!("unknown integrated ingestion stage {stage}"),
-            }),
-        };
-        thread::sleep(Duration::from_millis(inter_request_ms));
-        result
-    })
-}
-
-fn run_steam_worker_once(
-    repo: &Repository,
-    owner: &str,
-    job_limit: i64,
-    enrich_limit: u32,
-    api_key: Option<&str>,
-) -> Result<SteamWorkerStats, String> {
-    let jobs = repo
-        .lease_jobs(owner, job_limit, WORKER_LEASE_MS, Some("steam"))
-        .map_err(err)?;
-    let mut stats = SteamWorkerStats {
-        leased: jobs.len(),
-        ..SteamWorkerStats::default()
-    };
-    for job in jobs {
-        let status = worker_task_status(&job.task_type);
-        let mut continue_enrichment = false;
-        let result = match job.task_type.as_str() {
-            "sync_catalog" => match api_key {
-                Some(key) => run_catalog_worker_task(repo, key),
-                None => Err(worker_task_error(
-                    "auth",
-                    "MPGS_STEAM_WEB_API_KEY is not configured for the worker",
-                )),
-            },
-            "collect_candidates" => run_candidate_worker_task(repo, owner),
-            "collect_candidate_top" => run_candidate_top_worker_task(repo, owner),
-            "collect_candidate_continuation" => run_candidate_worker_task(repo, owner),
-            "enrich_catalog" => {
-                run_enrichment_worker_task(repo, owner, enrich_limit).map(|has_more| {
-                    continue_enrichment = has_more;
-                })
-            }
-            _ => Err(worker_task_error(
-                "invalid_payload",
-                "unsupported Steam job type",
-            )),
-        };
-        match result {
-            Ok(()) => {
-                let completion_key = worker_completion_key(owner, job.job_id);
-                storage_write_with_retry(|| repo.complete_job(job.job_id, owner, &completion_key))
-                    .map_err(|failure| failure.message)?;
-                if let Some((task_name, cursor_key)) = status
-                    && let Err(failure) = storage_write_with_retry(|| {
-                        record_worker_refresh(repo, task_name, cursor_key, None)
-                    })
-                {
-                    eprintln!(
-                        "warn job_id={} task_type={} status_refresh={}",
-                        job.job_id, job.task_type, failure.message
-                    );
-                }
-                if continue_enrichment {
-                    let continuation = mpgs_storage::EnqueueJob {
-                        source: "steam".into(),
-                        task_type: "enrich_catalog".into(),
-                        entity_key: "scheduled".into(),
-                        priority: 50,
-                        due_at_ms: repo.database().now_ms(),
-                        idempotency_key: format!("enrichment-continuation:{}", job.job_id),
-                        payload_json: None,
-                        max_attempts: 3,
-                    };
-                    if let Err(failure) = storage_write_with_retry(|| {
-                        repo.enqueue_job_if_no_active(&continuation).map(|_| ())
-                    }) {
-                        eprintln!(
-                            "warn job_id={} enrichment_continuation={}",
-                            job.job_id, failure.message
-                        );
-                    }
-                }
-                if let Err(failure) =
-                    storage_write_with_retry(|| refresh_worker_pipeline_snapshot_if_due(repo))
-                {
-                    eprintln!(
-                        "warn job_id={} snapshot_refresh={}",
-                        job.job_id, failure.message
-                    );
-                }
-                stats.completed = stats.completed.saturating_add(1);
-            }
-            Err(failure) => {
-                let job_error_category = worker_job_error_category(failure.category);
-                let failed = storage_write_with_retry(|| {
-                    repo.fail_job(
-                        job.job_id,
-                        owner,
-                        job_error_category,
-                        worker_retry_delay_ms(job_error_category, job.attempts),
-                    )
-                })
-                .map_err(|failure| failure.message)?;
-                if let Some((task_name, cursor_key)) = status
-                    && let Err(failure) = storage_write_with_retry(|| {
-                        record_worker_refresh(repo, task_name, cursor_key, Some(job_error_category))
-                    })
-                {
-                    eprintln!(
-                        "warn job_id={} task_type={} status_refresh={}",
-                        job.job_id, job.task_type, failure.message
-                    );
-                }
-                if failed.status == "dead" {
-                    stats.dead = stats.dead.saturating_add(1);
-                } else {
-                    stats.retried = stats.retried.saturating_add(1);
-                }
-                if let Err(snapshot_failure) =
-                    storage_write_with_retry(|| refresh_worker_pipeline_snapshot_if_due(repo))
-                {
-                    eprintln!(
-                        "warn job_id={} snapshot_refresh={}",
-                        job.job_id, snapshot_failure.message
-                    );
-                }
-                eprintln!(
-                    "warn job_id={} task_type={} category={}",
-                    job.job_id, job.task_type, job_error_category
-                );
-            }
-        }
-    }
-    Ok(stats)
-}
-
-fn refresh_worker_pipeline_snapshot_if_due(repo: &Repository) -> StorageResult<()> {
-    let now_ms = repo.database().now_ms();
-    let due = repo.pipeline_status_snapshot()?.is_none_or(|snapshot| {
-        now_ms.saturating_sub(snapshot.generated_at_ms) >= WORKER_PIPELINE_SNAPSHOT_INTERVAL_MS
-    });
-    if due {
-        repo.refresh_pipeline_status_snapshot()?;
-    }
-    Ok(())
-}
-
-fn run_catalog_worker_task(repo: &Repository, api_key: &str) -> Result<(), WorkerTaskError> {
-    let max_pages = catalog_worker_pages();
-    let notes = format!(
-        "worker=true;max_pages={max_pages};page_size={APP_LIST_PAGE_SIZE_DEFAULT};key=present"
-    );
-    let run_id = worker_storage_with_retry(|| {
-        repo.start_source_run(
-            APP_LIST_SOURCE_NAME,
-            "catalog_sync",
-            APP_LIST_ADAPTER_VERSION,
-            Some(&notes),
-        )
-    })?;
-    match collect_steam_catalog(repo, api_key, max_pages, APP_LIST_PAGE_SIZE_DEFAULT) {
-        Ok(stats) => worker_storage_with_retry(|| {
-            repo.finish_source_run(
-                run_id,
-                "succeeded",
-                stats.request_count,
-                stats.success_count,
-                None,
-                Some("cursor persisted"),
-            )
-        }),
-        Err(failure) => {
-            let status = if failure.stats.success_count > 0 {
-                "partial"
-            } else {
-                "failed"
-            };
-            let _ = worker_storage_with_retry(|| {
-                repo.finish_source_run(
-                    run_id,
-                    status,
-                    failure.stats.request_count,
-                    failure.stats.success_count,
-                    Some(failure.category),
-                    Some(&failure.message),
-                )
-            });
-            Err(worker_task_error(failure.category, failure.message))
-        }
-    }
-}
-
-fn run_candidate_worker_task(repo: &Repository, owner: &str) -> Result<(), WorkerTaskError> {
-    let run_id = worker_storage_with_retry(|| {
-        repo.start_source_run(
-            STORE_SEARCH_SOURCE_NAME,
-            "candidate_discovery",
-            STORE_SEARCH_ADAPTER_VERSION,
-            Some(
-                "worker=true;channels=released_desc,comingsoon_released_asc;category2=1;cc=CN;l=schinese",
-            ),
-        )
-    })?;
-    match collect_steam_candidates(repo, STORE_SEARCH_TARGET_DEFAULT) {
-        Ok(stats) => {
-            let integrated =
-                process_integrated_game_ingestion(repo, owner, INTEGRATED_INGESTION_LIMIT)?;
-            let notes = format!(
-                "target reached or bounded refresh completed;integrated_claimed={};integrated_completed={};integrated_retried={}",
-                integrated.claimed_apps, integrated.completed_apps, integrated.retried_apps
-            );
-            worker_storage_with_retry(|| {
-                repo.finish_source_run(
-                    run_id,
-                    "succeeded",
-                    stats.request_count,
-                    stats.success_count,
-                    None,
-                    Some(&notes),
-                )
-            })
-        }
-        Err(failure) => {
-            let status = if failure.stats.success_count > 0 {
-                "partial"
-            } else {
-                "failed"
-            };
-            let _ = worker_storage_with_retry(|| {
-                repo.finish_source_run(
-                    run_id,
-                    status,
-                    failure.stats.request_count,
-                    failure.stats.success_count,
-                    Some(failure.category),
-                    Some(&failure.message),
-                )
-            });
-            Err(worker_task_error(failure.category, failure.message))
-        }
-    }
-}
-
-fn run_candidate_top_worker_task(repo: &Repository, owner: &str) -> Result<(), WorkerTaskError> {
-    let run_id = worker_storage_with_retry(|| {
-        repo.start_source_run(
-            STORE_SEARCH_SOURCE_NAME,
-            "candidate_top_refresh",
-            STORE_SEARCH_ADAPTER_VERSION,
-            Some("worker=true;pages=top;channels=released_desc,comingsoon_released_asc"),
-        )
-    })?;
-    match collect_steam_candidate_top_pages(repo) {
-        Ok(stats) => {
-            let integrated =
-                process_integrated_game_ingestion(repo, owner, INTEGRATED_INGESTION_LIMIT)?;
-            let notes = format!(
-                "top pages refreshed;integrated_claimed={};integrated_completed={};integrated_retried={}",
-                integrated.claimed_apps, integrated.completed_apps, integrated.retried_apps
-            );
-            worker_storage_with_retry(|| {
-                repo.finish_source_run(
-                    run_id,
-                    "succeeded",
-                    stats.request_count,
-                    stats.success_count,
-                    None,
-                    Some(&notes),
-                )
-            })
-        }
-        Err(failure) => {
-            let status = if failure.stats.success_count > 0 {
-                "partial"
-            } else {
-                "failed"
-            };
-            let _ = worker_storage_with_retry(|| {
-                repo.finish_source_run(
-                    run_id,
-                    status,
-                    failure.stats.request_count,
-                    failure.stats.success_count,
-                    Some(failure.category),
-                    Some(&failure.message),
-                )
-            });
-            Err(worker_task_error(failure.category, failure.message))
-        }
-    }
-}
-
-fn run_enrichment_worker_task(
-    repo: &Repository,
-    owner: &str,
-    limit: u32,
-) -> Result<bool, WorkerTaskError> {
-    let (country_code, language) = configured_store_locale()
-        .map_err(|_| worker_task_error("invalid_payload", "invalid Steam store locale"))?;
-    let integrated_limit = i64::from(limit).min(INTEGRATED_INGESTION_LIMIT);
-    let integrated = process_integrated_game_ingestion(repo, owner, integrated_limit)?;
-    let continue_integrated = integrated_ingestion_should_continue(&integrated, integrated_limit);
-    let limit = limit.saturating_sub(u32::try_from(integrated.claimed_apps).unwrap_or(limit));
-    if limit == 0 {
-        return Ok(continue_integrated);
-    }
-    let cursor = repo
-        .source_cursor(ENRICH_CURSOR_KEY)
-        .map_err(worker_storage_error)?
-        .map(|value| serde_json::from_str::<EnrichmentCursor>(&value))
-        .transpose()
-        .map_err(|_| worker_task_error("invalid_payload", "invalid stored enrichment cursor"))?
-        .unwrap_or_default();
-    let media_policy = configured_media_backfill_policy();
-    // Media coverage is a full candidate-scope query. Gate the quota once and
-    // reuse the result in run notes so a completed backfill lane cannot cause
-    // an extra coverage scan and a guaranteed-empty focused fallback.
-    let coverage = repo.media_coverage_stats().map_err(worker_storage_error)?;
-    let need_filter = configured_enrichment_need_filter(media_backfill_due(media_policy, coverage));
-    let targets = list_enrichment_targets_with_quotas(
-        repo,
-        limit,
-        cursor.after_app_id,
-        &country_code,
-        &language,
-        need_filter,
-        media_policy,
-    )
-    .map_err(worker_storage_error)?;
-    let run_notes = format!(
-        "worker=true;phase=quota;limit={limit};targets={};country={country_code};language={language};after_app_id={};media_coverage={:.3};media_with={}/{};integrated_claimed={};integrated_completed={};integrated_retried={}",
-        targets.len(),
-        cursor.after_app_id,
-        coverage.coverage_ratio,
-        coverage.apps_with_media,
-        coverage.candidate_apps,
-        integrated.claimed_apps,
-        integrated.completed_apps,
-        integrated.retried_apps
-    );
-    let run_id = worker_storage_with_retry(|| {
-        repo.start_source_run(
-            STORE_SOURCE_NAME,
-            "candidate_enrichment",
-            STORE_ADAPTER_VERSION,
-            Some(&run_notes),
-        )
-    })?;
-    if targets.is_empty() {
-        worker_storage_with_retry(|| {
-            repo.finish_source_run(run_id, "succeeded", 0, 0, None, Some("no targets due"))
-        })?;
-        return Ok(continue_integrated);
-    }
-    let enrichment_batch_full = targets.len() >= usize::try_from(limit).unwrap_or(usize::MAX);
-    match enrich_steam_candidates(repo, &targets, &country_code, &language, Some(run_id)) {
-        Ok(stats) => {
-            let next_cursor = EnrichmentCursor {
-                after_app_id: targets
-                    .last()
-                    .map_or(cursor.after_app_id, |target| target.app_id),
-            };
-            let next_cursor_value =
-                serde_json::to_value(next_cursor).map_err(worker_storage_error)?;
-            worker_storage_with_retry(|| {
-                repo.save_source_cursor(ENRICH_CURSOR_KEY, STORE_SOURCE_NAME, &next_cursor_value)
-            })?;
-            let status = if stats.error_count > 0 && stats.success_count > 0 {
-                "partial"
-            } else if stats.error_count > 0 {
-                "failed"
-            } else {
-                "succeeded"
-            };
-            let notes = format!(
-                "apps_attempted={} store={} store_not_found={} reviews={} popular_reviews={} ccu={} errors={}",
-                stats.apps_attempted,
-                stats.store_ok,
-                stats.store_not_found,
-                stats.reviews_ok,
-                stats.popular_reviews_ok,
-                stats.ccu_ok,
-                stats.error_count
-            );
-            worker_storage_with_retry(|| {
-                repo.finish_source_run(
-                    run_id,
-                    status,
-                    stats.request_count,
-                    stats.success_count,
-                    (stats.error_count > 0).then_some("partial_errors"),
-                    Some(&notes),
-                )
-            })?;
-            // Failed dimensions stay due and need the normal scheduler delay;
-            // immediately continuing a partial batch would hammer the same
-            // degraded upstream endpoint.
-            if let Some(category) = stats.first_error_category {
-                return Err(worker_task_error(category, "partial enrichment failure"));
-            }
-            Ok(integrated.retried_apps == 0
-                && integrated.dead_apps == 0
-                && enrichment_batch_should_continue(
-                    continue_integrated,
-                    enrichment_batch_full,
-                    &stats,
-                ))
-        }
-        Err(failure) => {
-            let _ = worker_storage_with_retry(|| {
-                repo.finish_source_run(
-                    run_id,
-                    "failed",
-                    failure.stats.request_count,
-                    failure.stats.success_count,
-                    Some(failure.category),
-                    Some(&failure.message),
-                )
-            });
-            Err(worker_task_error(failure.category, failure.message))
-        }
-    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(err)?
+        .as_nanos();
+    Ok(format!("{owner}:{}:{nonce}", std::process::id()))
 }
 
 fn print_coverage(coverage: &mpgs_storage::M3CatalogCoverage) {
@@ -1976,10 +1034,10 @@ fn print_coverage(coverage: &mpgs_storage::M3CatalogCoverage) {
     println!("with_ccu={}", coverage.with_ccu);
 }
 
-fn audit_m3(repo: &Repository, db_path: &std::path::Path) -> Result<(), String> {
+fn audit_m3(repo: &Repository) -> Result<(), String> {
     let active = repo.active_algorithm_config().map_err(err)?;
     let coverage = repo.m3_catalog_coverage().map_err(err)?;
-    println!("path={}", db_path.display());
+    println!("database=postgresql");
     println!("algorithm_version={}", active.version);
     println!(
         "normalized_multiplayer_candidates={}",
@@ -2020,7 +1078,7 @@ fn parse_m7_audit_options(
     for arg in args {
         let Some(value) = arg.strip_prefix("--allow-upcoming-shortfall=") else {
             return Err(
-                "m7-data-audit accepts only --allow-upcoming-shortfall=<reason> after db-path"
+                "m7-data-audit accepts only --allow-upcoming-shortfall=<reason> after database-url|env"
                     .into(),
             );
         };
@@ -2101,14 +1159,10 @@ fn print_m7_coverage(coverage: &mpgs_storage::M7DataCoverage) {
     );
 }
 
-fn audit_m7(
-    repo: &Repository,
-    db_path: &std::path::Path,
-    upcoming_shortfall_reason: Option<&str>,
-) -> Result<(), String> {
+fn audit_m7(repo: &Repository, upcoming_shortfall_reason: Option<&str>) -> Result<(), String> {
     let active = repo.active_algorithm_config().map_err(err)?;
     let coverage = repo.m7_data_coverage(&active.config).map_err(err)?;
-    println!("path={}", db_path.display());
+    println!("database=postgresql");
     println!("algorithm_version={}", active.version);
     println!("m7_policy_min_candidates={M7_MIN_CANDIDATES}");
     println!("m7_policy_min_trusted_profiles={M7_MIN_TRUSTED_FRIEND_PROFILES}");
@@ -2379,32 +1433,6 @@ fn collect_steam_candidates(
             failure.stats.merge(stats);
             return Err(failure);
         }
-    }
-    save_candidate_status_cursor(repo, stats)?;
-    Ok(stats)
-}
-
-fn collect_steam_candidate_top_pages(
-    repo: &Repository,
-) -> Result<CollectionStats, CollectionError> {
-    let client = store_search_client()?;
-    let mut stats = CollectionStats::default();
-    for sort in [StoreSearchSort::ReleasedDesc, StoreSearchSort::ReleasedAsc] {
-        let request =
-            StoreSearchRequest::with_sort(0, 100, sort).map_err(|error| CollectionError {
-                category: source_error_category(&error),
-                message: error.to_string(),
-                stats,
-            })?;
-        let page = fetch_store_search_page_with_retry(&client, &request, &mut stats)?;
-        let current = ingest_candidate_page(repo, &page, &mut stats)?;
-        println!(
-            "progress candidates={current} page_start={} rows={} refresh=top sort={}",
-            page.start,
-            page.result_count,
-            sort.as_query_value()
-        );
-        thread::sleep(Duration::from_millis(1_100));
     }
     save_candidate_status_cursor(repo, stats)?;
     Ok(stats)
@@ -2803,14 +1831,6 @@ impl EnrichStats {
             self.first_error_category = Some(category);
         }
     }
-}
-
-fn enrichment_batch_should_continue(
-    continue_integrated: bool,
-    batch_full: bool,
-    stats: &EnrichStats,
-) -> bool {
-    stats.error_count == 0 && (continue_integrated || (batch_full && stats.success_count > 0))
 }
 
 fn enrich_steam_candidates(
@@ -3242,16 +2262,9 @@ fn enrich_ccu(
 }
 
 fn retryable_storage_write_error(error: &StorageError) -> bool {
-    matches!(
-        error,
-        StorageError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
-            if matches!(
-                code.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
-    )
+    matches!(error, StorageError::Database(mpgs_storage::pg::Error::Postgres(error))
+        if error.code().is_some_and(|code| matches!(code.code(), "40001" | "40P01" | "55P03")))
 }
-
 fn storage_write_with_retry<T>(
     mut write: impl FnMut() -> StorageResult<T>,
 ) -> Result<T, SoftEnrichError> {
@@ -3465,28 +2478,28 @@ fn usage() -> &'static str {
     "mpgs-dbtool <command> [args]\n\n\
      Commands:\n\
        recommendation-golden-evaluate <labels.json> [--json]\n\
-       recommendation-audit <db-path> --as-of YYYY-MM-DD [--user-id ID] [--top N] [--strict] [--json]\n\
-       migrate <db-path>\n\
-       integrity <db-path>\n\
-       feature-evidence-retention <db-path> [retention-ms] [--apply --confirm --backup path]\n\
-       pipeline-retention <db-path> [retention-ms] [--batch-limit N] [--apply --confirm --backup path]\n\
-       recover-steam-leases <db-path>\n\
-       requeue-game-ingestion <db-path> <app-id> <stage> <operator> <reason>\n\
-       m3-audit <db-path>\n\
-       m7-data-audit <db-path> [--allow-upcoming-shortfall=<reason>]\n\
-       sync-retrieval <db-path> [limit=5000] [after_app_id=0]\n\
-       extract-offline-features <db-path> [limit=5000] [after_app_id=0]\n\
-       materialize-store-profiles <db-path>\n\
-       repair-empty-availability <db-path>\n\
-       embed-documents <db-path> [limit=200] [batch=16]\n\
-       collect-steam-catalog <db-path> [max-pages=1] [page-size=1000]\n\
-       collect-steam-candidates <db-path> [target, default 2000]\n\
-       enrich-steam-app <db-path> <app-id>\n\
-       enrich-steam-candidates <db-path> [limit, default 100]\n\
-       run-steam-worker-once <db-path> [job-limit=1] [enrich-limit=100]\n\
-       import-golden-profiles <db-path>\n\
-       backup <db-path> <backup-path>\n\
-       restore <backup-path> <dest-db-path>\n\n\
+       recommendation-audit <database-url|env> --as-of YYYY-MM-DD [--user-id ID] [--top N] [--strict] [--json]\n\
+       migrate <database-url|env>\n\
+       integrity <database-url|env>\n\
+       feature-evidence-retention <database-url|env> [retention-ms] [--apply --confirm]\n\
+       pipeline-retention <database-url|env> [retention-ms] [--batch-limit N] [--apply --confirm]\n\
+       recover-steam-leases <database-url|env>\n\
+       requeue-game-ingestion <database-url|env> <app-id> <stage> <operator> <reason>\n\
+       m3-audit <database-url|env>\n\
+       m7-data-audit <database-url|env> [--allow-upcoming-shortfall=<reason>]\n\
+       sync-retrieval <database-url|env> [limit=5000] [after_app_id=0]\n\
+       extract-offline-features <database-url|env> [limit=5000] [after_app_id=0]\n\
+       materialize-store-profiles <database-url|env>\n\
+       repair-empty-availability <database-url|env>\n\
+       embed-documents <database-url|env> [limit=200] [batch=16]\n\
+       collect-steam-catalog <database-url|env> [max-pages=1] [page-size=1000]\n\
+       collect-steam-candidates <database-url|env> [target, default 2000]\n\
+       enrich-steam-app <database-url|env> <app-id>\n\
+       enrich-steam-candidates <database-url|env> [limit, default 100]\n\
+       run-maintenance-once <database-url|env> [job-limit=4] [stage-limit=6]\n\
+       run-steam-worker-once <database-url|env> [job-limit=4] [stage-limit=6]\n\
+       import-golden-profiles <database-url|env>\n\
+       Database URLs may be omitted when MPGS_DATABASE_URL is configured.\n\n\
      Enrichment environment:\n\
        MPGS_STEAM_WEB_API_KEY (required by collect-steam-catalog; server-side only)\n\
        MPGS_STEAM_WORKER_ID (optional stable lease owner name)\n\
@@ -3529,7 +2542,7 @@ const RETRIEVAL_ELIGIBILITY_SQL: &str = "(
 )";
 
 const DUPLICATE_INACTIVE_EVIDENCE_SQL: &str = "evidence.is_active = 0
-    AND evidence.observed_at_ms < ?1
+    AND evidence.observed_at_ms < $1
     AND EXISTS (
         SELECT 1 FROM feature_evidence newer
         WHERE newer.app_id = evidence.app_id
@@ -3544,7 +2557,6 @@ struct PipelineRetentionPlan {
     duplicate_inactive_evidence: i64,
     noneligible_documents: i64,
     noneligible_embeddings: i64,
-    noneligible_fts_rows: i64,
     historical_completed_jobs: i64,
     historical_dead_jobs: i64,
     estimated_payload_bytes: i64,
@@ -3584,21 +2596,14 @@ fn plan_pipeline_retention(db: &Database, cutoff: i64) -> StorageResult<Pipeline
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
-        let fts_sql = format!(
-            "SELECT COUNT(*) FROM game_fts fts
-             JOIN game_documents document ON document.document_id = fts.document_id
-             JOIN apps a ON a.app_id = document.app_id
-             WHERE NOT ({RETRIEVAL_ELIGIBILITY_SQL})"
-        );
-        let noneligible_fts_rows = conn.query_row(&fts_sql, [], |row| row.get(0))?;
         let (historical_completed_jobs, historical_dead_jobs, job_bytes) = conn.query_row(
             "SELECT
-                 COALESCE(SUM(status = 'completed'), 0),
-                 COALESCE(SUM(status = 'dead'), 0),
+                 COUNT(*) FILTER (WHERE status = 'completed'),
+                 COUNT(*) FILTER (WHERE status = 'dead'),
                  COALESCE(SUM(length(entity_key) + length(idempotency_key) +
                      length(COALESCE(payload_json, ''))), 0)
              FROM jobs
-             WHERE status IN ('completed', 'dead') AND updated_at_ms < ?1",
+             WHERE status IN ('completed', 'dead') AND updated_at_ms < $1",
             [cutoff],
             |row| {
                 Ok((
@@ -3612,7 +2617,6 @@ fn plan_pipeline_retention(db: &Database, cutoff: i64) -> StorageResult<Pipeline
             duplicate_inactive_evidence,
             noneligible_documents,
             noneligible_embeddings,
-            noneligible_fts_rows,
             historical_completed_jobs,
             historical_dead_jobs,
             estimated_payload_bytes: evidence_bytes
@@ -3635,17 +2639,17 @@ fn apply_pipeline_retention(
             "DELETE FROM feature_evidence WHERE evidence_id IN (
                  SELECT evidence.evidence_id FROM feature_evidence evidence
                  WHERE {DUPLICATE_INACTIVE_EVIDENCE_SQL}
-                 ORDER BY evidence.evidence_id LIMIT ?2
+                 ORDER BY evidence.evidence_id LIMIT $2
              )"
         );
-        let deleted_evidence = tx.execute(&evidence_sql, rusqlite::params![cutoff, batch_limit])?;
+        let deleted_evidence = tx.execute(&evidence_sql, mpgs_storage::pg::params![cutoff, batch_limit])?;
 
         let document_sql = format!(
             "SELECT document.document_id
              FROM game_documents document
              JOIN apps a ON a.app_id = document.app_id
              WHERE NOT ({RETRIEVAL_ELIGIBILITY_SQL})
-             ORDER BY document.document_id LIMIT ?1"
+             ORDER BY document.document_id LIMIT $1"
         );
         let document_ids = {
             let mut statement = tx.prepare(&document_sql)?;
@@ -3654,9 +2658,8 @@ fn apply_pipeline_retention(
                 .collect::<Result<Vec<_>, _>>()?
         };
         for document_id in &document_ids {
-            tx.execute("DELETE FROM game_fts WHERE document_id = ?1", [document_id])?;
             tx.execute(
-                "DELETE FROM game_documents WHERE document_id = ?1",
+                "DELETE FROM game_documents WHERE document_id = $1",
                 [document_id],
             )?;
         }
@@ -3664,11 +2667,11 @@ fn apply_pipeline_retention(
         let jobs = {
             let mut statement = tx.prepare(
                 "SELECT job_id, status FROM jobs
-                 WHERE status IN ('completed', 'dead') AND updated_at_ms < ?1
-                 ORDER BY updated_at_ms, job_id LIMIT ?2",
+                 WHERE status IN ('completed', 'dead') AND updated_at_ms < $1
+                 ORDER BY updated_at_ms, job_id LIMIT $2",
             )?;
             statement
-                .query_map(rusqlite::params![cutoff, batch_limit], |row| {
+                .query_map(mpgs_storage::pg::params![cutoff, batch_limit], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -3682,12 +2685,12 @@ fn apply_pipeline_retention(
                 tx.execute(
                     "INSERT INTO pipeline_retention_summary(
                          status, deleted_count, last_cutoff_ms, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4)
+                     ) VALUES ($1, $2, $3, $4)
                      ON CONFLICT(status) DO UPDATE SET
-                         deleted_count = deleted_count + excluded.deleted_count,
+                         deleted_count = pipeline_retention_summary.deleted_count + excluded.deleted_count,
                          last_cutoff_ms = excluded.last_cutoff_ms,
                          updated_at_ms = excluded.updated_at_ms",
-                    rusqlite::params![
+                    mpgs_storage::pg::params![
                         status,
                         i64::try_from(deleted).unwrap_or(i64::MAX),
                         cutoff,
@@ -3697,7 +2700,7 @@ fn apply_pipeline_retention(
             }
         }
         for (job_id, _) in &jobs {
-            tx.execute("DELETE FROM jobs WHERE job_id = ?1", [job_id])?;
+            tx.execute("DELETE FROM jobs WHERE job_id = $1", [job_id])?;
         }
         tx.commit()?;
         Ok((deleted_evidence, document_ids.len(), jobs.len()))
@@ -3706,7 +2709,7 @@ fn apply_pipeline_retention(
 
 fn run_pipeline_retention(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut args = args.peekable();
-    let db_path = required_path(args.next(), "--db path")?;
+    let db_path = required_database_url(args.next())?;
     let retention_ms = if args.peek().is_some_and(|value| !value.starts_with("--")) {
         args.next()
             .expect("peeked retention value")
@@ -3721,7 +2724,6 @@ fn run_pipeline_retention(args: impl Iterator<Item = String>) -> Result<(), Stri
     let mut batch_limit = 100_000_i64;
     let mut apply = false;
     let mut confirm = false;
-    let mut backup_path: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--batch-limit" => {
@@ -3733,18 +2735,20 @@ fn run_pipeline_retention(args: impl Iterator<Item = String>) -> Result<(), Stri
             }
             "--apply" => apply = true,
             "--confirm" => confirm = true,
-            "--backup" => backup_path = Some(required_path(args.next(), "--backup path")?),
             _ => return Err(format!("unknown pipeline-retention option: {arg}")),
         }
     }
     if !(1..=1_000_000).contains(&batch_limit) {
         return Err("--batch-limit must be between 1 and 1000000".into());
     }
+    if apply && !confirm {
+        return Err("--apply requires --confirm".into());
+    }
     let db = Database::open(&db_path).map_err(err)?;
     db.assert_ready().map_err(err)?;
     let cutoff = db.now_ms().saturating_sub(retention_ms);
     let plan = plan_pipeline_retention(&db, cutoff).map_err(err)?;
-    println!("path={}", db_path.display());
+    println!("database=postgresql");
     println!("cutoff_ms={cutoff}");
     println!(
         "duplicate_inactive_evidence={}",
@@ -3752,7 +2756,6 @@ fn run_pipeline_retention(args: impl Iterator<Item = String>) -> Result<(), Stri
     );
     println!("noneligible_documents={}", plan.noneligible_documents);
     println!("noneligible_embeddings={}", plan.noneligible_embeddings);
-    println!("noneligible_fts_rows={}", plan.noneligible_fts_rows);
     println!(
         "historical_completed_jobs={}",
         plan.historical_completed_jobs
@@ -3764,13 +2767,6 @@ fn run_pipeline_retention(args: impl Iterator<Item = String>) -> Result<(), Stri
         println!("dry_run=true");
         println!("compact=false");
         return Ok(());
-    }
-    if !confirm {
-        return Err("--apply requires --confirm".into());
-    }
-    let backup = backup_path.ok_or_else(|| "--apply requires --backup path".to_owned())?;
-    if !backup.is_file() {
-        return Err(format!("backup path does not exist: {}", backup.display()));
     }
     let (deleted_evidence, deleted_documents, deleted_jobs) =
         apply_pipeline_retention(&db, cutoff, batch_limit).map_err(err)?;
@@ -3784,7 +2780,7 @@ fn run_pipeline_retention(args: impl Iterator<Item = String>) -> Result<(), Stri
 
 fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<(), String> {
     let mut args = args.peekable();
-    let db_path = required_path(args.next(), "--db path")?;
+    let db_path = required_database_url(args.next())?;
     let retention_ms = if args.peek().is_some_and(|value| !value.starts_with("--")) {
         args.next()
             .expect("peeked retention value")
@@ -3798,14 +2794,15 @@ fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<
     }
     let mut apply = false;
     let mut confirm = false;
-    let mut backup_path: Option<PathBuf> = None;
-    while let Some(arg) = args.next() {
+    for arg in args {
         match arg.as_str() {
             "--apply" => apply = true,
             "--confirm" => confirm = true,
-            "--backup" => backup_path = Some(required_path(args.next(), "--backup path")?),
             _ => return Err(format!("unknown feature-evidence-retention option: {arg}")),
         }
+    }
+    if apply && !confirm {
+        return Err("--apply requires --confirm".into());
     }
     let db = Database::open(&db_path).map_err(err)?;
     db.assert_ready().map_err(err)?;
@@ -3814,27 +2811,20 @@ fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<
         .with_conn(|conn| {
             conn.query_row(
                 "SELECT COUNT(*), COALESCE(SUM(length(value_json) + length(source_ref)), 0)
-                 FROM feature_evidence WHERE is_active = 0 AND observed_at_ms < ?1",
+                 FROM feature_evidence WHERE is_active = 0 AND observed_at_ms < $1",
                 [cutoff],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .map_err(Into::into)
         })
         .map_err(err)?;
-    println!("path={}", db_path.display());
+    println!("database=postgresql");
     println!("cutoff_ms={cutoff}");
     println!("inactive_rows={rows}");
     println!("estimated_payload_bytes={bytes}");
     if !apply {
         println!("dry_run=true");
         return Ok(());
-    }
-    if !confirm {
-        return Err("--apply requires --confirm".into());
-    }
-    let backup = backup_path.ok_or_else(|| "--apply requires --backup path".to_owned())?;
-    if !backup.is_file() {
-        return Err(format!("backup path does not exist: {}", backup.display()));
     }
     let deleted = db
         .with_conn_mut(|conn| {
@@ -3843,7 +2833,7 @@ fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<
                 "DELETE FROM feature_evidence
                  WHERE evidence_id IN (
                    SELECT evidence_id FROM feature_evidence
-                   WHERE is_active = 0 AND observed_at_ms < ?1
+                   WHERE is_active = 0 AND observed_at_ms < $1
                    ORDER BY evidence_id LIMIT 100000
                  )",
                 [cutoff],
@@ -3862,157 +2852,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn controlled_deploy_lease_recovery_supports_the_pre_queue_schema() {
-        let db = Database::open_in_memory().unwrap();
-        db.with_conn_mut(|conn| {
-            mpgs_storage::migrate::migrate_to(conn, 24, 1_000)?;
-            Ok(())
-        })
-        .unwrap();
-        let repo = Repository::new(db);
-
-        assert_eq!(recover_controlled_deploy_leases(&repo).unwrap(), (0, 0));
-        assert_eq!(repo.database().schema_version().unwrap(), 24);
-    }
-
-    #[test]
-    fn integrated_ingestion_runs_stages_in_order_and_retries_only_the_failed_stage() {
+    fn lease_recovery_preserves_another_live_invocation() {
         let clock = std::sync::Arc::new(mpgs_storage::FakeClock::new(10_000));
         let db = Database::open_in_memory_with_clock(clock.clone()).unwrap();
         db.migrate().unwrap();
         let repo = Repository::new(db);
-        let page = StoreSearchPage {
-            candidates: vec![mpgs_steam_source::StoreSearchCandidate {
-                app_id: 632360,
-                name: "Risk of Rain 2".into(),
-            }],
-            start: 0,
-            result_count: 1,
-            total_count: 1,
-            content_hash: "integrated-worker-fixture".into(),
-            sort: StoreSearchSort::ReleasedDesc,
-        };
-        repo.ingest_store_search_page_and_queue_new_games(&page)
-            .unwrap();
-
-        let mut calls = Vec::new();
-        let mut fail_review_once = true;
-        let first =
-            process_integrated_game_ingestion_with(&repo, "worker-a", 1, |app_id, stage| {
-                calls.push((app_id, stage.to_owned()));
-                if stage == "review_summary" && fail_review_once {
-                    fail_review_once = false;
-                    return Err(SoftEnrichError {
-                        category: "network",
-                        message: "fixture timeout".into(),
-                    });
-                }
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(first.completed_apps, 0);
-        assert_eq!(first.retried_apps, 1);
-
-        clock.advance_ms(WORKER_RETRY_BASE_MS);
-        let second =
-            process_integrated_game_ingestion_with(&repo, "worker-b", 1, |app_id, stage| {
-                calls.push((app_id, stage.to_owned()));
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(second.completed_apps, 1);
-        assert_eq!(second.retried_apps, 0);
+        repo.enqueue_job(&mpgs_storage::EnqueueJob {
+            source: "steam".into(),
+            task_type: "fixture".into(),
+            entity_key: "fixture".into(),
+            priority: 50,
+            due_at_ms: 0,
+            idempotency_key: "lease-recovery-fixture".into(),
+            payload_json: None,
+            max_attempts: 3,
+        })
+        .unwrap();
         assert_eq!(
-            calls,
-            vec![
-                (632360, "store_details".into()),
-                (632360, "review_summary".into()),
-                (632360, "review_summary".into()),
-                (632360, "popular_reviews".into()),
-                (632360, "ccu".into()),
-            ]
+            repo.lease_jobs("active", 1, 90_000, Some("steam"))
+                .unwrap()
+                .len(),
+            1
         );
-        assert!(repo.pending_game_ingestion_app_ids().unwrap().is_empty());
+        assert_eq!(recover_expired_steam_leases(&repo).unwrap(), (0, 0));
+        clock.advance_ms(90_000);
+        assert_eq!(recover_expired_steam_leases(&repo).unwrap(), (1, 0));
     }
 
     #[test]
-    fn worker_continues_only_after_a_full_successful_batch() {
-        let completed = IntegratedIngestionStats {
-            claimed_apps: 1,
-            completed_apps: 1,
-            ..IntegratedIngestionStats::default()
-        };
-        let retried = IntegratedIngestionStats {
-            claimed_apps: 1,
-            retried_apps: 1,
-            ..IntegratedIngestionStats::default()
-        };
-        assert!(integrated_ingestion_should_continue(&completed, 1));
-        assert!(!integrated_ingestion_should_continue(&retried, 1));
-
-        let successful = EnrichStats {
-            success_count: 4,
-            ..EnrichStats::default()
-        };
-        let partial = EnrichStats {
-            success_count: 3,
-            error_count: 1,
-            ..EnrichStats::default()
-        };
-        assert!(enrichment_batch_should_continue(false, true, &successful));
-        assert!(!enrichment_batch_should_continue(false, true, &partial));
-        assert!(!enrichment_batch_should_continue(false, false, &successful));
-        assert!(!enrichment_batch_should_continue(true, true, &partial));
-
-        let mut failed = EnrichStats::default();
-        failed.record_error("rate_limited");
-        failed.record_error("network");
-        assert_eq!(failed.error_count, 2);
-        assert_eq!(failed.first_error_category, Some("rate_limited"));
-        assert_eq!(
-            worker_retry_delay_ms("rate_limited", 1),
-            i64::try_from(ENRICH_RATE_LIMIT_COOLDOWN_MS).unwrap()
-        );
-        assert_eq!(worker_retry_delay_ms("network", 1), WORKER_RETRY_BASE_MS);
-    }
-
-    #[test]
-    fn evidence_retention_defaults_to_dry_run_and_requires_confirmation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("retention.db");
-        let db = Database::open(&path).unwrap();
-        db.migrate().unwrap();
-        drop(db);
-
-        run_feature_evidence_retention([path.display().to_string()].into_iter()).unwrap();
+    fn evidence_retention_requires_confirmation_before_connecting() {
         let error = run_feature_evidence_retention(
-            [path.display().to_string(), "--apply".to_owned()].into_iter(),
+            ["postgresql://unused".into(), "--apply".to_owned()].into_iter(),
         )
         .unwrap_err();
         assert_eq!(error, "--apply requires --confirm");
     }
 
     #[test]
-    fn pipeline_retention_defaults_to_dry_run_and_requires_confirmation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pipeline-retention.db");
-        let db = Database::open(&path).unwrap();
-        db.migrate().unwrap();
-        drop(db);
-
-        run_pipeline_retention([path.display().to_string()].into_iter()).unwrap();
-        let error =
-            run_pipeline_retention([path.display().to_string(), "--apply".to_owned()].into_iter())
-                .unwrap_err();
+    fn pipeline_retention_requires_confirmation_before_connecting() {
+        let error = run_pipeline_retention(
+            ["postgresql://unused".into(), "--apply".to_owned()].into_iter(),
+        )
+        .unwrap_err();
         assert_eq!(error, "--apply requires --confirm");
     }
 
     #[test]
     fn pipeline_retention_preserves_fact_changes_and_summarizes_deleted_jobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pipeline-apply.db");
-        let backup = dir.path().join("pipeline-apply.backup.db");
-        let db = Database::open(&path).unwrap();
+        let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         db.with_conn_mut(|conn| {
             conn.execute(
@@ -4056,32 +2943,21 @@ mod tests {
                     "INSERT INTO jobs (
                          source, task_type, entity_key, priority, attempts, max_attempts,
                          due_at_ms, status, idempotency_key, created_at_ms, updated_at_ms
-                     ) VALUES ('steam', 'fixture', ?1, 100, 1, 3, 1, ?2, ?1, 1, 1)",
-                    rusqlite::params![key, status],
+                     ) VALUES ('steam', 'fixture', $1, 100, 1, 3, 1, $2, $1, 1, 1)",
+                    mpgs_storage::pg::params![key, status],
                 )?;
             }
             Ok(())
         })
         .unwrap();
-        Repository::new(db.clone()).backup_to(&backup).unwrap();
-        drop(db);
-
-        run_pipeline_retention(
-            [
-                path.display().to_string(),
-                "1000".into(),
-                "--batch-limit".into(),
-                "100".into(),
-                "--apply".into(),
-                "--confirm".into(),
-                "--backup".into(),
-                backup.display().to_string(),
-            ]
-            .into_iter(),
-        )
-        .unwrap();
-
-        let db = Database::open(&path).unwrap();
+        let plan = plan_pipeline_retention(&db, 1_000).unwrap();
+        assert_eq!(plan.duplicate_inactive_evidence, 1);
+        assert_eq!(plan.historical_completed_jobs, 1);
+        assert_eq!(plan.historical_dead_jobs, 1);
+        assert_eq!(
+            apply_pipeline_retention(&db, 1_000, 100).unwrap(),
+            (1, 0, 2)
+        );
         db.with_conn(|conn| {
             let evidence: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM feature_evidence WHERE source_type = 'retention_fixture'",
@@ -4226,13 +3102,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_worker_pages_defaults_to_one_page() {
-        // Safety: steady-state workers must not hammer GetAppList without an
-        // explicit burst override via MPGS_CATALOG_WORKER_PAGES.
-        assert_eq!(catalog_worker_pages(), APP_LIST_PAGES_DEFAULT);
-    }
-
-    #[test]
     fn candidate_worker_uses_a_bounded_multi_page_backlog_batch() {
         assert_eq!(candidate_worker_pages(), CANDIDATE_WORKER_PAGES_DEFAULT);
         assert!(candidate_collection_satisfied(
@@ -4243,85 +3112,6 @@ mod tests {
             CANDIDATE_REFRESH_CONTINUATION_PAGES,
             false,
         ));
-    }
-
-    #[test]
-    fn enrichment_quota_plan_gives_every_enabled_dimension_a_budget() {
-        let plan = enrichment_quota_plan(20, EnrichmentNeedFilter::ALL, 0);
-        assert_eq!(plan.iter().map(|entry| entry.limit).sum::<u32>(), 20);
-        assert!(
-            plan.iter()
-                .any(|entry| entry.filter.store && entry.limit > 0)
-        );
-        assert!(
-            plan.iter()
-                .any(|entry| entry.filter.reviews && entry.limit > 0)
-        );
-        assert!(plan.iter().any(|entry| entry.filter.ccu && entry.limit > 0));
-        assert!(
-            plan.iter()
-                .any(|entry| entry.filter.english_name && entry.limit > 0)
-        );
-        assert!(
-            plan.iter()
-                .any(|entry| entry.filter.media_backfill && entry.limit > 0)
-        );
-    }
-
-    #[test]
-    fn completed_media_coverage_removes_the_backfill_quota() {
-        let policy = mpgs_storage::MediaBackfillPolicy::DEFAULT;
-        let incomplete = MediaCoverageStats {
-            candidate_apps: 100,
-            apps_with_media: 94,
-            coverage_ratio: 0.94,
-        };
-        let complete = MediaCoverageStats {
-            candidate_apps: 100,
-            apps_with_media: 95,
-            coverage_ratio: 0.95,
-        };
-
-        assert!(media_backfill_due(policy, incomplete));
-        assert!(!media_backfill_due(policy, complete));
-        assert!(!media_backfill_due(
-            policy,
-            MediaCoverageStats {
-                candidate_apps: 0,
-                apps_with_media: 0,
-                coverage_ratio: 1.0,
-            }
-        ));
-    }
-
-    #[test]
-    fn worker_pipeline_snapshot_refresh_is_throttled() {
-        let clock = std::sync::Arc::new(mpgs_storage::FakeClock::new(1_000_000));
-        let db = Database::open_in_memory_with_clock(clock.clone()).unwrap();
-        db.migrate().unwrap();
-        let repo = Repository::new(db);
-        repo.ensure_runtime_defaults().unwrap();
-        let initial = repo.pipeline_status_snapshot().unwrap().unwrap();
-
-        clock.advance_ms(WORKER_PIPELINE_SNAPSHOT_INTERVAL_MS - 1);
-        refresh_worker_pipeline_snapshot_if_due(&repo).unwrap();
-        assert_eq!(
-            repo.pipeline_status_snapshot()
-                .unwrap()
-                .unwrap()
-                .generated_at_ms,
-            initial.generated_at_ms
-        );
-
-        clock.advance_ms(1);
-        refresh_worker_pipeline_snapshot_if_due(&repo).unwrap();
-        assert_eq!(
-            repo.pipeline_status_snapshot()
-                .unwrap()
-                .unwrap()
-                .generated_at_ms,
-            1_000_000 + WORKER_PIPELINE_SNAPSHOT_INTERVAL_MS
-        );
     }
 
     #[test]
@@ -4341,26 +3131,10 @@ mod tests {
         );
         assert!(optional_catalog_page_size(Some("0".into())).is_err());
         assert!(optional_catalog_page_size(Some((APP_LIST_MAX_RESULTS + 1).to_string())).is_err());
-        assert_eq!(
-            optional_worker_job_limit(None).unwrap(),
-            WORKER_JOB_LIMIT_DEFAULT
-        );
-        assert!(optional_worker_job_limit(Some("0".into())).is_err());
-        assert_eq!(worker_job_error_category("storage"), "network");
-        assert_eq!(
-            worker_job_error_category("response_too_large"),
-            "parse_changed"
-        );
     }
 
     #[test]
-    fn storage_write_retry_is_limited_to_sqlite_contention() {
-        let busy = StorageError::Sqlite(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            None,
-        ));
-        assert!(retryable_storage_write_error(&busy));
-
+    fn permanent_storage_errors_are_not_retried() {
         let mut attempts = 0;
         let failure = storage_write_with_retry::<()>(|| {
             attempts += 1;
@@ -4408,38 +3182,5 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name == "if_modified_since" && value.as_ref() == "1700000000")
         );
-    }
-
-    #[test]
-    fn worker_marks_unsupported_steam_jobs_dead_without_network_access() {
-        let db = Database::open_in_memory().unwrap();
-        let repo = Repository::new(db);
-        repo.migrate().unwrap();
-        repo.ensure_runtime_defaults().unwrap();
-        let job_id = repo
-            .enqueue_job(&mpgs_storage::EnqueueJob {
-                source: "steam".into(),
-                task_type: "unsupported".into(),
-                entity_key: "test".into(),
-                priority: 1,
-                due_at_ms: 0,
-                idempotency_key: "dbtool-worker-unsupported".into(),
-                payload_json: None,
-                max_attempts: 1,
-            })
-            .unwrap();
-
-        let stats = run_steam_worker_once(&repo, "test-worker", 1, 1, None).unwrap();
-
-        assert_eq!(stats.leased, 1);
-        assert_eq!(stats.completed, 0);
-        assert_eq!(stats.dead, 1);
-        let job = repo
-            .database()
-            .with_conn(|conn| mpgs_storage::jobs::get_job(conn, job_id))
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.status, "dead");
-        assert_eq!(job.last_error_category.as_deref(), Some("invalid_payload"));
     }
 }

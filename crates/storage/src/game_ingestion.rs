@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use crate::pg::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::error::{StorageError, StorageResult};
 use crate::models::GameIngestionTask;
@@ -21,14 +21,14 @@ pub fn queue_new_app(
             total_failure_attempts, lease_count, next_attempt_at_ms,
             enrichment_profile, profile_version, discovered_at_ms, updated_at_ms
          )
-         SELECT ?1, ?2, 0, ?3, 'pending', 0, 0, 0, ?4,
+         SELECT $1, $2, 0, $3, 'pending', 0, 0, 0, $4,
                 CASE
                     WHEN app_type IN ('demo', 'playtest') THEN 'basic_demo'
                     WHEN release_state IN ('upcoming', 'coming_soon') THEN 'basic_upcoming'
                     ELSE 'full_released'
                 END,
-                1, ?4, ?4
-         FROM apps WHERE app_id = ?1
+                1, $4, $4
+         FROM apps WHERE app_id = $1
          ON CONFLICT(app_id) DO NOTHING",
         params![app_id, source, INITIAL_STAGE, now_ms],
     )?;
@@ -49,8 +49,9 @@ pub fn pending_app_ids(conn: &Connection) -> StorageResult<Vec<u32>> {
 pub fn recover_leases(conn: &Connection, now_ms: i64) -> StorageResult<usize> {
     conn.execute(
         "UPDATE game_ingestion_queue
-         SET lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
-         WHERE lease_owner IS NOT NULL OR lease_expires_at_ms IS NOT NULL",
+         SET lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = $1
+         WHERE (lease_owner IS NOT NULL OR lease_expires_at_ms IS NOT NULL)
+           AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)",
         [now_ms],
     )
     .map_err(Into::into)
@@ -68,7 +69,7 @@ pub fn claim_tasks(
     let lane_paused: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM game_ingestion_lane_state
-             WHERE lane = ?1 AND pause_until_ms > ?2
+             WHERE lane = $1 AND pause_until_ms > $2
          )",
         params![LANE_NAME, now_ms],
         |row| row.get(0),
@@ -81,10 +82,10 @@ pub fn claim_tasks(
         "SELECT app_id
          FROM game_ingestion_queue
          WHERE status IN ('pending', 'retry')
-           AND next_attempt_at_ms <= ?1
-           AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?1)
+           AND next_attempt_at_ms <= $1
+           AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)
          ORDER BY priority DESC, next_attempt_at_ms, discovered_at_ms, app_id
-         LIMIT ?2",
+         LIMIT $2 FOR UPDATE SKIP LOCKED",
     )?;
     let app_ids = statement
         .query_map(params![now_ms, limit], |row| row.get::<_, u32>(0))?
@@ -96,12 +97,12 @@ pub fn claim_tasks(
     for app_id in app_ids {
         let changed = tx.execute(
             "UPDATE game_ingestion_queue
-             SET lease_owner = ?1, lease_expires_at_ms = ?2,
-                 lease_count = lease_count + 1, updated_at_ms = ?3
-             WHERE app_id = ?4
+             SET lease_owner = $1, lease_expires_at_ms = $2,
+                 lease_count = lease_count + 1, updated_at_ms = $3
+             WHERE app_id = $4
                AND status IN ('pending', 'retry')
-               AND next_attempt_at_ms <= ?3
-               AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?3)",
+               AND next_attempt_at_ms <= $3
+               AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $3)",
             params![owner, lease_expires_at_ms, now_ms, app_id],
         )?;
         if changed == 1
@@ -114,6 +115,43 @@ pub fn claim_tasks(
     Ok(claimed)
 }
 
+/// Release a bounded invocation's task without recording a failed attempt.
+pub fn defer_ingestion_job(
+    conn: &Connection,
+    app_id: u32,
+    owner: &str,
+    delay_ms: i64,
+    now_ms: i64,
+) -> StorageResult<GameIngestionTask> {
+    if owner.trim().is_empty() {
+        return Err(StorageError::validation("lease owner is required"));
+    }
+    if !(0..=7 * 24 * 60 * 60 * 1000).contains(&delay_ms) {
+        return Err(StorageError::validation(
+            "delay_ms must be between 0 and 604800000",
+        ));
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE game_ingestion_queue
+         SET next_attempt_at_ms = $1, lease_owner = NULL,
+             lease_expires_at_ms = NULL, updated_at_ms = $2
+         WHERE app_id = $3 AND status IN ('pending', 'retry')
+           AND lease_owner = $4
+           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > $2",
+        params![now_ms.saturating_add(delay_ms), now_ms, app_id, owner],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::lease(format!(
+            "game ingestion lease for app {app_id} is no longer active"
+        )));
+    }
+    let task = get_task(&tx, app_id)?
+        .ok_or_else(|| StorageError::not_found(format!("app {app_id} queue")))?;
+    tx.commit()?;
+    Ok(task)
+}
+
 pub fn advance_stage(
     conn: &Connection,
     app_id: u32,
@@ -123,11 +161,12 @@ pub fn advance_stage(
     if owner.trim().is_empty() {
         return Err(StorageError::validation("lease owner is required"));
     }
-    let task = require_active_lease(conn, app_id, owner, now_ms)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let task = require_active_lease(&tx, app_id, owner, now_ms)?;
     let enrichment_profile = if task.enrichment_profile == "basic_upcoming"
-        && conn.query_row(
+        && tx.query_row(
             "SELECT release_state = 'released'
-             FROM apps WHERE app_id = ?1",
+             FROM apps WHERE app_id = $1",
             [app_id],
             |row| row.get::<_, bool>(0),
         )? {
@@ -157,21 +196,21 @@ pub fn advance_stage(
         }
     };
     let complete = next_stage == "complete";
-    let changed = conn.execute(
+    let changed = tx.execute(
         "UPDATE game_ingestion_queue
-         SET stage = ?1,
-             status = CASE WHEN ?2 = 1 THEN 'complete' ELSE 'pending' END,
-             enrichment_profile = ?3,
+         SET stage = $1,
+             status = CASE WHEN $2 = 1 THEN 'complete' ELSE 'pending' END,
+             enrichment_profile = $3,
              stage_failure_attempts = 0,
-             next_attempt_at_ms = ?4,
+             next_attempt_at_ms = $4,
              last_error_category = NULL,
              last_error_summary = NULL,
              dead_at_ms = NULL,
-             lease_owner = CASE WHEN ?2 = 1 THEN NULL ELSE lease_owner END,
-             lease_expires_at_ms = CASE WHEN ?2 = 1 THEN NULL ELSE lease_expires_at_ms END,
-             updated_at_ms = ?4
-         WHERE app_id = ?5 AND lease_owner = ?6
-           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?4",
+             lease_owner = CASE WHEN $2 = 1 THEN NULL ELSE lease_owner END,
+             lease_expires_at_ms = CASE WHEN $2 = 1 THEN NULL ELSE lease_expires_at_ms END,
+             updated_at_ms = $4
+         WHERE app_id = $5 AND lease_owner = $6
+           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > $4",
         params![
             next_stage,
             i64::from(complete),
@@ -186,7 +225,10 @@ pub fn advance_stage(
             "game ingestion lease for app {app_id} is no longer active"
         )));
     }
-    get_task(conn, app_id)?.ok_or_else(|| StorageError::not_found(format!("app {app_id} queue")))
+    let task = get_task(&tx, app_id)?
+        .ok_or_else(|| StorageError::not_found(format!("app {app_id} queue")))?;
+    tx.commit()?;
+    Ok(task)
 }
 
 pub fn retry_stage(
@@ -204,22 +246,23 @@ pub fn retry_stage(
             "global auth/config failures must pause the lane",
         ));
     }
-    let task = require_active_lease(conn, app_id, owner, now_ms)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let task = require_active_lease(&tx, app_id, owner, now_ms)?;
     let failure_attempts = task.stage_failure_attempts.saturating_add(1);
     let dead = failure_attempts >= failure_limit(error_category);
     let summary = bounded_summary(error_summary);
-    let changed = conn.execute(
+    let changed = tx.execute(
         "UPDATE game_ingestion_queue
-         SET status = CASE WHEN ?1 = 1 THEN 'dead' ELSE 'retry' END,
-             stage_failure_attempts = ?2,
+         SET status = CASE WHEN $1 = 1 THEN 'dead' ELSE 'retry' END,
+             stage_failure_attempts = $2,
              total_failure_attempts = total_failure_attempts + 1,
-             next_attempt_at_ms = CASE WHEN ?1 = 1 THEN ?3 ELSE ?4 END,
-             last_error_category = ?5,
-             last_error_summary = ?6,
-             dead_at_ms = CASE WHEN ?1 = 1 THEN ?3 ELSE NULL END,
-             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?3
-         WHERE app_id = ?7 AND lease_owner = ?8
-           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > ?3",
+             next_attempt_at_ms = CASE WHEN $1 = 1 THEN $3 ELSE $4 END,
+             last_error_category = $5,
+             last_error_summary = $6,
+             dead_at_ms = CASE WHEN $1 = 1 THEN $3 ELSE NULL END,
+             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = $3
+         WHERE app_id = $7 AND lease_owner = $8
+           AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > $3",
         params![
             i64::from(dead),
             failure_attempts,
@@ -236,7 +279,10 @@ pub fn retry_stage(
             "game ingestion lease for app {app_id} is no longer active"
         )));
     }
-    get_task(conn, app_id)?.ok_or_else(|| StorageError::not_found(format!("app {app_id} queue")))
+    let task = get_task(&tx, app_id)?
+        .ok_or_else(|| StorageError::not_found(format!("app {app_id} queue")))?;
+    tx.commit()?;
+    Ok(task)
 }
 
 pub fn pause_lane(
@@ -259,9 +305,9 @@ pub fn pause_lane(
         "INSERT INTO game_ingestion_lane_state(
              lane, pause_until_ms, last_error_category, last_error_summary,
              paused_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+         ) VALUES ($1, $2, $3, $4, $5, $5)
          ON CONFLICT(lane) DO UPDATE SET
-             pause_until_ms = MAX(
+             pause_until_ms = GREATEST(
                  game_ingestion_lane_state.pause_until_ms,
                  excluded.pause_until_ms
              ),
@@ -278,16 +324,16 @@ pub fn pause_lane(
         ],
     )?;
     let effective_pause_until_ms: i64 = tx.query_row(
-        "SELECT pause_until_ms FROM game_ingestion_lane_state WHERE lane = ?1",
+        "SELECT pause_until_ms FROM game_ingestion_lane_state WHERE lane = $1",
         [LANE_NAME],
         |row| row.get(0),
     )?;
     let paused_tasks = tx.execute(
         "UPDATE game_ingestion_queue
-         SET status = 'retry', next_attempt_at_ms = ?1,
-             last_error_category = ?2, last_error_summary = ?3,
-             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?4
-         WHERE lease_owner = ?5",
+         SET status = 'retry', next_attempt_at_ms = $1,
+             last_error_category = $2, last_error_summary = $3,
+             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = $4
+         WHERE lease_owner = $5",
         params![
             effective_pause_until_ms,
             error_category,
@@ -324,7 +370,7 @@ pub fn requeue_dead_task(
     tx.execute(
         "INSERT INTO game_ingestion_requeue_audit(
              app_id, stage, previous_status, operator, reason, requeued_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         ) VALUES ($1, $2, $3, $4, $5, $6)",
         params![
             app_id,
             stage,
@@ -337,10 +383,10 @@ pub fn requeue_dead_task(
     tx.execute(
         "UPDATE game_ingestion_queue
          SET status = 'pending', stage_failure_attempts = 0,
-             next_attempt_at_ms = ?1, last_error_category = NULL,
+             next_attempt_at_ms = $1, last_error_category = NULL,
              last_error_summary = NULL, dead_at_ms = NULL,
-             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?1
-         WHERE app_id = ?2 AND stage = ?3 AND status = 'dead'",
+             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = $1
+         WHERE app_id = $2 AND stage = $3 AND status = 'dead'",
         params![now_ms, app_id, stage],
     )?;
     tx.commit()?;
@@ -358,23 +404,23 @@ pub fn stage_observed(
         "store_details" => conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM store_detail_refresh_state
-                WHERE app_id = ?1 AND country_code = ?2 AND language = ?3
+                WHERE app_id = $1 AND country_code = $2 AND language = $3
              )",
             params![app_id, country_code, language],
             |row| row.get(0),
         )?,
         "review_summary" => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM review_snapshots WHERE app_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM review_snapshots WHERE app_id = $1)",
             [app_id],
             |row| row.get(0),
         )?,
         "popular_reviews" => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM popular_review_refresh_state WHERE app_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM popular_review_refresh_state WHERE app_id = $1)",
             [app_id],
             |row| row.get(0),
         )?,
         "ccu" => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM player_snapshots WHERE app_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM player_snapshots WHERE app_id = $1)",
             [app_id],
             |row| row.get(0),
         )?,
@@ -483,7 +529,7 @@ fn get_task(conn: &Connection, app_id: u32) -> StorageResult<Option<GameIngestio
                 total_failure_attempts, lease_count, next_attempt_at_ms,
                 last_error_category, last_error_summary, lease_owner,
                 lease_expires_at_ms, enrichment_profile, profile_version, dead_at_ms
-         FROM game_ingestion_queue WHERE app_id = ?1",
+         FROM game_ingestion_queue WHERE app_id = $1",
         [app_id],
         |row| {
             Ok(GameIngestionTask {
@@ -508,4 +554,45 @@ fn get_task(conn: &Connection, app_id: u32) -> StorageResult<Option<GameIngestio
     )
     .optional()
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    #[test]
+    fn deferred_ingestion_preserves_progress_and_recovery_keeps_live_leases() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            crate::catalog::ensure_app_stub(conn, 7, "Game", 0)?;
+            assert!(queue_new_app(conn, 7, "steam", 0)?);
+            assert_eq!(claim_tasks(conn, "worker-a", 1, 1_000, 0)?.len(), 1);
+            assert_eq!(
+                advance_stage(conn, 7, "worker-a", 1)?.stage,
+                "review_summary"
+            );
+            retry_stage(conn, 7, "worker-a", "network", "timeout", 1, 2)?;
+            assert_eq!(claim_tasks(conn, "worker-b", 1, 1_000, 3)?.len(), 1);
+            assert_eq!(recover_leases(conn, 4)?, 0);
+            assert!(defer_ingestion_job(conn, 7, "worker-a", 100, 4).is_err());
+            let deferred = defer_ingestion_job(conn, 7, "worker-b", 100, 4)?;
+            assert_eq!(deferred.stage, "review_summary");
+            assert_eq!(deferred.status, "retry");
+            assert_eq!(deferred.stage_failure_attempts, 1);
+            assert_eq!(deferred.total_failure_attempts, 1);
+            assert_eq!(deferred.lease_count, 2);
+            assert!(claim_tasks(conn, "worker-c", 1, 1_000, 103)?.is_empty());
+            assert_eq!(claim_tasks(conn, "worker-c", 1, 1_000, 104)?.len(), 1);
+            assert_eq!(recover_leases(conn, 1_104)?, 1);
+            let resumed = claim_tasks(conn, "worker-d", 1, 1_000, 1_104)?;
+            assert_eq!(resumed.len(), 1);
+            assert_eq!(resumed[0].stage, "review_summary");
+            assert_eq!(resumed[0].stage_failure_attempts, 1);
+            assert_eq!(resumed[0].total_failure_attempts, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
 }

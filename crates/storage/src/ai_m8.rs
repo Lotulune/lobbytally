@@ -1,6 +1,6 @@
 //! M8 progressive AI analyses, web evidence, field proposals, and bootstrap state.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use crate::pg::{Connection, OptionalExtension, params};
 
 use crate::error::{StorageError, StorageResult};
 
@@ -143,7 +143,7 @@ pub fn insert_progressive_analysis(
             analysis_id, task_type, status, prompt_version, input_hash,
             preference_hash, data_snapshot_hash, request_json, base_result_json,
             created_at_ms, updated_at_ms, expires_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11)",
         params![
             row.analysis_id,
             row.task_type,
@@ -173,7 +173,7 @@ pub fn get_progressive_analysis(
                     request_json, base_result_json, result_json, error_category, fallback_reason,
                     created_at_ms, updated_at_ms, completed_at_ms, expires_at_ms
              FROM ai_progressive_analyses
-             WHERE analysis_id = ?1 AND expires_at_ms > ?2",
+             WHERE analysis_id = $1 AND expires_at_ms > $2",
             params![analysis_id, now_ms],
             |row| {
                 Ok(ProgressiveAnalysis {
@@ -215,17 +215,17 @@ pub fn complete_progressive_analysis(
     }
     let changed = conn.execute(
         "UPDATE ai_progressive_analyses
-         SET status = ?2,
-             provider = ?3,
-             model = ?4,
-             protocol = ?5,
-             route_version = ?6,
-             result_json = ?7,
-             error_category = ?8,
-             fallback_reason = ?9,
-             completed_at_ms = ?10,
-             updated_at_ms = ?10
-         WHERE analysis_id = ?1",
+         SET status = $2,
+             provider = $3,
+             model = $4,
+             protocol = $5,
+             route_version = $6,
+             result_json = $7,
+             error_category = $8,
+             fallback_reason = $9,
+             completed_at_ms = $10,
+             updated_at_ms = $10
+         WHERE analysis_id = $1",
         params![
             update.analysis_id,
             update.status,
@@ -257,10 +257,11 @@ pub fn insert_web_discovery_evidence(
     }
     // Content-hash dedupe: identical URL+hash is a no-op success (no re-bill).
     let changed = conn.execute(
-        "INSERT OR IGNORE INTO web_discovery_evidence (
+        "INSERT INTO web_discovery_evidence (
             evidence_id, app_id, query_text, source_url, source_host, source_tier,
             title, snippet, content_hash, fetched_at_ms, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT DO NOTHING",
         params![
             row.evidence_id,
             row.app_id.map(i64::from),
@@ -288,9 +289,9 @@ pub fn list_web_discovery_for_app(
         "SELECT evidence_id, app_id, query_text, source_url, source_host, source_tier,
                 title, snippet, content_hash, fetched_at_ms, created_at_ms
          FROM web_discovery_evidence
-         WHERE app_id = ?1
+         WHERE app_id = $1
          ORDER BY fetched_at_ms DESC
-         LIMIT ?2",
+         LIMIT $2",
     )?;
     let rows = stmt.query_map(params![i64::from(app_id), limit], |row| {
         Ok(WebDiscoveryEvidence {
@@ -340,7 +341,7 @@ pub fn insert_field_proposal(conn: &Connection, row: &InsertFieldProposal) -> St
         "INSERT INTO field_proposals (
             proposal_id, app_id, field_name, proposed_value_json, confidence,
             evidence_ids_json, source_channel, review_status, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending_review', ?8, ?8)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending_review', $8, $8)",
         params![
             row.proposal_id,
             i64::from(row.app_id),
@@ -370,7 +371,7 @@ pub fn put_bootstrap_state(
         .map_err(|_| StorageError::validation("value_json must be valid JSON"))?;
     conn.execute(
         "INSERT INTO bootstrap_state(key, value_json, updated_at_ms)
-         VALUES (?1, ?2, ?3)
+         VALUES ($1, $2, $3)
          ON CONFLICT(key) DO UPDATE SET
             value_json = excluded.value_json,
             updated_at_ms = excluded.updated_at_ms",
@@ -382,7 +383,7 @@ pub fn put_bootstrap_state(
 pub fn get_bootstrap_state(conn: &Connection, key: &str) -> StorageResult<Option<String>> {
     let value = conn
         .query_row(
-            "SELECT value_json FROM bootstrap_state WHERE key = ?1",
+            "SELECT value_json FROM bootstrap_state WHERE key = $1",
             params![key],
             |row| row.get(0),
         )
@@ -432,7 +433,7 @@ pub fn upsert_game_ai_summary(conn: &Connection, row: &UpsertGameAiSummary) -> S
         "INSERT INTO game_ai_summaries (
             app_id, input_hash, prompt_version, summary_json, evidence_ids_json,
             review_status, model, created_at_ms, updated_at_ms, expires_at_ms
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9)
          ON CONFLICT(app_id, prompt_version) DO UPDATE SET
             input_hash = excluded.input_hash,
             summary_json = excluded.summary_json,
@@ -466,7 +467,7 @@ pub fn get_game_ai_summary(
         "SELECT app_id, input_hash, prompt_version, summary_json, evidence_ids_json,
                 review_status, model, created_at_ms, updated_at_ms, expires_at_ms
          FROM game_ai_summaries
-         WHERE app_id = ?1 AND prompt_version = ?2 AND expires_at_ms > ?3",
+         WHERE app_id = $1 AND prompt_version = $2 AND expires_at_ms > $3",
         params![i64::from(app_id), prompt_version, now_ms],
         |row| {
             Ok(GameAiSummaryRow {

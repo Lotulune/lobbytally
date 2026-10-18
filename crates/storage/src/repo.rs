@@ -1,6 +1,5 @@
-//! High-level repository façade over the SQLite database.
+//! High-level repository façade over the PostgreSQL database.
 
-use crate::backup::{self, restore_from_backup};
 use crate::catalog;
 use crate::curation;
 use crate::db::Database;
@@ -12,16 +11,15 @@ use crate::models::{
     EnrichmentNeedFilter, EnrichmentTarget, JobRecord, M3CatalogCoverage, M7DataCoverage,
     MediaBackfillOutcome, MediaBackfillPolicy, MediaCoverageStats, MultiplayerProfile,
 };
+use crate::pg::TransactionBehavior;
 use crate::quality::{self, QualityFinding};
 use mpgs_steam_source::{
     AppCatalogProposal, AppListPage, AppListRequest, AppRelationProposal, CcuProposal, GoldenGame,
     PopularReviewsProposal, ReviewSummaryProposal, StoreDetailsProposal, StoreSearchPage,
 };
-use rusqlite::TransactionBehavior;
 use std::{
     collections::HashMap,
     hash::Hash,
-    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -108,6 +106,10 @@ pub struct Repository {
 }
 
 impl Repository {
+    pub fn open(database_url: impl AsRef<str>) -> StorageResult<Self> {
+        Ok(Self::new(Database::open(database_url)?))
+    }
+
     pub fn new(db: Database) -> Self {
         Self {
             db,
@@ -118,6 +120,87 @@ impl Repository {
 
     pub fn database(&self) -> &Database {
         &self.db
+    }
+
+    pub fn consume_http_limit(
+        &self,
+        identity_keys: &[String],
+        identity_limit: u64,
+        global_limit: u64,
+        window_seconds: i64,
+    ) -> StorageResult<bool> {
+        self.db.with_conn_mut(|conn| {
+            crate::shared_limits::consume_http_limit(
+                conn,
+                identity_keys,
+                identity_limit,
+                global_limit,
+                window_seconds,
+                self.db.now_ms(),
+            )
+        })
+    }
+
+    pub fn acquire_ai_lease(
+        &self,
+        scope: &str,
+        scope_limit: usize,
+        global_limit: usize,
+        ttl_seconds: i64,
+    ) -> StorageResult<Option<String>> {
+        self.db.with_conn_mut(|conn| {
+            crate::shared_limits::acquire_ai_lease(
+                conn,
+                scope,
+                scope_limit,
+                global_limit,
+                ttl_seconds,
+                self.db.now_ms(),
+            )
+        })
+    }
+
+    pub fn release_ai_lease(&self, lease_id: &str) -> StorageResult<()> {
+        self.db
+            .with_conn_mut(|conn| crate::shared_limits::release_ai_lease(conn, lease_id))
+    }
+
+    pub fn avatar_storage_key_in_use(&self, key: &str) -> StorageResult<bool> {
+        self.db
+            .with_conn(|conn| crate::accounts::avatar_storage_key_in_use(conn, key))
+    }
+
+    pub fn yield_job(&self, job_id: i64, owner: &str, delay_ms: i64) -> StorageResult<JobRecord> {
+        self.db
+            .with_conn_mut(|conn| jobs::yield_job(conn, job_id, owner, delay_ms, self.db.now_ms()))
+    }
+
+    pub fn defer_ingestion_job(
+        &self,
+        app_id: u32,
+        owner: &str,
+        delay_ms: i64,
+    ) -> StorageResult<crate::models::GameIngestionTask> {
+        self.db.with_conn_mut(|conn| {
+            crate::game_ingestion::defer_ingestion_job(
+                conn,
+                app_id,
+                owner,
+                delay_ms,
+                self.db.now_ms(),
+            )
+        })
+    }
+
+    pub fn try_acquire_worker_lease(&self, owner: &str, lease_ms: i64) -> StorageResult<bool> {
+        self.db.with_conn_mut(|conn| {
+            jobs::try_acquire_worker_lease(conn, owner, lease_ms, self.db.now_ms())
+        })
+    }
+
+    pub fn release_worker_lease(&self, owner: &str) -> StorageResult<()> {
+        self.db
+            .with_conn_mut(|conn| jobs::release_worker_lease(conn, owner, self.db.now_ms()))
     }
 
     pub fn migrate(&self) -> StorageResult<i64> {
@@ -140,15 +223,6 @@ impl Repository {
             if active_algorithms != 1 {
                 return Err(crate::StorageError::migration(
                     "exactly one active algorithm config is required",
-                ));
-            }
-            let has_apps: i64 =
-                conn.query_row("SELECT EXISTS(SELECT 1 FROM apps LIMIT 1)", [], |row| {
-                    row.get(0)
-                })?;
-            if has_apps == 0 {
-                return Err(crate::StorageError::migration(
-                    "catalog has no app snapshot yet",
                 ));
             }
             crate::users::active_algorithm_config(conn)?;
@@ -239,8 +313,8 @@ impl Repository {
                     app_id, country_code, language, captured_at_ms, status, source,
                     checked_empty, store_core_empty, price_empty,
                     store_checked_at_ms, price_checked_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, 'not_found', 'steam_store_appdetails',
-                           1, 1, 1, ?4, ?4)
+                 ) VALUES ($1, $2, $3, $4, 'not_found', 'steam_store_appdetails',
+                           1, 1, 1, $4, $4)
                  ON CONFLICT(app_id, country_code, language) DO UPDATE SET
                     captured_at_ms = excluded.captured_at_ms,
                     status = excluded.status,
@@ -250,7 +324,7 @@ impl Repository {
                     price_empty = excluded.price_empty,
                     store_checked_at_ms = excluded.store_checked_at_ms,
                     price_checked_at_ms = excluded.price_checked_at_ms",
-                rusqlite::params![app_id, country_code, language, now],
+                crate::pg::params![app_id, country_code, language, now],
             )?;
             Ok(())
         })
@@ -274,13 +348,13 @@ impl Repository {
                 let already_candidate = tx.query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM feature_evidence evidence
-                         WHERE evidence.app_id = ?1
+                         WHERE evidence.app_id = $1
                            AND evidence.feature_name = 'category_hint'
                            AND evidence.is_active = 1
                            AND evidence.confidence >= 0.3
                      ) OR EXISTS (
                          SELECT 1 FROM multiplayer_profiles profile
-                         WHERE profile.app_id = ?1
+                         WHERE profile.app_id = $1
                            AND (
                                profile.dominant_mode IS NOT NULL
                                OR profile.private_session IS NOT NULL
@@ -442,8 +516,12 @@ impl Repository {
 
     pub fn restore_empty_availability_from_evidence(&self) -> StorageResult<usize> {
         let now = self.db.now_ms();
-        self.db
-            .with_conn_mut(|conn| catalog::restore_empty_availability_from_evidence(conn, now))
+        self.db.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            let result = catalog::restore_empty_availability_from_evidence(&tx, now)?;
+            tx.commit()?;
+            Ok(result)
+        })
     }
 
     pub fn ingest_multiplayer_bool(
@@ -585,8 +663,7 @@ impl Repository {
                 "WITH candidates(app_id) AS (
                      SELECT evidence.app_id
                      FROM feature_evidence evidence
-                          INDEXED BY idx_feature_evidence_enrichment_candidates
-                     CROSS JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
+                     JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND evidence.feature_name = 'category_hint'
                        AND evidence.is_active = 1
@@ -594,7 +671,7 @@ impl Repository {
                      UNION
                      SELECT profile.app_id
                      FROM multiplayer_profiles profile
-                     CROSS JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
+                     JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND (
                            profile.dominant_mode IS NOT NULL
@@ -615,64 +692,64 @@ impl Repository {
                                     OR NOT EXISTS (
                                         SELECT 1 FROM app_localizations localization
                                         WHERE localization.app_id = candidates.app_id
-                                          AND localization.language = ?7
+                                          AND localization.language = $7::text
                                     )
                                   ) AND NOT EXISTS (
                                       SELECT 1 FROM store_detail_refresh_state refresh
                                       WHERE refresh.app_id = candidates.app_id
-                                        AND refresh.country_code = ?5
-                                        AND refresh.language = ?7
+                                        AND refresh.country_code = $5::text
+                                        AND refresh.language = $7::text
                                         AND refresh.status IN ('succeeded', 'not_found')
                                          AND refresh.store_checked_at_ms >= CASE
-                                             WHEN a.release_state IN ('upcoming', 'coming_soon') THEN ?4
-                                             WHEN refresh.store_core_empty = 1 THEN ?18
-                                             ELSE ?4
+                                             WHEN a.release_state IN ('upcoming', 'coming_soon') THEN $4::bigint
+                                             WHEN refresh.store_core_empty = 1 THEN $18::bigint
+                                             ELSE $4::bigint
                                          END
                                   )
                               THEN 1 ELSE 0 END AS needs_store_details,
                          CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM review_snapshots review
                              WHERE review.app_id = candidates.app_id
-                               AND review.captured_at_ms >= ?2
+                               AND review.captured_at_ms >= $2::bigint
                          ) THEN 1 ELSE 0 END AS needs_reviews,
                          CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM popular_review_refresh_state review
                              WHERE review.app_id = candidates.app_id
-                               AND review.captured_at_ms >= ?2
+                               AND review.captured_at_ms >= $2::bigint
                          ) THEN 1 ELSE 0 END AS needs_review_excerpts,
                          CASE WHEN a.release_state = 'released' AND NOT EXISTS (
                              SELECT 1 FROM player_snapshots player
                              WHERE player.app_id = candidates.app_id
-                               AND player.captured_at_ms >= ?3
+                               AND player.captured_at_ms >= $3::bigint
                          ) THEN 1 ELSE 0 END AS needs_ccu,
                          CASE WHEN NOT EXISTS (
                              SELECT 1 FROM price_snapshots price
                              WHERE price.app_id = candidates.app_id
-                               AND price.country_code = ?5
+                               AND price.country_code = $5::text
                                AND price.final_price_minor IS NOT NULL
-                               AND price.captured_at_ms >= ?4
+                               AND price.captured_at_ms >= $4::bigint
                          ) AND NOT EXISTS (
                              SELECT 1 FROM store_detail_refresh_state refresh
                              WHERE refresh.app_id = candidates.app_id
-                               AND refresh.country_code = ?5
-                                        AND refresh.language = ?7
+                               AND refresh.country_code = $5::text
+                                        AND refresh.language = $7::text
                                         AND refresh.status IN ('succeeded', 'not_found')
                                          AND refresh.price_checked_at_ms >= CASE
-                                             WHEN refresh.price_empty = 1 THEN ?18 ELSE ?4 END
+                                             WHEN refresh.price_empty = 1 THEN $18::bigint ELSE $4::bigint END
                          ) THEN 1 ELSE 0 END AS needs_price,
-                         CASE WHEN ?13 = 1
+                         CASE WHEN $13::bigint = 1
                                    AND NOT EXISTS (
                                        SELECT 1 FROM app_media_assets media
                                        WHERE media.app_id = candidates.app_id
                                    )
                                    AND COALESCE(backfill.status, 'pending') IN ('pending', 'failed')
-                                   AND COALESCE(backfill.attempts, 0) < ?14
+                                   AND COALESCE(backfill.attempts, 0) < $14::bigint
                                    AND (
                                        backfill.last_attempt_at_ms IS NULL
-                                       OR backfill.last_attempt_at_ms < ?15
+                                       OR backfill.last_attempt_at_ms < $15::bigint
                                    )
                               THEN 1 ELSE 0 END AS needs_media_backfill,
-                         CASE WHEN ?16 = 1
+                         CASE WHEN $16::bigint = 1
                                    AND NOT EXISTS (
                                        SELECT 1 FROM app_localizations en
                                        WHERE en.app_id = candidates.app_id
@@ -685,7 +762,7 @@ impl Repository {
                                        WHERE en_refresh.app_id = candidates.app_id
                                          AND en_refresh.country_code = 'US'
                                          AND en_refresh.language = 'english'
-                                         AND en_refresh.captured_at_ms >= ?17
+                                         AND en_refresh.captured_at_ms >= $17::bigint
                                    )
                               THEN 1 ELSE 0 END AS needs_english_name,
                          COALESCE((
@@ -714,34 +791,34 @@ impl Repository {
                      app_id, needs_store_details, needs_reviews, needs_review_excerpts,
                      needs_ccu, needs_price, needs_media_backfill, needs_english_name
                  FROM due
-                 WHERE (needs_store_details = 1 AND ?8 = 1)
-                    OR (needs_reviews = 1 AND ?9 = 1)
-                    OR (needs_review_excerpts = 1 AND ?10 = 1)
-                    OR (needs_ccu = 1 AND ?11 = 1)
-                    OR (needs_price = 1 AND ?12 = 1)
-                    OR (needs_media_backfill = 1 AND ?13 = 1)
-                    OR (needs_english_name = 1 AND ?16 = 1)
+                 WHERE (needs_store_details = 1 AND $8::bigint = 1)
+                    OR (needs_reviews = 1 AND $9::bigint = 1)
+                    OR (needs_review_excerpts = 1 AND $10::bigint = 1)
+                    OR (needs_ccu = 1 AND $11::bigint = 1)
+                    OR (needs_price = 1 AND $12::bigint = 1)
+                    OR (needs_media_backfill = 1 AND $13::bigint = 1)
+                    OR (needs_english_name = 1 AND $16::bigint = 1)
                  ORDER BY
-                     CASE WHEN (needs_reviews = 1 AND ?9 = 1)
-                                  OR (needs_review_excerpts = 1 AND ?10 = 1)
+                     CASE WHEN (needs_reviews = 1 AND $9::bigint = 1)
+                                  OR (needs_review_excerpts = 1 AND $10::bigint = 1)
                          THEN last_known_ccu ELSE 0 END DESC,
-                     CASE WHEN needs_ccu = 1 AND ?11 = 1
+                     CASE WHEN needs_ccu = 1 AND $11::bigint = 1
                          THEN last_known_reviews ELSE 0 END DESC,
                      (
-                         CASE WHEN needs_media_backfill = 1 AND ?13 = 1 THEN 5 ELSE 0 END
-                       + CASE WHEN needs_english_name = 1 AND ?16 = 1 THEN 4 ELSE 0 END
-                       + CASE WHEN needs_store_details = 1 AND ?8 = 1 THEN 3 ELSE 0 END
-                       + CASE WHEN needs_price = 1 AND ?12 = 1 THEN 3 ELSE 0 END
-                       + CASE WHEN needs_reviews = 1 AND ?9 = 1 THEN 4 ELSE 0 END
-                       + CASE WHEN needs_review_excerpts = 1 AND ?10 = 1 THEN 1 ELSE 0 END
-                       + CASE WHEN needs_ccu = 1 AND ?11 = 1 THEN 2 ELSE 0 END
+                         CASE WHEN needs_media_backfill = 1 AND $13::bigint = 1 THEN 5 ELSE 0 END
+                       + CASE WHEN needs_english_name = 1 AND $16::bigint = 1 THEN 4 ELSE 0 END
+                       + CASE WHEN needs_store_details = 1 AND $8::bigint = 1 THEN 3 ELSE 0 END
+                       + CASE WHEN needs_price = 1 AND $12::bigint = 1 THEN 3 ELSE 0 END
+                       + CASE WHEN needs_reviews = 1 AND $9::bigint = 1 THEN 4 ELSE 0 END
+                       + CASE WHEN needs_review_excerpts = 1 AND $10::bigint = 1 THEN 1 ELSE 0 END
+                       + CASE WHEN needs_ccu = 1 AND $11::bigint = 1 THEN 2 ELSE 0 END
                      ) DESC,
-                     CASE WHEN app_id > ?6 THEN 0 ELSE 1 END,
+                     CASE WHEN app_id > $6::bigint THEN 0 ELSE 1 END,
                      app_id ASC
-                 LIMIT ?1",
+                 LIMIT $1::bigint",
             )?;
             let rows = stmt.query_map(
-                rusqlite::params![
+                crate::pg::params![
                     limit,
                     review_cutoff,
                     ccu_cutoff,
@@ -789,8 +866,7 @@ impl Repository {
                 "WITH candidates(app_id) AS (
                      SELECT evidence.app_id
                      FROM feature_evidence evidence
-                          INDEXED BY idx_feature_evidence_enrichment_candidates
-                     CROSS JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
+                     JOIN apps candidate_app ON candidate_app.app_id = evidence.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND evidence.feature_name = 'category_hint'
                        AND evidence.is_active = 1
@@ -798,7 +874,7 @@ impl Repository {
                      UNION
                      SELECT profile.app_id
                      FROM multiplayer_profiles profile
-                     CROSS JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
+                     JOIN apps candidate_app ON candidate_app.app_id = profile.app_id
                      WHERE candidate_app.app_type IN ('game', 'demo', 'playtest')
                        AND (
                            profile.dominant_mode IS NOT NULL
@@ -845,7 +921,7 @@ impl Repository {
             let changed = conn.execute(
                 "INSERT INTO app_media_backfill_state (
                      app_id, attempts, last_attempt_at_ms, status, updated_at_ms
-                 ) VALUES (?1, 1, ?2, 'pending', ?2)
+                 ) VALUES ($1, 1, $2, 'pending', $2)
                  ON CONFLICT(app_id) DO UPDATE SET
                      attempts = app_media_backfill_state.attempts + 1,
                      last_attempt_at_ms = excluded.last_attempt_at_ms,
@@ -854,9 +930,9 @@ impl Repository {
                  WHERE app_media_backfill_state.status IN ('pending', 'failed')
                    AND (
                        app_media_backfill_state.last_attempt_at_ms IS NULL
-                       OR app_media_backfill_state.last_attempt_at_ms <= ?3
+                       OR app_media_backfill_state.last_attempt_at_ms <= $3
                    )",
-                rusqlite::params![app_id, now, stale_claim_cutoff],
+                crate::pg::params![app_id, now, stale_claim_cutoff],
             )?;
             Ok(changed == 1)
         })
@@ -881,7 +957,7 @@ impl Repository {
             conn.execute(
                 "INSERT INTO app_media_backfill_state (
                      app_id, attempts, last_attempt_at_ms, status, updated_at_ms
-                  ) VALUES (?1, 1, ?2, ?3, ?2)
+                  ) VALUES ($1, 1, $2, $3, $2)
                   ON CONFLICT(app_id) DO UPDATE SET
                       last_attempt_at_ms = CASE
                           WHEN app_media_backfill_state.status IN ('complete', 'none', 'exhausted')
@@ -898,12 +974,12 @@ impl Repository {
                               THEN 'none'
                           WHEN app_media_backfill_state.status = 'exhausted'
                               THEN 'exhausted'
-                          WHEN app_media_backfill_state.attempts >= ?4
+                          WHEN app_media_backfill_state.attempts >= $4
                               THEN 'exhausted'
                           ELSE 'failed'
                       END,
                       updated_at_ms = excluded.updated_at_ms",
-                rusqlite::params![app_id, now, status, max_attempts],
+                crate::pg::params![app_id, now, status, max_attempts],
             )?;
             Ok(())
         })
@@ -912,8 +988,8 @@ impl Repository {
     pub fn app_has_media_assets(&self, app_id: u32) -> StorageResult<bool> {
         self.db.with_conn(|conn| {
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM app_media_assets WHERE app_id = ?1",
-                rusqlite::params![app_id],
+                "SELECT COUNT(*) FROM app_media_assets WHERE app_id = $1",
+                crate::pg::params![app_id],
                 |row| row.get(0),
             )?;
             Ok(count > 0)
@@ -926,11 +1002,11 @@ impl Repository {
         self.db.with_conn(|conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM app_localizations
-                 WHERE app_id = ?1
-                   AND lower(language) = ?2
+                 WHERE app_id = $1
+                   AND lower(language) = $2
                    AND name IS NOT NULL
                    AND trim(name) != ''",
-                rusqlite::params![app_id, language],
+                crate::pg::params![app_id, language],
                 |row| row.get(0),
             )?;
             Ok(count > 0)
@@ -956,9 +1032,9 @@ impl Repository {
         self.db.with_conn(|conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM store_detail_refresh_state
-                  WHERE app_id = ?1 AND country_code = ?2 AND language = ?3
-                    AND store_checked_at_ms >= ?4",
-                rusqlite::params![app_id, country_code, language, cutoff],
+                  WHERE app_id = $1 AND country_code = $2 AND language = $3
+                    AND store_checked_at_ms >= $4",
+                crate::pg::params![app_id, country_code, language, cutoff],
                 |row| row.get(0),
             )?;
             Ok(count > 0)
@@ -981,7 +1057,7 @@ impl Repository {
                      app_id, country_code, language, captured_at_ms, status, source,
                      checked_empty, store_core_empty, price_empty,
                      store_checked_at_ms, price_checked_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, 0, 0, 0, ?4, 0)
+                 ) VALUES ($1, $2, $3, $4, 'succeeded', $5, 0, 0, 0, $4, 0)
                  ON CONFLICT(app_id, country_code, language) DO UPDATE SET
                      captured_at_ms = excluded.captured_at_ms,
                      status = excluded.status,
@@ -989,7 +1065,7 @@ impl Repository {
                      checked_empty = excluded.checked_empty,
                      store_core_empty = excluded.store_core_empty,
                      store_checked_at_ms = excluded.store_checked_at_ms",
-                rusqlite::params![app_id, country_code, language, now, source],
+                crate::pg::params![app_id, country_code, language, now, source],
             )?;
             Ok(())
         })
@@ -1007,15 +1083,18 @@ impl Repository {
         let now = self.db.now_ms();
         let language = language.trim().to_ascii_lowercase();
         self.db.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
             catalog::upsert_app_localization(
-                conn,
+                &tx,
                 app_id,
                 &language,
                 name,
                 short_description,
                 source,
                 now,
-            )
+            )?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -1186,12 +1265,12 @@ impl Repository {
                        )
                  ), review_days AS (
                      SELECT DISTINCT review.app_id,
-                            date(review.captured_at_ms / 1000, 'unixepoch') AS day_utc
+                            (to_timestamp(review.captured_at_ms / 1000.0) AT TIME ZONE 'UTC')::date::text AS day_utc
                      FROM review_snapshots review
                      JOIN focus ON focus.app_id = review.app_id
                  ), review_numbered AS (
                      SELECT app_id, day_utc,
-                            julianday(day_utc) - ROW_NUMBER() OVER (
+                            (day_utc::date - DATE '1970-01-01') - ROW_NUMBER() OVER (
                                 PARTITION BY app_id ORDER BY day_utc
                             ) AS streak_key
                      FROM review_days
@@ -1207,7 +1286,7 @@ impl Repository {
                        AND daily.median_approx_ccu IS NOT NULL
                  ), ccu_numbered AS (
                      SELECT app_id, day_utc,
-                            julianday(day_utc) - ROW_NUMBER() OVER (
+                            (day_utc::date - DATE '1970-01-01') - ROW_NUMBER() OVER (
                                 PARTITION BY app_id ORDER BY day_utc
                             ) AS streak_key
                      FROM ccu_days
@@ -1461,21 +1540,12 @@ impl Repository {
 
     pub fn run_quality_checks(&self) -> StorageResult<Vec<QualityFinding>> {
         let now = self.db.now_ms();
-        self.db
-            .with_conn_mut(|conn| quality::run_quality_checks(conn, now))
-    }
-
-    pub fn backup_to(&self, dest: impl AsRef<Path>) -> StorageResult<()> {
-        backup::backup_to_path(&self.db, dest)
-    }
-
-    pub fn restore_backup(
-        backup_path: impl AsRef<Path>,
-        dest_path: impl AsRef<Path>,
-        now_ms: i64,
-    ) -> StorageResult<Self> {
-        let db = restore_from_backup(backup_path, dest_path, now_ms)?;
-        Ok(Self::new(db))
+        self.db.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            let findings = quality::run_quality_checks(&tx, now)?;
+            tx.commit()?;
+            Ok(findings)
+        })
     }
 
     pub fn seed_demo_if_empty(&self) -> StorageResult<usize> {
@@ -1491,18 +1561,20 @@ impl Repository {
     pub fn ensure_runtime_defaults(&self) -> StorageResult<()> {
         let now = self.db.now_ms();
         self.db.with_conn_mut(|conn| {
-            crate::users::ensure_algorithm_config(conn, now)?;
-            crate::source_state::ensure_data_refresh_tasks(conn, now)?;
+            let tx = conn.transaction()?;
+            crate::users::ensure_algorithm_config(&tx, now)?;
+            crate::source_state::ensure_data_refresh_tasks(&tx, now)?;
             let empty_snapshot = crate::models::PipelineStatusSnapshot {
                 generated_at_ms: now,
                 ..Default::default()
             };
-            conn.execute(
-                "INSERT OR IGNORE INTO pipeline_status_snapshot (
+            tx.execute(
+                "INSERT INTO pipeline_status_snapshot (
                     snapshot_id, generated_at_ms, snapshot_json
-                 ) VALUES (1, ?1, ?2)",
-                rusqlite::params![now, serde_json::to_string(&empty_snapshot)?],
+                 ) VALUES (1, $1, $2) ON CONFLICT (snapshot_id) DO NOTHING",
+                crate::pg::params![now, serde_json::to_string(&empty_snapshot)?],
             )?;
+            tx.commit()?;
             Ok(())
         })
     }
@@ -1537,7 +1609,7 @@ impl Repository {
     }
 
     pub fn pipeline_inventory(&self) -> StorageResult<crate::models::PipelineInventory> {
-        use rusqlite::OptionalExtension;
+        use crate::pg::OptionalExtension;
 
         let now_ms = self.db.now_ms();
         let today = crate::util::day_utc_from_ms(now_ms);
@@ -1559,9 +1631,9 @@ impl Repository {
                 "SELECT COUNT(*) FROM apps
                  WHERE release_state = 'released'
                    AND release_date IS NOT NULL
-                   AND release_date >= ?1
-                   AND release_date <= ?2",
-                rusqlite::params![since, today],
+                   AND release_date >= $1
+                   AND release_date <= $2",
+                crate::pg::params![since, today],
                 |row| row.get(0),
             )?;
             let coming_soon_total: i64 = conn.query_row(
@@ -1598,13 +1670,13 @@ impl Repository {
             let jobs_pending: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM jobs
                  WHERE status = 'pending'
-                    OR (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= ?1)",
+                    OR (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= $1)",
                 [now_ms],
                 |row| row.get(0),
             )?;
             let jobs_leased: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM jobs
-                 WHERE status = 'leased' AND lease_expires_at_ms > ?1",
+                 WHERE status = 'leased' AND lease_expires_at_ms > $1",
                 [now_ms],
                 |row| row.get(0),
             )?;
@@ -1615,7 +1687,7 @@ impl Repository {
             )?;
             let recent_cutoff_ms = now_ms.saturating_sub(7 * 24 * 60 * 60 * 1_000);
             let jobs_dead_recent: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM jobs WHERE status = 'dead' AND updated_at_ms >= ?1",
+                "SELECT COUNT(*) FROM jobs WHERE status = 'dead' AND updated_at_ms >= $1",
                 [recent_cutoff_ms],
                 |row| row.get(0),
             )?;
@@ -1645,11 +1717,11 @@ impl Repository {
         self.db.with_conn(|conn| {
             let (pending, pending_due, leased) = conn.query_row(
                 "SELECT
-                    COALESCE(SUM(status = 'pending' OR
-                        (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= ?1)), 0),
-                    COALESCE(SUM((status = 'pending' AND due_at_ms <= ?1) OR
-                        (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= ?1)), 0),
-                    COALESCE(SUM(status = 'leased' AND lease_expires_at_ms > ?1), 0)
+                    COUNT(*) FILTER (WHERE status = 'pending' OR
+                        (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= $1)),
+                    COUNT(*) FILTER (WHERE (status = 'pending' AND due_at_ms <= $1) OR
+                        (status = 'leased' AND COALESCE(lease_expires_at_ms, 0) <= $1)),
+                    COUNT(*) FILTER (WHERE status = 'leased' AND lease_expires_at_ms > $1)
                  FROM jobs
                  WHERE status IN ('pending', 'leased')",
                 [now_ms],
@@ -1659,7 +1731,7 @@ impl Repository {
                 "SELECT job_id, task_type, entity_key, attempts, max_attempts,
                         lease_expires_at_ms, updated_at_ms
                  FROM jobs
-                 WHERE status = 'leased' AND lease_expires_at_ms > ?1
+                 WHERE status = 'leased' AND lease_expires_at_ms > $1
                  ORDER BY updated_at_ms ASC, job_id ASC
                  LIMIT 10",
             )?;
@@ -1731,29 +1803,29 @@ impl Repository {
                  )
                  SELECT COUNT(*),
                         COALESCE(SUM(CASE WHEN a.release_state = 'released' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(EXISTS(
+                        COUNT(*) FILTER (WHERE EXISTS(
                             SELECT 1 FROM store_detail_refresh_state refresh
                             WHERE refresh.app_id = candidates.app_id
                               AND refresh.status IN ('succeeded', 'not_found')
                               AND refresh.store_checked_at_ms > 0
-                        )), 0),
+                        )),
                         COALESCE(SUM(CASE WHEN COALESCE(v.platforms_json, '[]') <> '[]' THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN a.release_date IS NOT NULL OR a.release_date_raw IS NOT NULL THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM review_snapshots r WHERE r.app_id = candidates.app_id) THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM latest_review_snapshots r WHERE r.app_id = candidates.app_id) THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM player_snapshots c WHERE c.app_id = candidates.app_id) THEN 1 ELSE 0 END), 0),
                         COALESCE(SUM(CASE WHEN a.release_state = 'released' AND EXISTS(SELECT 1 FROM player_snapshots c WHERE c.app_id = candidates.app_id AND c.player_count IS NOT NULL AND c.result_code = 1) THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(
+                        COUNT(*) FILTER (WHERE
                             EXISTS(SELECT 1 FROM price_snapshots price WHERE price.app_id = candidates.app_id)
                             OR EXISTS(
                                 SELECT 1 FROM store_detail_refresh_state refresh
                                 WHERE refresh.app_id = candidates.app_id
                                   AND refresh.price_checked_at_ms > 0
                             )
-                        ), 0),
-                        COALESCE(SUM(EXISTS(SELECT 1 FROM price_snapshots price WHERE price.app_id = candidates.app_id AND price.final_price_minor IS NOT NULL)), 0),
+                        ),
+                        COUNT(*) FILTER (WHERE EXISTS(SELECT 1 FROM price_snapshots price WHERE price.app_id = candidates.app_id AND price.final_price_minor IS NOT NULL)),
                         COALESCE(SUM(CASE WHEN COALESCE(v.languages_json, '[]') <> '[]' THEN 1 ELSE 0 END), 0),
-                        COALESCE(SUM(EXISTS(SELECT 1 FROM game_documents d WHERE d.app_id = candidates.app_id)), 0),
+                        COUNT(*) FILTER (WHERE EXISTS(SELECT 1 FROM game_documents d WHERE d.app_id = candidates.app_id)),
                         COALESCE(SUM(CASE WHEN media.capsule_url IS NOT NULL AND TRIM(media.capsule_url) <> '' THEN 1 ELSE 0 END), 0)
                  FROM candidates
                  JOIN apps a ON a.app_id = candidates.app_id
@@ -1787,16 +1859,16 @@ impl Repository {
         let integrated_ingestion = self.db.with_conn(|conn| {
             let mut status = conn.query_row(
                 "SELECT
-                    COALESCE(SUM(status = 'pending' AND
-                        (lease_owner IS NULL OR COALESCE(lease_expires_at_ms, 0) <= ?1)), 0),
-                    COALESCE(SUM(status = 'retry' AND
-                        (lease_owner IS NULL OR COALESCE(lease_expires_at_ms, 0) <= ?1)), 0),
-                    COALESCE(SUM(lease_owner IS NOT NULL AND lease_expires_at_ms > ?1), 0),
-                    COALESCE(SUM(status = 'dead'), 0),
-                    COALESCE(SUM(stage = 'store_details' AND status NOT IN ('complete', 'dead')), 0),
-                    COALESCE(SUM(stage = 'review_summary' AND status NOT IN ('complete', 'dead')), 0),
-                    COALESCE(SUM(stage = 'popular_reviews' AND status NOT IN ('complete', 'dead')), 0),
-                    COALESCE(SUM(stage = 'ccu' AND status NOT IN ('complete', 'dead')), 0),
+                    COUNT(*) FILTER (WHERE status = 'pending' AND
+                        (lease_owner IS NULL OR COALESCE(lease_expires_at_ms, 0) <= $1)),
+                    COUNT(*) FILTER (WHERE status = 'retry' AND
+                        (lease_owner IS NULL OR COALESCE(lease_expires_at_ms, 0) <= $1)),
+                    COUNT(*) FILTER (WHERE lease_owner IS NOT NULL AND lease_expires_at_ms > $1),
+                    COUNT(*) FILTER (WHERE status = 'dead'),
+                    COUNT(*) FILTER (WHERE stage = 'store_details' AND status NOT IN ('complete', 'dead')),
+                    COUNT(*) FILTER (WHERE stage = 'review_summary' AND status NOT IN ('complete', 'dead')),
+                    COUNT(*) FILTER (WHERE stage = 'popular_reviews' AND status NOT IN ('complete', 'dead')),
+                    COUNT(*) FILTER (WHERE stage = 'ccu' AND status NOT IN ('complete', 'dead')),
                     MIN(CASE WHEN status = 'dead' THEN dead_at_ms END)
                  FROM game_ingestion_queue",
                 [generated_at_ms],
@@ -1906,11 +1978,11 @@ impl Repository {
         self.db.with_conn_mut(|conn| {
             conn.execute(
                 "INSERT INTO pipeline_status_snapshot (snapshot_id, generated_at_ms, snapshot_json)
-                 VALUES (1, ?1, ?2)
+                 VALUES (1, $1, $2)
                  ON CONFLICT(snapshot_id) DO UPDATE SET
                     generated_at_ms = excluded.generated_at_ms,
                     snapshot_json = excluded.snapshot_json",
-                rusqlite::params![snapshot.generated_at_ms, snapshot_json],
+                crate::pg::params![snapshot.generated_at_ms, snapshot_json],
             )?;
             Ok(())
         })?;
@@ -1920,7 +1992,7 @@ impl Repository {
     pub fn pipeline_status_snapshot(
         &self,
     ) -> StorageResult<Option<crate::models::PipelineStatusSnapshot>> {
-        use rusqlite::OptionalExtension;
+        use crate::pg::OptionalExtension;
 
         self.db.with_conn(|conn| {
             let json: Option<String> = conn
@@ -2083,8 +2155,9 @@ impl Repository {
         &self,
         user_id: &str,
     ) -> StorageResult<Option<crate::accounts::AvatarMetadata>> {
-        self.db
-            .with_conn_mut(|conn| crate::accounts::delete_avatar_metadata(conn, user_id))
+        self.db.with_conn_mut(|conn| {
+            crate::accounts::delete_avatar_metadata(conn, user_id, self.db.now_ms())
+        })
     }
 
     pub fn set_account_avatar_moderation(
@@ -2452,7 +2525,7 @@ impl Repository {
         offset: usize,
     ) -> StorageResult<crate::community::CommunityPlayIntentPage> {
         let now = self.db.now_ms();
-        self.db.with_conn_mut(|conn| {
+        self.db.with_conn(|conn| {
             crate::community::page(conn, user_id, sort, filters, limit, offset, now)
         })
     }
@@ -2469,7 +2542,7 @@ impl Repository {
         u32,
     )> {
         self.db
-            .with_conn_mut(|conn| crate::community::previews_for_game(conn, app_id, user_id))
+            .with_conn(|conn| crate::community::previews_for_game(conn, app_id, user_id))
     }
 
     // --- M8 progressive AI + dual-channel storage ---

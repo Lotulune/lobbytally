@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{Connection, params};
+use crate::pg::{Connection, OptionalExtension, params};
 
 use crate::catalog;
 use crate::error::{StorageError, StorageResult};
@@ -22,7 +22,7 @@ pub struct PlayIntentEpoch {
     pub revision: u64,
 }
 
-/// Vote state used by a feed, read from one SQLite snapshot.
+/// Vote state used by a feed, read from one PostgreSQL snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayIntentFeedSnapshot {
     pub epoch: PlayIntentEpoch,
@@ -30,7 +30,7 @@ pub struct PlayIntentFeedSnapshot {
     pub user_votes: HashSet<u32>,
 }
 
-/// Vote state used by game detail, read by one SQLite statement.
+/// Vote state used by game detail, read by one PostgreSQL statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayIntentGameSnapshot {
     pub epoch: PlayIntentEpoch,
@@ -47,12 +47,14 @@ pub fn set_play_intent(
     now_ms: i64,
 ) -> StorageResult<PlayIntentState> {
     let tx = conn.unchecked_transaction()?;
-    let account_active: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = ?1 AND status = 'active')",
-        params![user_id],
-        |row| row.get(0),
-    )?;
-    if !account_active {
+    let account_active = tx
+        .query_row(
+            "SELECT user_id FROM user_accounts WHERE user_id = $1 AND status = 'active' FOR UPDATE",
+            params![user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if account_active.is_none() {
         return Err(StorageError::not_found("active account"));
     }
     if catalog::get_app(&tx, app_id)?.is_none() {
@@ -61,13 +63,13 @@ pub fn set_play_intent(
     if intent {
         tx.execute(
             "INSERT INTO play_intent_votes (app_id, user_id, created_at_ms)
-             VALUES (?1, ?2, ?3)
+             VALUES ($1, $2, $3)
              ON CONFLICT (app_id, user_id) DO NOTHING",
             params![app_id, user_id, now_ms],
         )?;
     } else {
         tx.execute(
-            "DELETE FROM play_intent_votes WHERE app_id = ?1 AND user_id = ?2",
+            "DELETE FROM play_intent_votes WHERE app_id = $1 AND user_id = $2",
             params![app_id, user_id],
         )?;
     }
@@ -85,7 +87,7 @@ pub fn count_for(conn: &Connection, app_id: u32) -> StorageResult<u32> {
         "SELECT COUNT(*)
          FROM play_intent_votes AS vote
          JOIN user_accounts AS account ON account.user_id = vote.user_id
-         WHERE vote.app_id = ?1 AND account.status = 'active'",
+         WHERE vote.app_id = $1 AND account.status = 'active'",
         params![app_id],
         |row| row.get(0),
     )?;
@@ -97,7 +99,7 @@ pub fn has_voted(conn: &Connection, user_id: &str, app_id: u32) -> StorageResult
         "SELECT COUNT(*) > 0
          FROM play_intent_votes AS vote
          JOIN user_accounts AS account ON account.user_id = vote.user_id
-         WHERE vote.app_id = ?1 AND vote.user_id = ?2 AND account.status = 'active'",
+         WHERE vote.app_id = $1 AND vote.user_id = $2 AND account.status = 'active'",
         params![app_id, user_id],
         |row| row.get(0),
     )?;
@@ -130,7 +132,7 @@ pub fn user_votes(conn: &Connection, user_id: &str) -> StorageResult<HashSet<u32
         "SELECT vote.app_id
          FROM play_intent_votes AS vote
          JOIN user_accounts AS account ON account.user_id = vote.user_id
-         WHERE vote.user_id = ?1 AND account.status = 'active'",
+         WHERE vote.user_id = $1 AND account.status = 'active'",
     )?;
     let rows = stmt.query_map(params![user_id], |row| Ok(row.get::<_, i64>(0)? as u32))?;
     let mut set = HashSet::new();
@@ -157,14 +159,47 @@ pub fn feed_snapshot(
     conn: &Connection,
     user_id: Option<&str>,
 ) -> StorageResult<PlayIntentFeedSnapshot> {
-    let tx = conn.unchecked_transaction()?;
-    let epoch = epoch(&tx)?;
-    let counts = all_counts(&tx)?;
-    let user_votes = match user_id {
-        Some(user_id) => user_votes(&tx, user_id)?,
-        None => HashSet::new(),
+    let mut statement = conn.prepare(
+        "WITH votes AS (
+             SELECT vote.app_id, COUNT(*) AS vote_count,
+                    BOOL_OR(vote.user_id = $1::TEXT) AS voted
+             FROM play_intent_votes AS vote
+             JOIN user_accounts AS account ON account.user_id = vote.user_id
+             WHERE account.status = 'active'
+             GROUP BY vote.app_id
+         )
+         SELECT state.revision, votes.app_id, votes.vote_count,
+                COALESCE(votes.voted, FALSE)
+         FROM play_intent_state AS state
+         LEFT JOIN votes ON TRUE
+         WHERE state.singleton = 1",
+    )?;
+    let rows = statement.query_map(params![user_id], |row| {
+        Ok((
+            row.get::<_, u64>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, bool>(3)?,
+        ))
+    })?;
+    let mut revision = None;
+    let mut counts = HashMap::new();
+    let mut user_votes = HashSet::new();
+    for row in rows {
+        let (current_revision, app_id, count, voted) = row?;
+        revision = Some(current_revision);
+        if let Some(app_id) = app_id {
+            let app_id = app_id as u32;
+            counts.insert(app_id, count.unwrap_or(0).max(0) as u32);
+            if voted {
+                user_votes.insert(app_id);
+            }
+        }
+    }
+    let epoch = PlayIntentEpoch {
+        revision: revision
+            .ok_or_else(|| StorageError::migration("play-intent state is missing"))?,
     };
-    tx.commit()?;
     Ok(PlayIntentFeedSnapshot {
         epoch,
         counts,
@@ -182,12 +217,12 @@ pub fn game_snapshot(
                 (SELECT COUNT(*)
                  FROM play_intent_votes AS vote
                  JOIN user_accounts AS account ON account.user_id = vote.user_id
-                 WHERE vote.app_id = ?1 AND account.status = 'active'),
-                CASE WHEN ?2 IS NULL THEN 0 ELSE EXISTS (
+                 WHERE vote.app_id = $1 AND account.status = 'active'),
+                CASE WHEN $2::TEXT IS NULL THEN FALSE ELSE EXISTS (
                     SELECT 1
                     FROM play_intent_votes AS vote
                     JOIN user_accounts AS account ON account.user_id = vote.user_id
-                    WHERE vote.app_id = ?1 AND vote.user_id = ?2 AND account.status = 'active'
+                    WHERE vote.app_id = $1 AND vote.user_id = $2 AND account.status = 'active'
                 ) END
          FROM play_intent_state AS state WHERE state.singleton = 1",
         params![app_id, user_id],
@@ -206,6 +241,8 @@ pub fn game_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
     use crate::accounts::{RegisterAccount, register_account};
     use crate::db::Database;
@@ -332,5 +369,36 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn concurrent_duplicate_votes_change_count_and_revision_once() {
+        let (db, user) = setup();
+        let handles: Vec<_> = (0..4).map(|_| db.reconnect().unwrap()).collect();
+        let barrier = Arc::new(Barrier::new(handles.len()));
+        let threads: Vec<_> = handles
+            .into_iter()
+            .map(|handle| {
+                let user = user.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle
+                        .with_conn(|conn| set_play_intent(conn, &user, 10, true, 1))
+                        .unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            let state = thread.join().unwrap();
+            assert_eq!(state.count, 1);
+            assert!(state.voted);
+        }
+        let snapshot = db
+            .with_conn(|conn| feed_snapshot(conn, Some(&user)))
+            .unwrap();
+        assert_eq!(snapshot.epoch.revision, 1);
+        assert_eq!(snapshot.counts.get(&10), Some(&1));
+        assert!(snapshot.user_votes.contains(&10));
     }
 }

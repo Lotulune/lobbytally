@@ -1,5 +1,7 @@
 # MPGS 运维手册（M6）
 
+本页保留 SQLite 单机版本的运维记录。当前代码的部署、调度、头像存储及验收流程见 [Vercel + Supabase 部署指南](VERCEL_SUPABASE.md)。
+
 面向单节点 MVP：一个 `mpgs-server` 进程 + 本机 SQLite。数据库文件不得放在网络共享或同步盘上。
 
 ## 1. 组件

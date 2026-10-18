@@ -11,7 +11,7 @@ use mpgs_steam_source::{
 
 use crate::clock::FakeClock;
 use crate::db::Database;
-use crate::migrate::{self, latest_version};
+use crate::migrate::latest_version;
 use crate::models::{CreateOverrideRequest, EnqueueJob, FeatureOrigin};
 use crate::repo::Repository;
 
@@ -27,6 +27,7 @@ fn repo_with_clock(now_ms: i64) -> (Repository, Arc<FakeClock>) {
 fn empty_database_migrates_to_latest() {
     let db = Database::open_in_memory().unwrap();
     assert_eq!(db.schema_version().unwrap(), 0);
+    assert!(db.readiness_check().is_err());
     let version = db.migrate().unwrap();
     assert_eq!(version, latest_version());
     db.assert_ready().unwrap();
@@ -254,73 +255,42 @@ fn calendar_cache_is_bounded_by_the_data_snapshot() {
 }
 
 #[test]
-fn previous_version_with_data_upgrades() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("upgrade.db");
+fn reconnected_database_preserves_catalog_schema_and_clock() {
     let clock = Arc::new(FakeClock::new(1_000));
-    let db = Database::open_with_clock(&path, clock.clone()).unwrap();
-
-    db.with_conn_mut(|conn| {
-        migrate::migrate_to(conn, 1, 1_000)?;
-        Ok(())
-    })
-    .unwrap();
-    assert_eq!(db.schema_version().unwrap(), 1);
-
-    db.with_conn_mut(|conn| {
-        conn.execute(
-            "INSERT INTO apps (
-                app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
-             ) VALUES (892970, 'game', 'Valheim', 'released', 1000, 1000)",
-            [],
-        )?;
-        Ok(())
-    })
-    .unwrap();
-
-    let version = db.migrate().unwrap();
-    assert_eq!(version, latest_version());
-    let name: String = db
-        .with_conn(|conn| {
-            Ok(conn.query_row(
-                "SELECT canonical_name FROM apps WHERE app_id = 892970",
-                [],
-                |row| row.get(0),
-            )?)
-        })
-        .unwrap();
-    assert_eq!(name, "Valheim");
-
-    // data_quality_findings must exist after v2
+    let db = Database::open_in_memory_with_clock(clock.clone()).unwrap();
+    db.migrate().unwrap();
     db.with_conn(|conn| {
-        conn.query_row("SELECT COUNT(*) FROM data_quality_findings", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        Ok(())
+        crate::catalog::upsert_app(
+            conn, 892970, "game", "Valheim", "released", None, None, None, 1_000,
+        )
     })
     .unwrap();
+    let reconnected = db.reconnect().unwrap();
+    // An independent handle keeps its isolated schema alive after the first is dropped.
+    drop(db);
+    reconnected.assert_ready().unwrap();
+    assert_eq!(reconnected.schema_version().unwrap(), latest_version());
+    assert_eq!(reconnected.migrate().unwrap(), latest_version());
+    clock.advance_ms(1_000);
+    assert_eq!(reconnected.now_ms(), 2_000);
+    let repo = Repository::new(reconnected);
+    assert_eq!(
+        repo.get_app(892970).unwrap().unwrap().canonical_name,
+        "Valheim"
+    );
 }
 
 #[test]
-fn per_app_ingestion_waits_for_writer_and_preserves_existing_identity() {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("ingestion-contention.db");
-    let db = Database::open(&path).unwrap();
-    db.migrate().unwrap();
-    db.with_conn_mut(|conn| {
-        conn.execute(
-            "INSERT INTO apps (
-                 app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
-             ) VALUES (892970, 'game', 'Valheim', 'released', 1, 1)",
-            [],
-        )?;
-        Ok(())
-    })
-    .unwrap();
-    let repo = Repository::new(db);
+fn ingestion_from_an_independent_handle_preserves_existing_identity() {
+    let (repo, _) = repo_with_clock(1_000);
+    repo.database()
+        .with_conn(|conn| {
+            crate::catalog::upsert_app(
+                conn, 892970, "game", "Valheim", "released", None, None, None, 1,
+            )
+        })
+        .unwrap();
+    let worker = Repository::new(repo.database().reconnect().unwrap());
     let raw = RawResponse::validate(
         200,
         include_bytes!("../../steam-source/fixtures/reviews_summary.json").to_vec(),
@@ -329,22 +299,11 @@ fn per_app_ingestion_waits_for_writer_and_preserves_existing_identity() {
     )
     .unwrap();
     let review = parse_review_summary(&ReviewSummaryRequest::summary_only(892970), &raw).unwrap();
-
-    let blocker = rusqlite::Connection::open(&path).unwrap();
-    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let (started_tx, started_rx) = mpsc::channel();
-    let waiting_repo = repo.clone();
-    let waiting_writer = std::thread::spawn(move || {
-        started_tx.send(()).unwrap();
-        waiting_repo.ingest_review(&review)
-    });
-    started_rx.recv().unwrap();
-    std::thread::sleep(Duration::from_millis(250));
-    blocker.execute_batch("COMMIT").unwrap();
-
-    waiting_writer.join().unwrap().unwrap();
-    let app = repo.get_app(892970).unwrap().unwrap();
-    assert_eq!(app.canonical_name, "Valheim");
+    worker.ingest_review(&review).unwrap();
+    assert_eq!(
+        repo.get_app(892970).unwrap().unwrap().canonical_name,
+        "Valheim"
+    );
     let review_count: i64 = repo
         .database()
         .with_conn(|conn| {
@@ -359,94 +318,68 @@ fn per_app_ingestion_waits_for_writer_and_preserves_existing_identity() {
 }
 
 #[test]
-fn file_backed_reads_do_not_wait_for_writer_handle_lock() {
-    use std::sync::{Arc, Barrier};
-    use std::time::{Duration, Instant};
-
-    let dir = tempfile::tempdir().unwrap();
-    let db = Database::open(dir.path().join("concurrent.db")).unwrap();
-    db.migrate().unwrap();
-    db.with_conn_mut(|conn| {
-        conn.execute(
-            "INSERT INTO apps (
-                 app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
-             ) VALUES (42, 'game', 'Concurrent Read', 'released', 1, 1)",
-            [],
-        )?;
-        Ok(())
-    })
-    .unwrap();
-
-    let barrier = Arc::new(Barrier::new(2));
-    let worker_barrier = barrier.clone();
-    let locked_db = db.clone();
-    let holder = std::thread::spawn(move || {
-        locked_db
-            .with_conn_mut(|_| {
-                worker_barrier.wait();
-                std::thread::sleep(Duration::from_millis(500));
-                Ok(())
-            })
-            .unwrap();
-    });
-    barrier.wait();
-
-    let started = Instant::now();
-    let count: i64 = db
-        .with_conn(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM apps", [], |row| row.get(0))?))
+fn independent_connections_only_observe_committed_writes() {
+    let (repo, _) = repo_with_clock(1_000);
+    repo.database()
+        .with_conn(|conn| {
+            crate::catalog::upsert_app(
+                conn,
+                42,
+                "game",
+                "Committed Name",
+                "released",
+                None,
+                None,
+                None,
+                1,
+            )
+        })
         .unwrap();
-    assert_eq!(count, 1);
-    assert!(
-        started.elapsed() < Duration::from_millis(250),
-        "read waited for the writer handle lock: {:?}",
-        started.elapsed()
+    let reader = Repository::new(repo.database().reconnect().unwrap());
+    repo.database()
+        .with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE apps SET canonical_name = 'Pending Name' WHERE app_id = 42",
+                [],
+            )?;
+            assert_eq!(
+                reader.get_app(42)?.unwrap().canonical_name,
+                "Committed Name"
+            );
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        reader.get_app(42).unwrap().unwrap().canonical_name,
+        "Pending Name"
     );
-    holder.join().unwrap();
 }
 
 #[test]
-fn version_three_data_is_hardened_by_version_four_migration() {
-    let clock = Arc::new(FakeClock::new(10_000));
-    let db = Database::open_in_memory_with_clock(clock).unwrap();
-    db.with_conn_mut(|conn| {
-        migrate::migrate_to(conn, 3, 1_000)?;
-        conn.execute(
-            "INSERT INTO apps (
-                app_id, app_type, canonical_name, release_state, release_date,
-                created_at_ms, updated_at_ms
-             ) VALUES (42, 'game', 'Legacy Date', 'released', '2 Feb, 2021', 1, 1)",
-            [],
-        )?;
-        conn.execute(
-            "INSERT INTO anonymous_users (
-                user_id, created_at_ms, last_active_at_ms, access_token_hash, refresh_token_hash
-             ) VALUES ('legacy-user', 1, 1, ?1, ?2)",
-            rusqlite::params![
-                crate::users::token_hash("legacy-access"),
-                crate::users::token_hash("legacy-refresh")
-            ],
-        )?;
-        conn.execute(
-            "INSERT INTO jobs (
-                source, task_type, entity_key, due_at_ms, status, idempotency_key,
-                created_at_ms, updated_at_ms
-             ) VALUES ('steam', 'ccu', '42', 1, 'pending', 'legacy-job', 1, 1)",
-            [],
-        )?;
-        Ok(())
-    })
-    .unwrap();
-
-    assert_eq!(db.migrate().unwrap(), latest_version());
-    let repo = Repository::new(db);
-    let app = repo.get_app(42).unwrap().unwrap();
-    assert_eq!(app.release_date, None);
-    assert_eq!(app.release_date_raw.as_deref(), Some("2 Feb, 2021"));
-    assert!(repo.resolve_access_token("legacy-access").is_err());
+fn baseline_session_and_job_defaults_do_not_grant_unbounded_access() {
+    let (repo, _) = repo_with_clock(10_000);
     repo.database()
         .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO anonymous_users (
+                    user_id, created_at_ms, last_active_at_ms, access_token_hash, refresh_token_hash
+                 ) VALUES ('default-user', 1, 1, $1, $2)",
+                crate::pg::params![
+                    crate::users::token_hash("default-access"),
+                    crate::users::token_hash("default-refresh")
+                ],
+            )?;
+            conn.execute(
+                "INSERT INTO jobs (
+                    source, task_type, entity_key, due_at_ms, status, idempotency_key,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ('steam', 'ccu', '42', 1, 'pending', 'default-job', 1, 1)",
+                [],
+            )?;
             let completion_key: Option<String> = conn.query_row(
-                "SELECT completion_idempotency_key FROM jobs WHERE idempotency_key = 'legacy-job'",
+                "SELECT completion_idempotency_key FROM jobs WHERE idempotency_key = 'default-job'",
                 [],
                 |row| row.get(0),
             )?;
@@ -454,6 +387,8 @@ fn version_three_data_is_hardened_by_version_four_migration() {
             Ok(())
         })
         .unwrap();
+    assert!(repo.resolve_access_token("default-access").is_err());
+    assert!(repo.refresh_anonymous_session("default-refresh").is_err());
 }
 
 #[test]
@@ -1082,7 +1017,7 @@ fn fixture_pipeline_into_storage() {
         .with_conn(|conn| {
             conn.query_row(
                 "SELECT source, entity_key, parse_version
-                 FROM source_documents WHERE source = ?1",
+                 FROM source_documents WHERE source = $1",
                 [APP_LIST_SOURCE_NAME],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -1295,71 +1230,28 @@ fn catalog_refresh_does_not_downgrade_store_identity_or_media() {
 }
 
 #[test]
-fn backup_restore_and_integrity() {
-    let dir = tempfile::tempdir().unwrap();
-    let live = dir.path().join("live.db");
-    let backup = dir.path().join("backup.db");
-    let restored = dir.path().join("restored.db");
-
-    let clock = Arc::new(FakeClock::new(9_000));
-    let db = Database::open_with_clock(&live, clock.clone()).unwrap();
-    let repo = Repository::new(db);
-    repo.migrate().unwrap();
-    repo.upsert_catalog(&AppCatalogProposal {
-        app_id: 570,
-        name: "Dota 2".into(),
-        app_type: AppTypeProposal::Game,
-        last_modified: None,
-        price_change_number: None,
-        source: "test",
-        stability: SourceStability::OfficialStable,
-        adapter_version: "t",
-    })
-    .unwrap();
-
-    repo.backup_to(&backup).unwrap();
-    assert!(matches!(
-        repo.backup_to(&backup),
-        Err(crate::StorageError::Conflict { .. })
-    ));
-    let restored_repo = Repository::restore_backup(&backup, &restored, 9_000).unwrap();
-    assert!(matches!(
-        Repository::restore_backup(&backup, &restored, 9_000),
-        Err(crate::StorageError::Conflict { .. })
-    ));
-    restored_repo.assert_ready().unwrap();
-    let app = restored_repo.get_app(570).unwrap().unwrap();
-    assert_eq!(app.canonical_name, "Dota 2");
-    // Restored DBs remain upgradeable: migrate is idempotent at latest.
-    assert_eq!(restored_repo.migrate().unwrap(), latest_version());
+fn isolated_database_schemas_do_not_share_data() {
+    let (first, _) = repo_with_clock(9_000);
+    first
+        .upsert_catalog(&AppCatalogProposal {
+            app_id: 570,
+            name: "Dota 2".into(),
+            app_type: AppTypeProposal::Game,
+            last_modified: None,
+            price_change_number: None,
+            source: "test",
+            stability: SourceStability::OfficialStable,
+            adapter_version: "t",
+        })
+        .unwrap();
+    let (second, _) = repo_with_clock(9_000);
+    assert!(second.get_app(570).unwrap().is_none());
     assert_eq!(
-        restored_repo.database().schema_version().unwrap(),
-        latest_version()
+        first.get_app(570).unwrap().unwrap().canonical_name,
+        "Dota 2"
     );
-}
-
-/// M6: empty DB upgrades through every shipped migration in order.
-#[test]
-fn m6_upgrade_path_from_each_intermediate_version() {
-    for from in 0..latest_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(format!("from_{from}.db"));
-        {
-            let db = Database::open(&path).unwrap();
-            if from > 0 {
-                db.with_conn_mut(|conn| {
-                    migrate::migrate_to(conn, from, 1_000)?;
-                    Ok(())
-                })
-                .unwrap();
-                assert_eq!(db.schema_version().unwrap(), from);
-            }
-        }
-        let db = Database::open(&path).unwrap();
-        let version = db.migrate().unwrap();
-        assert_eq!(version, latest_version(), "upgrade from {from}");
-        db.assert_ready().unwrap();
-    }
+    first.assert_ready().unwrap();
+    second.assert_ready().unwrap();
 }
 
 #[test]
@@ -1662,14 +1554,14 @@ fn basic_ingestion_profiles_stop_after_store_details_and_promote_released_games(
 }
 
 #[test]
-fn pipeline_reliability_migration_preserves_queue_and_rechecks_ambiguous_empty_state() {
+fn pipeline_baseline_defaults_reliability_fields_and_preserves_queue() {
     let db = Database::open_in_memory().unwrap();
+    db.migrate().unwrap();
     db.with_conn_mut(|conn| {
-        migrate::migrate_to(conn, 25, 1_000)?;
         conn.execute(
             "INSERT INTO apps(
                  app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
-             ) VALUES (42, 'game', 'Migration Fixture', 'released', 1, 1)",
+             ) VALUES (42, 'game', 'Baseline Fixture', 'released', 1, 1)",
             [],
         )?;
         conn.execute(
@@ -1680,15 +1572,15 @@ fn pipeline_reliability_migration_preserves_queue_and_rechecks_ambiguous_empty_s
         )?;
         conn.execute(
             "INSERT INTO game_ingestion_queue(
-                 app_id, source, priority, stage, status, stage_attempts, total_attempts,
+                 app_id, source, priority, stage, status, lease_count,
                  next_attempt_at_ms, discovered_at_ms, updated_at_ms
-             ) VALUES (42, 'fixture', 7, 'review_summary', 'retry', 2, 5, 2_000, 1, 1)",
+             ) VALUES (42, 'fixture', 7, 'review_summary', 'retry', 5, 2_000, 1, 1)",
             [],
         )?;
-        migrate::migrate_to(conn, latest_version(), 2_000)?;
         Ok(())
     })
     .unwrap();
+    assert_eq!(db.migrate().unwrap(), latest_version());
 
     db.with_conn(|conn| {
         let refresh: (i64, i64, i64, i64) = conn.query_row(
@@ -1859,9 +1751,9 @@ fn global_ingestion_failure_blocks_all_claims_until_lane_pause_expires() {
     repo.database()
         .with_conn(|conn| {
             let state: (i64, i64, i64, i64, i64) = conn.query_row(
-                "SELECT SUM(status = 'retry'), SUM(status = 'pending'),
+                "SELECT COUNT(*) FILTER (WHERE status = 'retry'), COUNT(*) FILTER (WHERE status = 'pending'),
                         SUM(stage_failure_attempts), SUM(total_failure_attempts),
-                        SUM(lease_owner IS NOT NULL)
+                        COUNT(*) FILTER (WHERE lease_owner IS NOT NULL)
                  FROM game_ingestion_queue",
                 [],
                 |row| {
@@ -2020,7 +1912,7 @@ fn store_search_profile_materialization_is_scoped_to_the_ingested_page() {
             .with_conn(|conn| {
                 conn.query_row(
                     "SELECT COUNT(*) FROM feature_evidence
-                     WHERE app_id = ?1 AND source_type = 'steam_store_profile_derived'",
+                     WHERE app_id = $1 AND source_type = 'steam_store_profile_derived'",
                     [app_id],
                     |row| row.get::<_, i64>(0),
                 )
@@ -2186,9 +2078,9 @@ fn m7_coverage_requires_consecutive_focus_snapshot_days() {
                         total_positive, total_negative, total_reviews, review_score,
                         review_score_desc, wilson_lower, filter_offtopic_activity,
                         parameter_hash, content_hash, source
-                     ) VALUES (42, 'all', 'english', ?1, 100, 10, 110, NULL, NULL,
-                               0.80, 1, ?2, ?3, 'fixture')",
-                    rusqlite::params![
+                     ) VALUES (42, 'all', 'english', $1, 100, 10, 110, NULL, NULL,
+                               0.80, 1, $2, $3, 'fixture')",
+                    crate::pg::params![
                         captured_at_ms,
                         format!("review-params-{day}"),
                         format!("review-content-{day}")
@@ -2198,8 +2090,8 @@ fn m7_coverage_requires_consecutive_focus_snapshot_days() {
                     "INSERT INTO player_daily (
                         app_id, day_utc, min_ccu, max_ccu, mean_ccu, median_approx_ccu,
                         sample_count, missing_rate, updated_at_ms
-                     ) VALUES (42, ?1, 10, 20, 15.0, 15.0, 48, 0.0, ?2)",
-                    rusqlite::params![format!("1970-01-{:02}", day + 1), captured_at_ms],
+                     ) VALUES (42, $1, 10, 20, 15.0, 15.0, 48, 0.0, $2)",
+                    crate::pg::params![format!("1970-01-{:02}", day + 1), captured_at_ms],
                 )?;
             }
             Ok(())
@@ -2693,7 +2585,7 @@ fn source_cursor_and_run_state_support_resume() {
         .database()
         .with_conn(|conn| {
             conn.query_row(
-                "SELECT status FROM source_runs WHERE run_id = ?1",
+                "SELECT status FROM source_runs WHERE run_id = $1",
                 [run],
                 |row| row.get::<_, String>(0),
             )
@@ -2717,7 +2609,7 @@ fn starting_a_new_source_run_finalizes_an_interrupted_predecessor() {
     repo.database()
         .with_conn(|conn| {
             let predecessor: (String, Option<String>, Option<i64>) = conn.query_row(
-                "SELECT status, error_category, finished_at_ms FROM source_runs WHERE run_id = ?1",
+                "SELECT status, error_category, finished_at_ms FROM source_runs WHERE run_id = $1",
                 [old],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
@@ -2841,16 +2733,16 @@ fn pipeline_dynamic_coverage_uses_only_released_candidates() {
                          total_positive, total_negative, total_reviews, review_score,
                          review_score_desc, wilson_lower, filter_offtopic_activity,
                          parameter_hash, content_hash, source
-                     ) VALUES (?1, 'all', 'all', ?2, 90, 10, 100, 9,
-                               'Very Positive', 0.8, 1, 'fixture', ?3, 'fixture')",
-                    rusqlite::params![app_id, now_ms, format!("review-{app_id}")],
+                     ) VALUES ($1, 'all', 'all', $2, 90, 10, 100, 9,
+                               'Very Positive', 0.8, 1, 'fixture', $3, 'fixture')",
+                    crate::pg::params![app_id, now_ms, format!("review-{app_id}")],
                 )?;
                 conn.execute(
                     "INSERT INTO player_snapshots (
                          app_id, captured_at_ms, player_count, result_code,
                          content_hash, source, offline_players_excluded
-                     ) VALUES (?1, ?2, 1000, 1, ?3, 'fixture', 1)",
-                    rusqlite::params![app_id, now_ms, format!("ccu-{app_id}")],
+                     ) VALUES ($1, $2, 1000, 1, $3, 'fixture', 1)",
+                    crate::pg::params![app_id, now_ms, format!("ccu-{app_id}")],
                 )?;
             }
             conn.execute(
@@ -2893,13 +2785,13 @@ fn feed_sections_use_current_store_release_date() {
                      release_date_raw, release_date_precision, created_at_ms, updated_at_ms
                  ) VALUES (
                      4945580, 'game', 'Unemployed Nightmare Together', 'released', '2026-08-03',
-                     '2026 年 8 月 3 日', 'day', ?1, ?1
+                     '2026 年 8 月 3 日', 'day', $1, $1
                  )",
                 [now_ms],
             )?;
             conn.execute(
                 "INSERT INTO multiplayer_profiles (app_id, computed_at_ms, online_coop, recommended_min_players)
-                 VALUES (4945580, ?1, 1, 2)",
+                 VALUES (4945580, $1, 1, 2)",
                 [now_ms],
             )?;
             conn.execute(
@@ -2908,7 +2800,7 @@ fn feed_sections_use_current_store_release_date() {
                      old_release_state, new_release_state, source, observed_at_ms
                  ) VALUES (
                      4945580, '2026-07-27', '2026-08-03', 'day', 'day',
-                     'coming_soon', 'released', 'steam_store_appdetails', ?1
+                     'coming_soon', 'released', 'steam_store_appdetails', $1
                  )",
                 [now_ms],
             )?;
@@ -2918,7 +2810,7 @@ fn feed_sections_use_current_store_release_date() {
                 "UPDATE apps
                  SET release_date = '2026-07-09',
                      release_date_raw = 'Jul 9, 2026',
-                     updated_at_ms = ?1
+                     updated_at_ms = $1
                  WHERE app_id = 1623730",
                 [now_ms],
             )?;
@@ -2928,7 +2820,7 @@ fn feed_sections_use_current_store_release_date() {
                      old_release_state, new_release_state, source, observed_at_ms
                  ) VALUES (
                      1623730, '2024-01-19', '2026-07-09', 'day', 'day',
-                     'released', 'released', 'steam_store_appdetails', ?1
+                     'released', 'released', 'steam_store_appdetails', $1
                  )",
                 [now_ms],
             )?;
@@ -3115,7 +3007,7 @@ fn retrieval_sync_indexes_only_multiplayer_scope_without_hiding_name_search() {
         repo.database()
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT COUNT(*) FROM game_documents WHERE app_id = ?1",
+                    "SELECT COUNT(*) FROM game_documents WHERE app_id = $1",
                     [app_id],
                     |row| row.get::<_, i64>(0),
                 )
@@ -3143,10 +3035,10 @@ fn retrieval_sync_indexes_only_multiplayer_scope_without_hiding_name_search() {
 }
 
 #[test]
-fn search_name_trigram_migration_backfills_and_tracks_name_changes() {
+fn trigram_name_search_tracks_inserted_and_updated_names() {
     let db = Database::open_in_memory().unwrap();
+    db.migrate().unwrap();
     db.with_conn_mut(|conn| {
-        migrate::migrate_to(conn, 22, 1_000)?;
         conn.execute(
             "INSERT INTO apps (
                  app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
@@ -3189,21 +3081,39 @@ fn search_name_trigram_migration_backfills_and_tracks_name_changes() {
     )
     .unwrap();
 
-    let stale_index_rows: i64 = repo
-        .database()
+    assert!(repo.search_games("际深岩", 10).unwrap().is_empty());
+    assert!(repo.search_games("Rock Galactic", 10).unwrap().is_empty());
+    assert_eq!(repo.search_games("银河重", 10).unwrap()[0].app_id, 548430);
+    assert_eq!(repo.search_games("crew rem", 10).unwrap()[0].app_id, 548430);
+    assert_eq!(repo.search_games("深岩", 10).unwrap()[0].app_id, 548430);
+    repo.database()
         .with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM app_name_fts
-                 WHERE app_name_fts MATCH '\"际深岩\" OR \"Rock Galactic\"'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+            conn.execute("DELETE FROM app_localizations WHERE app_id = 548430", [])?;
+            Ok(())
         })
         .unwrap();
-    assert_eq!(stale_index_rows, 0);
+    assert!(repo.search_games("Crew Rem", 10).unwrap().is_empty());
     assert_eq!(repo.search_games("银河重", 10).unwrap()[0].app_id, 548430);
-    assert_eq!(repo.search_games("Crew Rem", 10).unwrap()[0].app_id, 548430);
+    repo.database()
+        .with_conn(|conn| {
+            crate::catalog::upsert_app(
+                conn,
+                999999,
+                "game",
+                r"100%_Fun\Party",
+                "released",
+                None,
+                None,
+                None,
+                1,
+            )
+        })
+        .unwrap();
+    for literal in ["%_", r"\Party"] {
+        let matches = repo.search_games(literal, 10).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].app_id, 999999);
+    }
 }
 
 #[test]
@@ -3513,32 +3423,33 @@ fn store_media_gallery_ingest_replace_preserve_and_clear() {
 }
 
 #[test]
-fn upgrade_from_v15_keeps_cover_and_empty_gallery() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("from_v15.db");
-    {
-        let db = Database::open(&path).unwrap();
-        db.with_conn_mut(|conn| {
-            migrate::migrate_to(conn, 15, 1_000)?;
-            conn.execute(
-                "INSERT INTO apps (
-                     app_id, app_type, canonical_name, release_state, created_at_ms, updated_at_ms
-                 ) VALUES (42, 'game', 'Legacy Cover', 'released', 1, 1)",
-                [],
+fn baseline_reconnect_keeps_cover_without_fabricating_gallery_assets() {
+    let (repo, _) = repo_with_clock(1_000);
+    repo.database()
+        .with_conn(|conn| {
+            crate::catalog::upsert_app(
+                conn,
+                42,
+                "game",
+                "Cover Only",
+                "released",
+                None,
+                None,
+                None,
+                1,
             )?;
             conn.execute(
                 "INSERT INTO app_media (app_id, capsule_url, source, updated_at_ms)
-                 VALUES (42, 'https://shared.akamai.steamstatic.com/legacy.jpg', 'seed', 1)",
+                 VALUES (42, 'https://shared.akamai.steamstatic.com/cover.jpg', 'seed', 1)",
                 [],
             )?;
             Ok(())
         })
         .unwrap();
-        assert_eq!(db.schema_version().unwrap(), 15);
-    }
-    let db = Database::open(&path).unwrap();
-    assert_eq!(db.migrate().unwrap(), latest_version());
-    let cover: String = db
+    let reconnected = Repository::new(repo.database().reconnect().unwrap());
+    reconnected.assert_ready().unwrap();
+    let cover: String = reconnected
+        .database()
         .with_conn(|conn| {
             conn.query_row(
                 "SELECT capsule_url FROM app_media WHERE app_id = 42",
@@ -3548,18 +3459,8 @@ fn upgrade_from_v15_keeps_cover_and_empty_gallery() {
             .map_err(Into::into)
         })
         .unwrap();
-    assert_eq!(cover, "https://shared.akamai.steamstatic.com/legacy.jpg");
-    let assets: i64 = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM app_media_assets WHERE app_id = 42",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-        })
-        .unwrap();
-    assert_eq!(assets, 0);
+    assert_eq!(cover, "https://shared.akamai.steamstatic.com/cover.jpg");
+    assert!(reconnected.game_media_assets(42).unwrap().is_empty());
 }
 
 // silence unused import warnings for types used only in docs-like examples
