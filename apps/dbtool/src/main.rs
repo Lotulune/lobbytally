@@ -14,11 +14,12 @@ use mpgs_ai::{EmbeddingInput, embedding_provider_from_env, encode_f32_le};
 use mpgs_steam_source::{
     APP_LIST_ADAPTER_VERSION, APP_LIST_MAX_RESULTS, APP_LIST_SOURCE_NAME, AppListCursor,
     AppListRequest, CcuRequest, DEFAULT_STORE_COUNTRY, DEFAULT_STORE_LANGUAGE, DEFAULT_USER_AGENT,
-    GoldenSet, RawResponse, ReviewSummaryRequest, STEAM_STORE_HOST, STEAM_WEB_API_HOST,
-    STORE_ADAPTER_VERSION, STORE_SEARCH_ADAPTER_VERSION, STORE_SEARCH_SOURCE_NAME,
-    STORE_SOURCE_NAME, SourceError, StoreDetailsRequest, StoreSearchPage, StoreSearchRequest,
-    StoreSearchSort, apply_page_to_cursor, http_not_found_proposal, parse_app_list_page, parse_ccu,
-    parse_popular_reviews, parse_review_summary, parse_store_details, parse_store_search_page,
+    GoldenSet, RawResponse, ReleaseStateProposal, ReviewSummaryRequest, STEAM_STORE_HOST,
+    STEAM_WEB_API_HOST, STORE_ADAPTER_VERSION, STORE_SEARCH_ADAPTER_VERSION,
+    STORE_SEARCH_SOURCE_NAME, STORE_SOURCE_NAME, SourceError, StoreDetailsRequest, StoreSearchPage,
+    StoreSearchRequest, StoreSearchSort, apply_page_to_cursor, http_not_found_proposal,
+    parse_app_list_page, parse_ccu, parse_popular_reviews, parse_review_summary,
+    parse_store_details, parse_store_search_page,
 };
 use mpgs_storage::{
     Database, EnrichmentNeedFilter, HASH_EMBED_MODEL, PutEmbedding, Repository, StorageError,
@@ -124,6 +125,19 @@ fn configured_enrichment_need_filter(media_enabled: bool) -> EnrichmentNeedFilte
         price: !skip_store,
         media_backfill: !skip_store && media_enabled,
         english_name: !skip_store,
+    }
+}
+
+fn forced_app_enrichment_target(app_id: u32) -> mpgs_storage::EnrichmentTarget {
+    mpgs_storage::EnrichmentTarget {
+        app_id,
+        needs_store_details: true,
+        needs_reviews: true,
+        needs_review_excerpts: true,
+        needs_ccu: true,
+        needs_price: true,
+        needs_media_backfill: false,
+        needs_english_name: false,
     }
 }
 
@@ -613,16 +627,7 @@ fn run() -> Result<(), String> {
                     )),
                 )
                 .map_err(err)?;
-            let target = mpgs_storage::EnrichmentTarget {
-                app_id,
-                needs_store_details: true,
-                needs_reviews: false,
-                needs_review_excerpts: false,
-                needs_ccu: false,
-                needs_price: true,
-                needs_media_backfill: false,
-                needs_english_name: false,
-            };
+            let target = forced_app_enrichment_target(app_id);
             match enrich_steam_candidates(&repo, &[target], &country_code, &language, Some(run_id))
             {
                 Ok(stats) => {
@@ -1863,9 +1868,23 @@ fn enrich_steam_candidates(
     for (index, target) in targets.iter().enumerate() {
         stats.apps_attempted = stats.apps_attempted.saturating_add(1);
         let mut app_ok = 0_i64;
+        let mut effective_target = *target;
 
         // Price/media come from appdetails; re-fetch store when those dimensions are due.
         if !skip_store && target.needs_store_fetch() {
+            // A store response may itself observe launch. Fetch the first
+            // reviews and CCU in this pass instead of waiting for another crawl.
+            let was_released = match repo.get_app(target.app_id) {
+                Ok(Some(app)) => app.release_state == "released",
+                Ok(None) => false,
+                Err(error) => {
+                    eprintln!(
+                        "warn app_id={} release_state_probe: {}",
+                        target.app_id, error
+                    );
+                    false
+                }
+            };
             if target.needs_media_backfill {
                 let _ = repo.begin_media_backfill_attempt(target.app_id);
             }
@@ -1877,9 +1896,17 @@ fn enrich_steam_candidates(
                 language,
                 &mut stats,
             ) {
-                Ok(StoreDetailsOutcome::Ingested { media_unusable }) => {
+                Ok(StoreDetailsOutcome::Ingested {
+                    media_unusable,
+                    released,
+                }) => {
                     stats.store_ok = stats.store_ok.saturating_add(1);
                     app_ok = app_ok.saturating_add(1);
+                    effective_target = promote_release_transition_dynamic_needs(
+                        effective_target,
+                        was_released,
+                        released,
+                    );
                     if target.needs_media_backfill {
                         let has_media = repo.app_has_media_assets(target.app_id).unwrap_or(false);
                         let outcome = if has_media {
@@ -1949,7 +1976,7 @@ fn enrich_steam_candidates(
             }
         }
 
-        if target.needs_reviews && !skip_reviews {
+        if effective_target.needs_reviews && !skip_reviews {
             match enrich_reviews(&client, repo, target.app_id, &mut stats) {
                 Ok(()) => {
                     stats.reviews_ok = stats.reviews_ok.saturating_add(1);
@@ -1966,7 +1993,7 @@ fn enrich_steam_candidates(
             thread::sleep(Duration::from_millis(inter_request_ms));
         }
 
-        if target.needs_review_excerpts && !skip_reviews {
+        if effective_target.needs_review_excerpts && !skip_reviews {
             match enrich_popular_reviews(&client, repo, target.app_id, &mut stats) {
                 Ok(()) => {
                     stats.popular_reviews_ok = stats.popular_reviews_ok.saturating_add(1);
@@ -1983,7 +2010,7 @@ fn enrich_steam_candidates(
             thread::sleep(Duration::from_millis(inter_request_ms));
         }
 
-        if target.needs_ccu && !skip_ccu {
+        if effective_target.needs_ccu && !skip_ccu {
             match enrich_ccu(&client, repo, target.app_id, &mut stats) {
                 Ok(()) => {
                     stats.ccu_ok = stats.ccu_ok.saturating_add(1);
@@ -2000,7 +2027,9 @@ fn enrich_steam_candidates(
             // CCU uses the separate Steam Web API host. When this app also had
             // Store work, the preceding Store delay already spaces the next
             // appdetails request. Preserve pacing for CCU-only refresh passes.
-            if !(target.needs_store_fetch() || target.needs_reviews || target.needs_review_excerpts)
+            if !(target.needs_store_fetch()
+                || effective_target.needs_reviews
+                || effective_target.needs_review_excerpts)
             {
                 thread::sleep(Duration::from_millis(inter_request_ms));
             }
@@ -2055,8 +2084,24 @@ struct SoftEnrichError {
 }
 
 enum StoreDetailsOutcome {
-    Ingested { media_unusable: bool },
+    Ingested {
+        media_unusable: bool,
+        released: bool,
+    },
     NotFound,
+}
+
+fn promote_release_transition_dynamic_needs(
+    mut target: mpgs_storage::EnrichmentTarget,
+    was_released: bool,
+    store_reports_released: bool,
+) -> mpgs_storage::EnrichmentTarget {
+    if store_reports_released && !was_released {
+        target.needs_reviews = true;
+        target.needs_review_excerpts = true;
+        target.needs_ccu = true;
+    }
+    target
 }
 
 fn enrich_store_details(
@@ -2098,6 +2143,7 @@ fn enrich_store_details(
     let media_unusable = (parsed.details.screenshots.is_none()
         && media_stats.screenshots_rejected > 0)
         || (parsed.details.movies.is_none() && media_stats.movies_rejected > 0);
+    let released = parsed.details.release_state == ReleaseStateProposal::Released;
     if media_stats.screenshots_rejected > 0
         || media_stats.movies_rejected > 0
         || media_stats.urls_rejected > 0
@@ -2115,7 +2161,10 @@ fn enrich_store_details(
         );
     }
     persist_with_retry(|| repo.ingest_store_details(&parsed.details, &parsed.relations))?;
-    Ok(StoreDetailsOutcome::Ingested { media_unusable })
+    Ok(StoreDetailsOutcome::Ingested {
+        media_unusable,
+        released,
+    })
 }
 
 /// Fetch English store name into `app_localizations` for dual-name search.
@@ -2850,6 +2899,47 @@ fn run_feature_evidence_retention(args: impl Iterator<Item = String>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_app_enrichment_repairs_all_launch_dynamic_dimensions() {
+        let target = forced_app_enrichment_target(4001890);
+        assert_eq!(target.app_id, 4001890);
+        assert!(target.needs_store_details);
+        assert!(target.needs_price);
+        assert!(target.needs_reviews);
+        assert!(target.needs_review_excerpts);
+        assert!(target.needs_ccu);
+        assert!(!target.needs_media_backfill);
+        assert!(!target.needs_english_name);
+    }
+
+    #[test]
+    fn store_release_transition_promotes_dynamic_work_in_the_same_pass() {
+        let pre_release_target = mpgs_storage::EnrichmentTarget {
+            app_id: 4001890,
+            needs_store_details: true,
+            needs_reviews: false,
+            needs_review_excerpts: false,
+            needs_ccu: false,
+            needs_price: false,
+            needs_media_backfill: false,
+            needs_english_name: false,
+        };
+        let promoted = promote_release_transition_dynamic_needs(pre_release_target, false, true);
+        assert!(promoted.needs_reviews);
+        assert!(promoted.needs_review_excerpts);
+        assert!(promoted.needs_ccu);
+        for (was_released, store_reports_released) in [(true, true), (false, false)] {
+            let unchanged = promote_release_transition_dynamic_needs(
+                pre_release_target,
+                was_released,
+                store_reports_released,
+            );
+            assert!(!unchanged.needs_reviews);
+            assert!(!unchanged.needs_review_excerpts);
+            assert!(!unchanged.needs_ccu);
+        }
+    }
 
     #[test]
     fn lease_recovery_preserves_another_live_invocation() {

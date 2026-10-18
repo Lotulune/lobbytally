@@ -2420,6 +2420,588 @@ fn empty_price_backoff_does_not_freeze_upcoming_store_refresh() {
 }
 
 #[test]
+fn past_release_date_gets_urgent_store_refresh_for_pre_release_states() {
+    use crate::repo::RELEASE_TRANSITION_REFRESH_INTERVAL_MS;
+
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let (repo, clock) = repo_with_clock(10 * day_ms);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 4001890,
+                name: "How to Fish".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 4001891,
+                name: "Unknown State Fixture".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "release-transition-urgent".into(),
+        sort: StoreSearchSort::ReleasedAsc,
+    })
+    .unwrap();
+
+    for app_id in [4_001_890, 4_001_891] {
+        let raw = RawResponse::validate(
+            200,
+            format!(
+                r#"{{"{app_id}":{{"success":true,"data":{{"steam_appid":{app_id},"type":"game","name":"Launch Fixture","is_free":true,"platforms":{{"windows":true}},"supported_languages":"English","release_date":{{"coming_soon":true,"date":"1970-01-01"}}}}}}}}"#
+            )
+            .into_bytes(),
+            Some("application/json".into()),
+            4096,
+        )
+        .unwrap();
+        let parsed = parse_store_details(
+            &StoreDetailsRequest::with_locale(app_id, "CN", "schinese").unwrap(),
+            &raw,
+        )
+        .unwrap();
+        repo.ingest_store_details(&parsed.details, &parsed.relations)
+            .unwrap();
+    }
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'unknown' WHERE app_id = 4001891",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let store_only = crate::models::EnrichmentNeedFilter {
+        store: true,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: false,
+    };
+    assert!(
+        repo.list_enrichment_targets_after_filtered(10, None, "CN", "schinese", store_only,)
+            .unwrap()
+            .is_empty()
+    );
+
+    clock.advance_ms(RELEASE_TRANSITION_REFRESH_INTERVAL_MS + 1);
+    let due = repo
+        .list_enrichment_targets_after_filtered(10, None, "CN", "schinese", store_only)
+        .unwrap();
+    assert_eq!(due.len(), 2);
+    assert!(due.iter().all(|target| target.needs_store_details));
+    assert!(due.iter().any(|target| target.app_id == 4_001_890));
+    assert!(due.iter().any(|target| target.app_id == 4_001_891));
+}
+
+#[test]
+fn stale_pre_release_lifecycle_outranks_regular_store_backlog() {
+    use crate::repo::PRICE_REFRESH_INTERVAL_MS;
+
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let (repo, clock) = repo_with_clock(10 * day_ms);
+    let mut candidates = (10_u32..30)
+        .map(|app_id| StoreSearchCandidate {
+            app_id,
+            name: format!("Regular Backlog {app_id}"),
+        })
+        .collect::<Vec<_>>();
+    candidates.push(StoreSearchCandidate {
+        app_id: 4_001_890,
+        name: "How to Fish".into(),
+    });
+    repo.ingest_store_search_page(&StoreSearchPage {
+        result_count: u32::try_from(candidates.len()).unwrap(),
+        total_count: u32::try_from(candidates.len()).unwrap(),
+        candidates,
+        start: 0,
+        content_hash: "release-transition-priority".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
+    let raw = RawResponse::validate(
+        200,
+        br#"{"4001890":{"success":true,"data":{"steam_appid":4001890,"type":"game","name":"How to Fish","is_free":true,"platforms":{"windows":true},"supported_languages":"English","release_date":{"coming_soon":true,"date":"1970-01-01"}}}}"#
+            .to_vec(),
+        Some("application/json".into()),
+        4096,
+    )
+    .unwrap();
+    let parsed = parse_store_details(
+        &StoreDetailsRequest::with_locale(4_001_890, "CN", "schinese").unwrap(),
+        &raw,
+    )
+    .unwrap();
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+    clock.advance_ms(PRICE_REFRESH_INTERVAL_MS + 1);
+
+    let store_only = crate::models::EnrichmentNeedFilter {
+        store: true,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: false,
+    };
+    let due = repo
+        .list_enrichment_targets_after_filtered(1, None, "CN", "schinese", store_only)
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].app_id, 4_001_890);
+    assert!(due[0].needs_store_details);
+}
+
+#[test]
+fn released_search_rediscovery_promotes_undated_pre_release_refresh_once() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let (repo, clock) = repo_with_clock(10 * day_ms);
+    let upcoming_page = StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 4_001_890,
+            name: "How to Fish".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "undated-upcoming-search".into(),
+        sort: StoreSearchSort::ReleasedAsc,
+    };
+    repo.ingest_store_search_page(&upcoming_page).unwrap();
+
+    let coming_soon = RawResponse::validate(
+        200,
+        br#"{"4001890":{"success":true,"data":{"steam_appid":4001890,"type":"game","name":"How to Fish","is_free":true,"platforms":{"windows":true},"supported_languages":"English","release_date":{"coming_soon":true,"date":"Coming soon"}}}}"#
+            .to_vec(),
+        Some("application/json".into()),
+        4096,
+    )
+    .unwrap();
+    let parsed = parse_store_details(
+        &StoreDetailsRequest::with_locale(4_001_890, "CN", "schinese").unwrap(),
+        &coming_soon,
+    )
+    .unwrap();
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+
+    let store_only = crate::models::EnrichmentNeedFilter {
+        store: true,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: false,
+    };
+    assert!(
+        repo.list_enrichment_targets_after_filtered(10, None, "CN", "schinese", store_only)
+            .unwrap()
+            .is_empty()
+    );
+
+    clock.advance_ms(60 * 60 * 1_000);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: upcoming_page.candidates.clone(),
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "rediscovered-in-released-search".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
+    let due = repo
+        .list_enrichment_targets_after_filtered(10, None, "CN", "schinese", store_only)
+        .unwrap();
+    let target = due
+        .iter()
+        .find(|target| target.app_id == 4_001_890)
+        .expect("Released_DESC rediscovery must force an authoritative store refresh");
+    assert!(target.needs_store_details);
+
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+    assert!(
+        repo.list_enrichment_targets_after_filtered(10, None, "CN", "schinese", store_only)
+            .unwrap()
+            .is_empty(),
+        "the same Released_DESC signal must not cause repeated 6-hour polling after it was checked"
+    );
+}
+
+#[test]
+fn future_pre_release_refresh_does_not_get_p0_lifecycle_priority() {
+    use crate::repo::PRICE_REFRESH_INTERVAL_MS;
+
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let (repo, clock) = repo_with_clock(10 * day_ms);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 10,
+                name: "Regular Store Backlog".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 4_001_890,
+                name: "Future Launch Fixture".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "future-release-no-p0-priority".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
+    let raw = RawResponse::validate(
+        200,
+        br#"{"4001890":{"success":true,"data":{"steam_appid":4001890,"type":"game","name":"Future Launch Fixture","is_free":true,"platforms":{"windows":true},"supported_languages":"English","release_date":{"coming_soon":true,"date":"2099-01-01"}}}}"#
+            .to_vec(),
+        Some("application/json".into()),
+        4096,
+    )
+    .unwrap();
+    let parsed = parse_store_details(
+        &StoreDetailsRequest::with_locale(4_001_890, "CN", "schinese").unwrap(),
+        &raw,
+    )
+    .unwrap();
+    repo.ingest_store_details(&parsed.details, &parsed.relations)
+        .unwrap();
+    clock.advance_ms(PRICE_REFRESH_INTERVAL_MS + 1);
+
+    let store_only = crate::models::EnrichmentNeedFilter {
+        store: true,
+        reviews: false,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: false,
+    };
+    let due = repo
+        .list_enrichment_targets_after_filtered(1, None, "CN", "schinese", store_only)
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].app_id, 10);
+}
+
+#[test]
+fn release_transition_invalidates_prelaunch_review_and_ccu_snapshots() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let (repo, clock) = repo_with_clock(10 * day_ms);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![StoreSearchCandidate {
+            app_id: 892970,
+            name: "Launch Barrier Fixture".into(),
+        }],
+        start: 0,
+        result_count: 1,
+        total_count: 1,
+        content_hash: "release-transition-barrier".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+
+    let upcoming = RawResponse::validate(
+        200,
+        br#"{"892970":{"success":true,"data":{"steam_appid":892970,"type":"game","name":"Launch Barrier Fixture","is_free":true,"platforms":{"windows":true},"supported_languages":"English, Simplified Chinese","release_date":{"coming_soon":true,"date":"1970-01-01"}}}}"#.to_vec(),
+        Some("application/json".into()),
+        4096,
+    )
+    .unwrap();
+    let upcoming = parse_store_details(
+        &StoreDetailsRequest::with_locale(892970, "CN", "schinese").unwrap(),
+        &upcoming,
+    )
+    .unwrap();
+    repo.ingest_store_details(&upcoming.details, &upcoming.relations)
+        .unwrap();
+
+    let reviews = RawResponse::validate(
+        200,
+        include_bytes!("../../steam-source/fixtures/reviews_summary.json").to_vec(),
+        None,
+        1024 * 1024,
+    )
+    .unwrap();
+    repo.ingest_review(
+        &parse_review_summary(&ReviewSummaryRequest::summary_only(892970), &reviews).unwrap(),
+    )
+    .unwrap();
+    let popular = RawResponse::validate(
+        200,
+        include_bytes!("../../steam-source/fixtures/reviews_popular.json").to_vec(),
+        None,
+        1024 * 1024,
+    )
+    .unwrap();
+    repo.ingest_popular_reviews(
+        &parse_popular_reviews(&ReviewSummaryRequest::popular_schinese(892970), &popular).unwrap(),
+    )
+    .unwrap();
+    let ccu = RawResponse::validate(
+        200,
+        include_bytes!("../../steam-source/fixtures/ccu_ok.json").to_vec(),
+        None,
+        1024 * 1024,
+    )
+    .unwrap();
+    repo.ingest_ccu(&parse_ccu(&CcuRequest::new(892970), &ccu).unwrap())
+        .unwrap();
+
+    clock.advance_ms(60 * 60 * 1_000);
+    let released = RawResponse::validate(
+        200,
+        br#"{"892970":{"success":true,"data":{"steam_appid":892970,"type":"game","name":"Launch Barrier Fixture","is_free":true,"platforms":{"windows":true},"supported_languages":"English, Simplified Chinese","release_date":{"coming_soon":false,"date":"1970-01-01"}}}}"#.to_vec(),
+        Some("application/json".into()),
+        4096,
+    )
+    .unwrap();
+    let released = parse_store_details(
+        &StoreDetailsRequest::with_locale(892970, "CN", "schinese").unwrap(),
+        &released,
+    )
+    .unwrap();
+    repo.ingest_store_details(&released.details, &released.relations)
+        .unwrap();
+
+    let due = repo.list_enrichment_targets(10).unwrap();
+    let due = due.iter().find(|target| target.app_id == 892970).unwrap();
+    assert!(due.needs_reviews);
+    assert!(due.needs_review_excerpts);
+    assert!(due.needs_ccu);
+}
+
+#[test]
+fn fresh_release_transition_outranks_popular_backlog_until_dynamic_data_arrives() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let now_ms = 10 * day_ms;
+    let released_at_ms = now_ms - 1_000;
+    let (repo, _) = repo_with_clock(now_ms);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 10,
+                name: "Fresh Launch".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 20,
+                name: "Popular Backlog".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "post-release-priority".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'released' WHERE app_id IN (10, 20)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO release_events (
+                     app_id, old_release_state, new_release_state, source, observed_at_ms
+                 ) VALUES (10, 'coming_soon', 'released', 'test', $1)",
+                [released_at_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO review_snapshots (
+                     app_id, region_scope, language_scope, captured_at_ms,
+                     total_positive, total_negative, total_reviews, review_score,
+                     review_score_desc, wilson_lower, filter_offtopic_activity,
+                     parameter_hash, content_hash, source
+                 ) VALUES (20, 'all', 'all', 1, 9000, 1000, 10000, 8,
+                     'Very Positive', 0.9, 1, 'params', 'reviews', 'test')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO player_snapshots (
+                     app_id, captured_at_ms, player_count, result_code,
+                     missing_reason, content_hash, source
+                 ) VALUES (20, 1, 50000, 1, NULL, 'ccu', 'test')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO popular_review_refresh_state (
+                     app_id, captured_at_ms, result_count, source
+                 ) VALUES (20, 1, 10, 'test')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    for filter in [
+        crate::models::EnrichmentNeedFilter {
+            store: false,
+            reviews: true,
+            review_excerpts: false,
+            ccu: false,
+            price: false,
+            media_backfill: false,
+            english_name: false,
+        },
+        crate::models::EnrichmentNeedFilter {
+            store: false,
+            reviews: false,
+            review_excerpts: true,
+            ccu: false,
+            price: false,
+            media_backfill: false,
+            english_name: false,
+        },
+        crate::models::EnrichmentNeedFilter {
+            store: false,
+            reviews: false,
+            review_excerpts: false,
+            ccu: true,
+            price: false,
+            media_backfill: false,
+            english_name: false,
+        },
+    ] {
+        let targets = repo
+            .list_enrichment_targets_after_filtered(1, Some(0), "CN", "schinese", filter)
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].app_id, 10);
+    }
+
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "INSERT INTO review_snapshots (
+                     app_id, region_scope, language_scope, captured_at_ms,
+                     total_positive, total_negative, total_reviews, review_score,
+                     review_score_desc, wilson_lower, filter_offtopic_activity,
+                     parameter_hash, content_hash, source
+                 ) VALUES (10, 'all', 'all', $1, 1, 0, 1, 9,
+                     'Positive', 1.0, 1, 'params', 'fresh-reviews', 'test')",
+                [now_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO player_snapshots (
+                     app_id, captured_at_ms, player_count, result_code,
+                     missing_reason, content_hash, source
+                 ) VALUES (10, $1, 1, 1, NULL, 'fresh-ccu', 'test')",
+                [now_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO popular_review_refresh_state (
+                     app_id, captured_at_ms, result_count, source
+                 ) VALUES (10, $1, 0, 'test')",
+                [now_ms],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let targets = repo
+        .list_enrichment_targets_after_filtered(
+            1,
+            Some(0),
+            "CN",
+            "schinese",
+            crate::models::EnrichmentNeedFilter {
+                store: false,
+                reviews: true,
+                review_excerpts: false,
+                ccu: false,
+                price: false,
+                media_backfill: false,
+                english_name: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].app_id, 20);
+}
+
+#[test]
+fn post_release_dynamic_backlog_uses_cursor_fairness_before_popularity() {
+    let day_ms = 24 * 60 * 60 * 1_000;
+    let now_ms = 10 * day_ms;
+    let released_at_ms = now_ms - 1_000;
+    let (repo, _) = repo_with_clock(now_ms);
+    repo.ingest_store_search_page(&StoreSearchPage {
+        candidates: vec![
+            StoreSearchCandidate {
+                app_id: 10,
+                name: "Popular Fresh Launch".into(),
+            },
+            StoreSearchCandidate {
+                app_id: 20,
+                name: "Zero Signal Fresh Launch".into(),
+            },
+        ],
+        start: 0,
+        result_count: 2,
+        total_count: 2,
+        content_hash: "post-release-cursor-fairness".into(),
+        sort: StoreSearchSort::ReleasedDesc,
+    })
+    .unwrap();
+    repo.database()
+        .with_conn_mut(|conn| {
+            conn.execute(
+                "UPDATE apps SET release_state = 'released' WHERE app_id IN (10, 20)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO release_events (
+                     app_id, old_release_state, new_release_state, source, observed_at_ms
+                 ) VALUES
+                     (10, 'coming_soon', 'released', 'test', $1),
+                     (20, 'coming_soon', 'released', 'test', $1)",
+                [released_at_ms],
+            )?;
+            conn.execute(
+                "INSERT INTO player_snapshots (
+                     app_id, captured_at_ms, player_count, result_code,
+                     missing_reason, content_hash, source
+                 ) VALUES (10, 1, 50000, 1, NULL, 'old-popular-ccu', 'test')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let review_only = crate::models::EnrichmentNeedFilter {
+        store: false,
+        reviews: true,
+        review_excerpts: false,
+        ccu: false,
+        price: false,
+        media_backfill: false,
+        english_name: false,
+    };
+    let targets = repo
+        .list_enrichment_targets_after_filtered(1, Some(10), "CN", "schinese", review_only)
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].app_id, 20);
+
+    let wrapped = repo
+        .list_enrichment_targets_after_filtered(1, Some(20), "CN", "schinese", review_only)
+        .unwrap();
+    assert_eq!(wrapped.len(), 1);
+    assert_eq!(wrapped[0].app_id, 10);
+}
+
+#[test]
 fn enrichment_targets_prioritize_apps_missing_the_most_dynamic_dimensions() {
     let (repo, _) = repo_with_clock(10 * 24 * 60 * 60 * 1_000);
     repo.ingest_store_search_page(&StoreSearchPage {

@@ -23,19 +23,22 @@ npx --yes supabase@2.121.0 db push --linked --skip-vault
 
 已有登录、关联或 `supabase/config.toml` 时先核对目标，跳过相应初始化步骤。`--skip-vault` 跳过 CLI 从 `config.toml` 同步 Vault 配置；迁移 SQL 中创建 Vault secret 的语句仍会执行。
 
-CLI 按文件名顺序应用缺少的迁移。当前基线包含：
+CLI 按文件名顺序应用缺少的迁移。当前初始化及后续迁移包含：
 
 1. `supabase/migrations/20261018174837_lobbytally_initial.sql`
 2. `supabase/migrations/20261018174851_lobbytally_platform.sql`
 3. `supabase/migrations/20261018175423_lobbytally_postgres_hardening.sql`
 4. `supabase/migrations/20261018182444_lobbytally_runtime_access.sql`
+5. `supabase/migrations/20261018203956_lobbytally_release_transition_index.sql`
 
 第一份文件创建私有 `mpgs` schema、表、索引、触发器和运行默认值。第二份文件创建私有 `avatars` bucket 和定时请求函数；第三份调整扩展位置并补齐外键索引；第四份创建仅供后台使用的 `lobbytally_runtime` 登录角色和 RLS 策略，并将随机密码加密保存在 Vault 的 `lobbytally_database_password` 中。文件适用于新项目；不要反复执行第一份基线。
 
-也可以在 SQL Editor 依次执行上述文件，但它不会写入 CLI 迁移记录。仅在确认四份 SQL 都已成功执行后，才可登记已有基线，避免 `db push` 重跑初始化：
+第五份迁移为发售状态变化查询添加性能索引，兼容已有数据和运行中的旧版本。它不修改应用 schema 契约，因此 `mpgs.schema_migrations` 仍为版本 `1`；Supabase CLI 单独记录这份迁移。已有四份迁移的项目只需应用新增文件。
+
+也可以在 SQL Editor 依次执行上述文件，但它不会写入 CLI 迁移记录。仅在确认五份 SQL 都已成功执行后，才可登记这些已执行版本，避免 `db push` 重跑初始化：
 
 ```text
-npx --yes supabase@2.121.0 migration repair 20261018174837 20261018174851 20261018175423 20261018182444 --status applied
+npx --yes supabase@2.121.0 migration repair 20261018174837 20261018174851 20261018175423 20261018182444 20261018203956 --status applied
 ```
 
 `migration repair` 只登记历史，不执行 SQL。也可以从第一次初始化起就使用关联项目的 CLI `db push`，此时无需手动执行或修复这些迁移。[官方迁移记录说明](https://supabase.com/docs/reference/cli/supabase-migration-repair)

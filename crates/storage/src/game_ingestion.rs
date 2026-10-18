@@ -410,17 +410,38 @@ pub fn stage_observed(
             |row| row.get(0),
         )?,
         "review_summary" => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM review_snapshots WHERE app_id = $1)",
+            "SELECT EXISTS(
+                SELECT 1 FROM review_snapshots WHERE app_id = $1
+                  AND captured_at_ms >= COALESCE((
+                      SELECT MAX(observed_at_ms) FROM release_events
+                      WHERE app_id = $1 AND new_release_state = 'released'
+                        AND old_release_state <> 'released'
+                  ), 0)
+             )",
             [app_id],
             |row| row.get(0),
         )?,
         "popular_reviews" => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM popular_review_refresh_state WHERE app_id = $1)",
+            "SELECT EXISTS(
+                SELECT 1 FROM popular_review_refresh_state WHERE app_id = $1
+                  AND captured_at_ms >= COALESCE((
+                      SELECT MAX(observed_at_ms) FROM release_events
+                      WHERE app_id = $1 AND new_release_state = 'released'
+                        AND old_release_state <> 'released'
+                  ), 0)
+             )",
             [app_id],
             |row| row.get(0),
         )?,
         "ccu" => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM player_snapshots WHERE app_id = $1)",
+            "SELECT EXISTS(
+                SELECT 1 FROM player_snapshots WHERE app_id = $1
+                  AND captured_at_ms >= COALESCE((
+                      SELECT MAX(observed_at_ms) FROM release_events
+                      WHERE app_id = $1 AND new_release_state = 'released'
+                        AND old_release_state <> 'released'
+                  ), 0)
+             )",
             [app_id],
             |row| row.get(0),
         )?,
@@ -560,6 +581,95 @@ fn get_task(conn: &Connection, app_id: u32) -> StorageResult<Option<GameIngestio
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    #[test]
+    fn resumed_dynamic_stages_require_observations_since_latest_actual_release() {
+        const STAGES: [&str; 3] = ["review_summary", "popular_reviews", "ccu"];
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn_mut(|conn| {
+            crate::catalog::ensure_app_stub(conn, 42, "Launch", 0)?;
+            conn.execute(
+                "UPDATE apps SET release_state = 'coming_soon' WHERE app_id = 42",
+                [],
+            )?;
+            for stage in STAGES {
+                assert!(!stage_observed(conn, 42, stage, "CN", "schinese")?);
+            }
+            conn.execute_batch(
+                "INSERT INTO review_snapshots (
+                     app_id, region_scope, language_scope, captured_at_ms,
+                     total_positive, total_negative, total_reviews,
+                     filter_offtopic_activity, parameter_hash, content_hash, source
+                 ) VALUES (42, 'all', 'all', 100, 0, 0, 0, 1, 'p', 'review', 'test');
+                 INSERT INTO popular_review_refresh_state
+                     (app_id, captured_at_ms, result_count, source)
+                 VALUES (42, 100, 0, 'test');
+                 INSERT INTO player_snapshots
+                     (app_id, captured_at_ms, player_count, result_code, content_hash, source)
+                 VALUES (42, 100, 0, 1, 'ccu', 'test');",
+            )?;
+            // Existing pre-release observations still count before any actual launch.
+            for stage in STAGES {
+                assert!(stage_observed(conn, 42, stage, "CN", "schinese")?);
+            }
+            conn.execute(
+                "INSERT INTO release_events
+                     (app_id, old_release_state, new_release_state, source, observed_at_ms)
+                 VALUES (42, 'upcoming', 'coming_soon', 'test', 150)",
+                [],
+            )?;
+            for stage in STAGES {
+                assert!(stage_observed(conn, 42, stage, "CN", "schinese")?);
+            }
+            conn.execute_batch(
+                "UPDATE apps SET release_state = 'released' WHERE app_id = 42;
+                 INSERT INTO release_events
+                     (app_id, old_release_state, new_release_state, source, observed_at_ms)
+                 VALUES (42, 'coming_soon', 'released', 'test', 200),
+                        (42, 'released', 'released', 'test', 800);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // A new instance resuming the queue must use the stored release boundary.
+        let resumed = db.reconnect().unwrap();
+        resumed.with_conn_mut(|conn| {
+            for stage in STAGES {
+                assert!(!stage_observed(conn, 42, stage, "CN", "schinese")?);
+            }
+            conn.execute("UPDATE review_snapshots SET captured_at_ms = 200 WHERE app_id = 42", [])?;
+            assert!(stage_observed(conn, 42, "review_summary", "CN", "schinese")?);
+            assert!(!stage_observed(conn, 42, "popular_reviews", "CN", "schinese")?);
+            assert!(!stage_observed(conn, 42, "ccu", "CN", "schinese")?);
+            conn.execute("UPDATE popular_review_refresh_state SET captured_at_ms = 200 WHERE app_id = 42", [])?;
+            conn.execute("UPDATE player_snapshots SET captured_at_ms = 201 WHERE app_id = 42", [])?;
+            // The later released-to-released event is not a new launch.
+            for stage in STAGES {
+                assert!(stage_observed(conn, 42, stage, "CN", "schinese")?);
+            }
+
+            conn.execute(
+                "INSERT INTO release_events
+                     (app_id, old_release_state, new_release_state, source, observed_at_ms)
+                 VALUES (42, 'retired', 'released', 'test', 500)",
+                [],
+            )?;
+            for stage in STAGES {
+                assert!(!stage_observed(conn, 42, stage, "CN", "schinese")?);
+            }
+            conn.execute_batch(
+                "UPDATE review_snapshots SET captured_at_ms = 500 WHERE app_id = 42;
+                 UPDATE popular_review_refresh_state SET captured_at_ms = 500 WHERE app_id = 42;
+                 UPDATE player_snapshots SET captured_at_ms = 500 WHERE app_id = 42;",
+            )?;
+            for stage in STAGES {
+                assert!(stage_observed(conn, 42, stage, "CN", "schinese")?);
+            }
+            Ok(())
+        }).unwrap();
+    }
 
     #[test]
     fn deferred_ingestion_preserves_progress_and_recovery_keeps_live_leases() {

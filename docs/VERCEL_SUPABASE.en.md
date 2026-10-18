@@ -23,7 +23,7 @@ npx --yes supabase@2.121.0 db push --linked --skip-vault
 
 Reuse existing authentication and links after checking the target. Skip `init` if `supabase/config.toml` exists. `--skip-vault` disables the CLI's synchronization from `config.toml`; Vault statements inside migration SQL still run.
 
-The current baseline contains these files in filename order:
+The initialization and subsequent migrations currently contain these files in filename order:
 
 | Migration | Purpose |
 | --- | --- |
@@ -31,11 +31,14 @@ The current baseline contains these files in filename order:
 | `20261018174851_lobbytally_platform.sql` | Private `avatars` bucket, Cron / HTTP extensions, and dispatch function |
 | `20261018175423_lobbytally_postgres_hardening.sql` | Extension placement and foreign-key indexes |
 | `20261018182444_lobbytally_runtime_access.sql` | Dedicated backend role, RLS policies, and a random password encrypted in Vault |
+| `20261018203956_lobbytally_release_transition_index.sql` | Partial index for release-transition freshness queries |
 
-Alternatively, execute the files sequentially in the SQL Editor. The editor does not record CLI migration history. Only after confirming that all four files succeeded, register that existing baseline before using CLI pushes:
+The fifth migration is an additive performance index, compatible with existing data and the running application. It keeps the application schema contract at version `1`; Supabase CLI records the additional migration separately. An installation with the first four migrations already applied needs only the new file.
+
+Alternatively, execute the files sequentially in the SQL Editor. The editor does not record CLI migration history. Only after confirming that all five files succeeded, register those applied versions before using CLI pushes:
 
 ```text
-npx --yes supabase@2.121.0 migration repair 20261018174837 20261018174851 20261018175423 20261018182444 --status applied
+npx --yes supabase@2.121.0 migration repair 20261018174837 20261018174851 20261018175423 20261018182444 20261018203956 --status applied
 ```
 
 Keep `mpgs` outside the Data API's exposed schemas. Browser clients need no Supabase key, and the Rust API controls access to private avatars.

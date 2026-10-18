@@ -60,7 +60,7 @@ Preview deployments need an isolated Supabase project or an approved isolated en
 
 ## Apply migrations with accurate history
 
-For a fresh Supabase project, use the migration files in [supabase/migrations](../supabase/migrations/) in filename order. The initial cloud setup currently comprises the application baseline, platform resources, PostgreSQL hardening, and restricted runtime access. The provider guide lists the exact files and setup sequence.
+For a fresh Supabase project, use the migration files in [supabase/migrations](../supabase/migrations/) in filename order. The initial cloud setup comprises the application baseline, platform resources, PostgreSQL hardening, and restricted runtime access, followed by an additive release-transition query index. The provider guide lists the exact files and setup sequence.
 
 Prefer a linked CLI migration flow from the first application. Check the intended project and migration history before `db push`. The verified dry check is:
 
@@ -72,7 +72,7 @@ Inspect current help before use. `--skip-vault` skips the CLI's Vault synchroniz
 
 If an operator already applied the SQL in SQL Editor, inspect the resulting schema and objects before recording those exact versions as applied with `migration repair`. Repair changes migration history; it does not execute SQL. Never mark a failed or unexecuted migration applied merely to unblock a push. Do not replay the fresh baseline or runtime-role creation against an existing production database. Add a reviewed forward migration for a production change.
 
-Supabase migration history and `mpgs.schema_migrations` serve different purposes. The current application schema version remains `1`; it is not the count of Supabase migration files. Production startup checks readiness and does not run migrations or populate demonstration games.
+Supabase migration history and `mpgs.schema_migrations` serve different purposes. The current application schema version remains `1`; it is not the count of Supabase migration files. The release-transition index is performance-only and preserves this contract so a running version-1 deployment stays ready. The local bootstrap reuses that same index SQL. Production startup checks readiness and does not run migrations or populate demonstration games.
 
 The database connection must use:
 

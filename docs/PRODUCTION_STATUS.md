@@ -8,6 +8,7 @@
 | --- | --- |
 | Supabase | `Lunafleur / lobbytally`，东京 `ap-northeast-1`，项目 `fzywcxyyazlwetvixdzt` |
 | 数据库 | 四份迁移已应用；应用 schema 版本 `1`；专用后台角色连接和 readiness 通过 |
+| 合并后的新增迁移 | `20261018203956_lobbytally_release_transition_index.sql` 为下一次数据库部署增加兼容索引，应用 schema 仍为 `1`；本次代码合并尚未执行这份生产迁移 |
 | 数据隔离 | 私有 `mpgs` schema、私有 `avatars` bucket；安全 Advisor 无发现 |
 | Vercel | `redaiyos-projects / lobbytally`；容器云端构建与东京运行已验证；[正式站点](https://mpgs.lunafleur.dpdns.org) 已通过 HTTPS、页面、静态资源和 API 验收 |
 | 新数据 | 从空库开始，不导入旧 SQLite、账号或游戏数据 |

@@ -9,6 +9,13 @@ pub const MIGRATIONS: &[(i64, &str, &str)] = &[(
     include_str!("../../../supabase/migrations/20261018174837_lobbytally_initial.sql"),
 )];
 
+// Index-only additions do not change the application schema contract. Reuse
+// the forward Supabase SQL for local bootstrap without rewriting the deployed
+// baseline or making older binaries reject a new application schema version.
+const RELEASE_TRANSITION_INDEX_SQL: &str = include_str!(
+    "../../../supabase/migrations/20261018203956_lobbytally_release_transition_index.sql"
+);
+
 pub fn current_version(conn: &Connection) -> StorageResult<i64> {
     let exists: bool = conn.query_row(
         "SELECT EXISTS (
@@ -113,11 +120,14 @@ pub fn migrate_to(conn: &mut Connection, target: i64, now_ms: i64) -> StorageRes
         }
         current = next;
     }
+    if current > 0 {
+        tx.execute_batch(RELEASE_TRANSITION_INDEX_SQL)?;
+    }
     tx.commit()?;
     Ok(current)
 }
 
-/// Re-running migrate on an already-current database is a no-op.
+/// Preserve schema history while ensuring additive indexes are installed.
 pub fn migrate_idempotent(conn: &mut Connection, now_ms: i64) -> StorageResult<i64> {
     migrate_to_latest(conn, now_ms)
 }
@@ -353,6 +363,73 @@ mod tests {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    #[test]
+    fn released_transition_lookup_uses_partial_index() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.with_conn(|conn| {
+            let tx = conn.read_transaction()?;
+            // A tiny fixture may favor a sequential scan. Verify that the
+            // PostgreSQL planner can use this partial index for the real query.
+            tx.execute_batch("SET LOCAL enable_seqscan = off")?;
+            let plan = tx
+                .prepare(
+                    "EXPLAIN (COSTS OFF)
+                 SELECT app_id, MAX(observed_at_ms)
+                 FROM release_events
+                 WHERE new_release_state = 'released'
+                   AND old_release_state <> 'released'
+                 GROUP BY app_id",
+                )?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<crate::pg::Result<Vec<_>>>()?;
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("idx_release_events_to_released")),
+                "released transition lookup did not use partial index: {plan:?}"
+            );
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn additive_release_index_preserves_existing_baseline_and_zero_target() {
+        let db = Database::open_in_memory().unwrap();
+        db.with_conn_mut(|conn| {
+            assert_eq!(migrate_to(conn, 0, 1)?, 0);
+            assert_eq!(current_version(conn)?, 0);
+            let has_release_table: bool = conn.query_row(
+                "SELECT to_regclass(quote_ident(current_schema()) || '.release_events') IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            assert!(!has_release_table);
+
+            // Simulate the already-deployed Supabase baseline, without the new index.
+            conn.execute_batch(MIGRATIONS[0].2)?;
+            conn.execute("UPDATE schema_migrations SET applied_at_ms = 7", [])?;
+            assert_eq!(current_version(conn)?, 1);
+            assert_eq!(migrate_to_latest(conn, 8)?, 1);
+            assert_eq!(migrate_idempotent(conn, 9)?, 1);
+            let history: (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), MIN(applied_at_ms) FROM schema_migrations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(history, (1, 7));
+            let index_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE schemaname = current_schema() AND indexname = 'idx_release_events_to_released'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(index_count, 1);
+            Ok(())
+        }).unwrap();
     }
 
     #[test]
