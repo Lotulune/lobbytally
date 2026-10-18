@@ -2,13 +2,13 @@
 //! credential storage. Anonymous subjects remain the stable foreign-key root;
 //! an account is an extension of one subject rather than a replacement for it.
 
+use crate::pg::{Connection, OptionalExtension, params};
 use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use mpgs_domain::UserPreferences;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::{StorageError, StorageResult};
 use crate::users::{ACCESS_TOKEN_TTL_MS, REFRESH_TOKEN_TTL_MS, token_hash};
@@ -234,7 +234,7 @@ pub fn register_account(
 
     let tx = conn.transaction()?;
     let username_exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE username_normalized = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE username_normalized = $1)",
         params![username],
         |row| row.get(0),
     )?;
@@ -246,7 +246,7 @@ pub fn register_account(
         Some(user_id) => {
             ensure_anonymous_subject(&tx, user_id)?;
             let already_account: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = ?1)",
+                "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = $1)",
                 params![user_id],
                 |row| row.get(0),
             )?;
@@ -260,11 +260,12 @@ pub fn register_account(
         None => create_anonymous_subject(&tx, now_ms)?,
     };
     let avatar_public_id = format!("{AVATAR_PREFIX}{}", random_hex::<16>()?);
-    tx.execute(
+    let inserted = tx.execute(
         "INSERT INTO user_accounts (
             user_id, username_normalized, display_name, password_hash, password_scheme,
             status, avatar_public_id, created_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?7)",
+         ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $7)
+         ON CONFLICT DO NOTHING",
         params![
             user_id,
             username,
@@ -275,6 +276,11 @@ pub fn register_account(
             now_ms
         ],
     )?;
+    if inserted != 1 {
+        return Err(StorageError::conflict(
+            "username or current account is already registered",
+        ));
+    }
     let session = create_account_session(&tx, &user_id, &device_label, now_ms)?;
     tx.commit()?;
     Ok(session)
@@ -292,7 +298,7 @@ pub fn login_account(
     let account = tx
         .query_row(
             "SELECT user_id, password_hash, password_scheme, status
-             FROM user_accounts WHERE username_normalized = ?1",
+             FROM user_accounts WHERE username_normalized = $1 FOR UPDATE",
             params![username],
             |row| {
                 Ok((
@@ -323,7 +329,7 @@ pub fn login_account(
     if let Some(anonymous_user_id) = anonymous_user_id.filter(|source| *source != account.0) {
         ensure_anonymous_subject(&tx, anonymous_user_id)?;
         let source_is_account: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = $1)",
             params![anonymous_user_id],
             |row| row.get(0),
         )?;
@@ -347,12 +353,23 @@ pub fn refresh_account_session(
     }
     let refresh_hash = token_hash(refresh_token);
     let tx = conn.transaction()?;
+    // Account locks precede session locks on every credential-changing path.
+    // This serializes refresh rotation with password changes and account deletion.
+    tx.query_row(
+        "SELECT a.user_id FROM user_accounts AS a
+         JOIN account_sessions AS s ON s.user_id = a.user_id
+         WHERE s.refresh_token_hash = $1 FOR UPDATE OF a",
+        params![refresh_hash],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .ok_or_else(|| StorageError::not_found("account session"))?;
     let session = tx
         .query_row(
             "SELECT s.session_id, s.user_id, s.revoked_at_ms, s.refresh_expires_at_ms, a.status
              FROM account_sessions AS s
              JOIN user_accounts AS a ON a.user_id = s.user_id
-             WHERE s.refresh_token_hash = ?1",
+             WHERE s.refresh_token_hash = $1 FOR UPDATE OF s",
             params![refresh_hash],
             |row| {
                 Ok((
@@ -372,8 +389,8 @@ pub fn refresh_account_session(
         // A reused rotated token indicates credential theft. Revoke every
         // refresh session for the account before returning a generic 401.
         tx.execute(
-            "UPDATE account_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, ?1)
-             WHERE user_id = ?2",
+            "UPDATE account_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, $1)
+             WHERE user_id = $2",
             params![now_ms, user_id],
         )?;
         tx.commit()?;
@@ -381,8 +398,8 @@ pub fn refresh_account_session(
     }
     if refresh_expires_at_ms <= now_ms || status != "active" {
         tx.execute(
-            "UPDATE account_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, ?1)
-             WHERE session_id = ?2",
+            "UPDATE account_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, $1)
+             WHERE session_id = $2",
             params![now_ms, session_id],
         )?;
         tx.commit()?;
@@ -392,8 +409,8 @@ pub fn refresh_account_session(
     let replacement = create_account_session(&tx, &user_id, "Refreshed session", now_ms)?;
     let changed = tx.execute(
         "UPDATE account_sessions
-         SET revoked_at_ms = ?1, replaced_by_session_id = ?2
-         WHERE session_id = ?3 AND revoked_at_ms IS NULL",
+         SET revoked_at_ms = $1, replaced_by_session_id = $2
+         WHERE session_id = $3 AND revoked_at_ms IS NULL",
         params![now_ms, replacement.session_id, session_id],
     )?;
     if changed != 1 {
@@ -427,7 +444,7 @@ pub fn resolve_account_user_id_read(
              FROM account_sessions AS s
              JOIN user_accounts AS a ON a.user_id = s.user_id
              JOIN anonymous_users AS anonymous ON anonymous.user_id = s.user_id
-             WHERE s.access_token_hash = ?1 AND s.expires_at_ms > ?2
+             WHERE s.access_token_hash = $1 AND s.expires_at_ms > $2
                AND s.revoked_at_ms IS NULL AND a.status = 'active'",
             params![access_hash, now_ms],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
@@ -446,8 +463,8 @@ pub fn touch_account_last_active(
     now_ms: i64,
 ) -> StorageResult<()> {
     conn.execute(
-        "UPDATE anonymous_users SET last_active_at_ms = ?1
-         WHERE user_id = ?2 AND last_active_at_ms <= ?3",
+        "UPDATE anonymous_users SET last_active_at_ms = $1
+         WHERE user_id = $2 AND last_active_at_ms <= $3",
         params![now_ms, user_id, now_ms.saturating_sub(5 * 60 * 1000)],
     )?;
     Ok(())
@@ -467,7 +484,7 @@ pub fn account_profile(conn: &Connection, user_id: &str) -> StorageResult<Accoun
                 COALESCE(v.version, 0), v.storage_key
          FROM user_accounts AS a
          LEFT JOIN user_avatars AS v ON v.user_id = a.user_id
-         WHERE a.user_id = ?1",
+         WHERE a.user_id = $1",
         params![user_id],
         |row| {
             Ok(AccountProfile {
@@ -493,8 +510,8 @@ pub fn update_display_name(
 ) -> StorageResult<AccountProfile> {
     validate_display_name(display_name)?;
     let changed = conn.execute(
-        "UPDATE user_accounts SET display_name = ?1, updated_at_ms = ?2
-         WHERE user_id = ?3 AND status = 'active'",
+        "UPDATE user_accounts SET display_name = $1, updated_at_ms = $2
+         WHERE user_id = $3 AND status = 'active'",
         params![display_name.trim(), now_ms, user_id],
     )?;
     if changed != 1 {
@@ -517,7 +534,7 @@ pub fn change_password(
     let tx = conn.transaction()?;
     let account = tx
         .query_row(
-            "SELECT password_hash, password_scheme, status FROM user_accounts WHERE user_id = ?1",
+            "SELECT password_hash, password_scheme, status FROM user_accounts WHERE user_id = $1 FOR UPDATE",
             params![user_id],
             |row| {
                 Ok((
@@ -533,13 +550,13 @@ pub fn change_password(
         return Err(StorageError::not_found("account credentials"));
     }
     tx.execute(
-        "UPDATE user_accounts SET password_hash = ?1, password_scheme = ?2, updated_at_ms = ?3
-         WHERE user_id = ?4",
+        "UPDATE user_accounts SET password_hash = $1, password_scheme = $2, updated_at_ms = $3
+         WHERE user_id = $4",
         params![new_hash, PASSWORD_SCHEME, now_ms, user_id],
     )?;
     tx.execute(
-        "UPDATE account_sessions SET revoked_at_ms = ?1
-         WHERE user_id = ?2 AND access_token_hash <> ?3 AND revoked_at_ms IS NULL",
+        "UPDATE account_sessions SET revoked_at_ms = $1
+         WHERE user_id = $2 AND access_token_hash <> $3 AND revoked_at_ms IS NULL",
         params![now_ms, user_id, current_access_hash],
     )?;
     tx.commit()?;
@@ -552,8 +569,8 @@ pub fn revoke_current_session(
     now_ms: i64,
 ) -> StorageResult<()> {
     let changed = conn.execute(
-        "UPDATE account_sessions SET revoked_at_ms = ?1
-         WHERE access_token_hash = ?2 AND revoked_at_ms IS NULL",
+        "UPDATE account_sessions SET revoked_at_ms = $1
+         WHERE access_token_hash = $2 AND revoked_at_ms IS NULL",
         params![now_ms, token_hash(access_token)],
     )?;
     if changed != 1 {
@@ -564,8 +581,8 @@ pub fn revoke_current_session(
 
 pub fn revoke_all_sessions(conn: &Connection, user_id: &str, now_ms: i64) -> StorageResult<()> {
     conn.execute(
-        "UPDATE account_sessions SET revoked_at_ms = ?1
-         WHERE user_id = ?2 AND revoked_at_ms IS NULL",
+        "UPDATE account_sessions SET revoked_at_ms = $1
+         WHERE user_id = $2 AND revoked_at_ms IS NULL",
         params![now_ms, user_id],
     )?;
     Ok(())
@@ -579,7 +596,7 @@ pub fn delete_account(
     let tx = conn.transaction()?;
     let status: Option<String> = tx
         .query_row(
-            "SELECT status FROM user_accounts WHERE user_id = ?1",
+            "SELECT status FROM user_accounts WHERE user_id = $1 FOR UPDATE",
             params![user_id],
             |row| row.get(0),
         )
@@ -589,28 +606,31 @@ pub fn delete_account(
     }
     let avatar = avatar_metadata_for_user(&tx, user_id)?;
     tx.execute(
-        "DELETE FROM play_intent_votes WHERE user_id = ?1",
+        "DELETE FROM play_intent_votes WHERE user_id = $1",
         params![user_id],
     )?;
     tx.execute(
-        "DELETE FROM user_avatars WHERE user_id = ?1",
+        "DELETE FROM user_avatars WHERE user_id = $1",
         params![user_id],
     )?;
     tx.execute(
-        "DELETE FROM avatar_moderation WHERE user_id = ?1",
+        "DELETE FROM avatar_moderation WHERE user_id = $1",
         params![user_id],
     )?;
     tx.execute(
         "UPDATE user_accounts
-         SET status = 'deleted', display_name = 'Deleted user', updated_at_ms = ?1
-         WHERE user_id = ?2",
+         SET status = 'deleted', display_name = 'Deleted user', updated_at_ms = $1
+         WHERE user_id = $2",
         params![now_ms, user_id],
     )?;
     tx.execute(
-        "UPDATE account_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, ?1)
-         WHERE user_id = ?2",
+        "UPDATE account_sessions SET revoked_at_ms = COALESCE(revoked_at_ms, $1)
+         WHERE user_id = $2",
         params![now_ms, user_id],
     )?;
+    if let Some(avatar) = &avatar {
+        enqueue_retired_avatar_cleanup(&tx, &avatar.storage_key, now_ms)?;
+    }
     tx.commit()?;
     Ok(avatar)
 }
@@ -629,22 +649,16 @@ pub fn set_avatar_metadata(
         return Err(StorageError::validation("avatar storage key is invalid"));
     }
     let tx = conn.transaction()?;
-    let active: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = ?1 AND status = 'active')",
-        params![user_id],
-        |row| row.get(0),
-    )?;
-    if !active {
-        return Err(StorageError::not_found("account"));
-    }
+    lock_active_account(&tx, user_id)?;
+    let previous = avatar_metadata_for_user(&tx, user_id)?;
     let version: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(version), 0) + 1 FROM user_avatars WHERE user_id = ?1",
+        "SELECT COALESCE(MAX(version), 0) + 1 FROM user_avatars WHERE user_id = $1",
         params![user_id],
         |row| row.get(0),
     )?;
     tx.execute(
         "INSERT INTO user_avatars (user_id, version, content_hash, media_type, storage_key, updated_at_ms)
-         VALUES (?1, ?2, ?3, 'image/webp', ?4, ?5)
+         VALUES ($1, $2, $3, 'image/webp', $4, $5)
          ON CONFLICT(user_id) DO UPDATE SET
              version = excluded.version,
              content_hash = excluded.content_hash,
@@ -657,9 +671,12 @@ pub fn set_avatar_metadata(
     // account. A genuinely new upload may be displayed while the audit trail
     // remains in audit_events.
     tx.execute(
-        "DELETE FROM avatar_moderation WHERE user_id = ?1 AND content_hash <> ?2",
+        "DELETE FROM avatar_moderation WHERE user_id = $1 AND content_hash <> $2",
         params![user_id, content_hash],
     )?;
+    if let Some(previous) = previous.filter(|previous| previous.storage_key != storage_key) {
+        enqueue_retired_avatar_cleanup(&tx, &previous.storage_key, now_ms)?;
+    }
     let metadata =
         avatar_metadata_for_user(&tx, user_id)?.ok_or_else(|| StorageError::not_found("avatar"))?;
     tx.commit()?;
@@ -669,19 +686,57 @@ pub fn set_avatar_metadata(
 pub fn delete_avatar_metadata(
     conn: &mut Connection,
     user_id: &str,
+    now_ms: i64,
 ) -> StorageResult<Option<AvatarMetadata>> {
     let tx = conn.transaction()?;
+    lock_account(&tx, user_id)?;
     let metadata = avatar_metadata_for_user(&tx, user_id)?;
     tx.execute(
-        "DELETE FROM user_avatars WHERE user_id = ?1",
+        "DELETE FROM user_avatars WHERE user_id = $1",
         params![user_id],
     )?;
     tx.execute(
-        "DELETE FROM avatar_moderation WHERE user_id = ?1",
+        "DELETE FROM avatar_moderation WHERE user_id = $1",
         params![user_id],
     )?;
+    if let Some(metadata) = &metadata {
+        enqueue_retired_avatar_cleanup(&tx, &metadata.storage_key, now_ms)?;
+    }
     tx.commit()?;
     Ok(metadata)
+}
+
+fn enqueue_retired_avatar_cleanup(
+    conn: &Connection,
+    storage_key: &str,
+    now_ms: i64,
+) -> StorageResult<()> {
+    crate::jobs::enqueue_job(
+        conn,
+        &crate::models::EnqueueJob {
+            source: "avatar_cleanup".into(),
+            task_type: "delete_avatar".into(),
+            entity_key: storage_key.to_owned(),
+            priority: 10,
+            max_attempts: 100,
+            due_at_ms: now_ms.saturating_add(60_000),
+            // Separate from the upload-orphan job, which may have already
+            // completed while this object was the active avatar.
+            idempotency_key: format!("avatar-retired:{}", token_hash(storage_key)),
+            payload_json: None,
+        },
+        now_ms,
+    )?;
+    Ok(())
+}
+
+pub fn avatar_storage_key_in_use(conn: &Connection, storage_key: &str) -> StorageResult<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM user_avatars WHERE storage_key = $1)",
+        params![storage_key],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 /// Block or unblock the account's current avatar. Blocks are content-hash
@@ -705,11 +760,12 @@ pub fn set_avatar_moderation(
     }
 
     let tx = conn.transaction()?;
+    lock_account(&tx, user_id)?;
     let avatar =
         avatar_metadata_for_user(&tx, user_id)?.ok_or_else(|| StorageError::not_found("avatar"))?;
     let existing: Option<String> = tx
         .query_row(
-            "SELECT content_hash FROM avatar_moderation WHERE user_id = ?1",
+            "SELECT content_hash FROM avatar_moderation WHERE user_id = $1",
             params![user_id],
             |row| row.get(0),
         )
@@ -721,7 +777,7 @@ pub fn set_avatar_moderation(
         } else {
             tx.execute(
                 "INSERT INTO avatar_moderation (user_id, content_hash, blocked_at_ms, blocked_by, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT(user_id) DO UPDATE SET
                     content_hash = excluded.content_hash,
                     blocked_at_ms = excluded.blocked_at_ms,
@@ -733,7 +789,7 @@ pub fn set_avatar_moderation(
         }
     } else if existing.is_some() {
         tx.execute(
-            "DELETE FROM avatar_moderation WHERE user_id = ?1",
+            "DELETE FROM avatar_moderation WHERE user_id = $1",
             params![user_id],
         )?;
         true
@@ -746,8 +802,8 @@ pub fn set_avatar_moderation(
         // decision, and the M7 trigger invalidates community ETags.
         if blocked || existing.as_deref() == Some(avatar.content_hash.as_str()) {
             tx.execute(
-                "UPDATE user_avatars SET version = version + 1, updated_at_ms = ?1
-                 WHERE user_id = ?2 AND content_hash = ?3",
+                "UPDATE user_avatars SET version = version + 1, updated_at_ms = $1
+                 WHERE user_id = $2 AND content_hash = $3",
                 params![now_ms, user_id, avatar.content_hash],
             )?;
         }
@@ -767,7 +823,7 @@ pub fn set_avatar_moderation(
         tx.execute(
             "INSERT INTO audit_events (
                 actor, action, entity_type, entity_key, before_json, after_json, reason, request_id, created_at_ms
-             ) VALUES (?1, ?2, 'avatar', ?3, ?4, ?5, ?6, NULL, ?7)",
+             ) VALUES ($1, $2, 'avatar', $3, $4, $5, $6, NULL, $7)",
             params![actor, action, user_id, before, after, reason, now_ms],
         )?;
     }
@@ -784,7 +840,7 @@ pub fn avatar_by_public_id(conn: &Connection, public_id: &str) -> StorageResult<
          LEFT JOIN user_avatars AS v ON v.user_id = a.user_id
          LEFT JOIN avatar_moderation AS moderation
            ON moderation.user_id = a.user_id AND moderation.content_hash = v.content_hash
-         WHERE a.avatar_public_id = ?1 AND a.status = 'active'",
+         WHERE a.avatar_public_id = $1 AND a.status = 'active'",
         params![public_id],
         |row| {
             Ok(AvatarLookup {
@@ -803,7 +859,7 @@ pub fn account_ai_settings(conn: &Connection, user_id: &str) -> StorageResult<Ai
     let settings = conn
         .query_row(
             "SELECT mode, provider, base_url, model, encrypted_api_key, updated_at_ms
-             FROM user_ai_credentials WHERE user_id = ?1",
+             FROM user_ai_credentials WHERE user_id = $1",
             params![user_id],
             |row| {
                 Ok((
@@ -850,20 +906,13 @@ pub fn put_account_ai_settings(
     now_ms: i64,
 ) -> StorageResult<AiSettings> {
     let tx = conn.transaction()?;
-    let active: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = ?1 AND status = 'active')",
-        params![user_id],
-        |row| row.get(0),
-    )?;
-    if !active {
-        return Err(StorageError::not_found("account"));
-    }
+    lock_active_account(&tx, user_id)?;
     match input.mode {
         AiMode::Builtin | AiMode::Off => {
             tx.execute(
                 "INSERT INTO user_ai_credentials (
                     user_id, mode, provider, base_url, model, encrypted_api_key, key_version, updated_at_ms
-                 ) VALUES (?1, ?2, NULL, NULL, NULL, NULL, NULL, ?3)
+                 ) VALUES ($1, $2, NULL, NULL, NULL, NULL, NULL, $3)
                  ON CONFLICT(user_id) DO UPDATE SET
                     mode = excluded.mode, provider = NULL, base_url = NULL, model = NULL,
                     encrypted_api_key = NULL, key_version = NULL, updated_at_ms = excluded.updated_at_ms",
@@ -889,7 +938,7 @@ pub fn put_account_ai_settings(
             tx.execute(
                 "INSERT INTO user_ai_credentials (
                     user_id, mode, provider, base_url, model, encrypted_api_key, key_version, updated_at_ms
-                 ) VALUES (?1, 'custom', ?2, ?3, ?4, NULL, NULL, ?5)
+                 ) VALUES ($1, 'custom', $2, $3, $4, NULL, NULL, $5)
                  ON CONFLICT(user_id) DO UPDATE SET
                     mode = 'custom', provider = excluded.provider, base_url = excluded.base_url,
                     model = excluded.model, encrypted_api_key = NULL, key_version = NULL,
@@ -926,7 +975,7 @@ pub fn account_ai_daily_usage(
 ) -> StorageResult<u32> {
     let usage: Option<i64> = conn
         .query_row(
-            "SELECT builtin_requests FROM account_ai_usage WHERE user_id = ?1 AND day_utc = ?2",
+            "SELECT builtin_requests FROM account_ai_usage WHERE user_id = $1 AND day_utc = $2",
             params![user_id, day_utc],
             |row| row.get(0),
         )
@@ -942,36 +991,26 @@ pub fn consume_account_ai_quota(
     day_utc: i64,
     daily_limit: u32,
 ) -> StorageResult<Option<u32>> {
-    let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let active: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = ?1 AND status = 'active')",
-        params![user_id],
-        |row| row.get(0),
-    )?;
-    if !active {
-        return Err(StorageError::not_found("account"));
-    }
-    let current: Option<i64> = transaction
-        .query_row(
-            "SELECT builtin_requests FROM account_ai_usage WHERE user_id = ?1 AND day_utc = ?2",
-            params![user_id, day_utc],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let current = current.unwrap_or(0).max(0);
-    if current >= i64::from(daily_limit) {
+    let transaction = conn.transaction()?;
+    lock_active_account(&transaction, user_id)?;
+    if daily_limit == 0 {
         transaction.commit()?;
         return Ok(None);
     }
-    let next = current.saturating_add(1);
-    transaction.execute(
-        "INSERT INTO account_ai_usage (user_id, day_utc, builtin_requests)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(user_id, day_utc) DO UPDATE SET builtin_requests = excluded.builtin_requests",
-        params![user_id, day_utc, next],
-    )?;
+    let next: Option<i64> = transaction
+        .query_row(
+            "INSERT INTO account_ai_usage (user_id, day_utc, builtin_requests)
+             VALUES ($1, $2, 1)
+             ON CONFLICT(user_id, day_utc) DO UPDATE
+             SET builtin_requests = account_ai_usage.builtin_requests + 1
+             WHERE account_ai_usage.builtin_requests < $3
+             RETURNING builtin_requests",
+            params![user_id, day_utc, daily_limit],
+            |row| row.get(0),
+        )
+        .optional()?;
     transaction.commit()?;
-    Ok(Some(next.try_into().unwrap_or(u32::MAX)))
+    Ok(next.map(|next| next.try_into().unwrap_or(u32::MAX)))
 }
 
 pub fn custom_ai_credential(
@@ -982,7 +1021,7 @@ pub fn custom_ai_credential(
     let stored = conn
         .query_row(
             "SELECT mode, provider, base_url, model, encrypted_api_key
-             FROM user_ai_credentials WHERE user_id = ?1",
+             FROM user_ai_credentials WHERE user_id = $1",
             params![user_id],
             |row| {
                 Ok((
@@ -1023,7 +1062,7 @@ pub fn custom_ai_credential(
 
 pub fn account_is_active(conn: &Connection, user_id: &str) -> StorageResult<bool> {
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = ?1 AND status = 'active')",
+        "SELECT EXISTS(SELECT 1 FROM user_accounts WHERE user_id = $1 AND status = 'active')",
         params![user_id],
         |row| row.get(0),
     )
@@ -1045,7 +1084,7 @@ fn create_account_session(
         "INSERT INTO account_sessions (
             session_id, user_id, access_token_hash, refresh_token_hash, device_label,
             issued_at_ms, expires_at_ms, refresh_expires_at_ms, revoked_at_ms, replaced_by_session_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL)",
         params![
             session_id,
             user_id,
@@ -1079,28 +1118,29 @@ fn merge_anonymous_subject(
     // every feedback_id/undone_by relationship and its idempotent undo result.
     conn.execute(
         "DELETE FROM feedback_events
-         WHERE user_id = ?2
+         WHERE user_id = $2
            AND EXISTS (
                SELECT 1
                FROM feedback_events AS destination
-               WHERE destination.user_id = ?1
+               WHERE destination.user_id = $1
                  AND destination.idempotency_key = feedback_events.idempotency_key
            )",
         params![account_user_id, source_user_id],
     )?;
     conn.execute(
-        "UPDATE feedback_events SET user_id = ?1 WHERE user_id = ?2",
+        "UPDATE feedback_events SET user_id = $1 WHERE user_id = $2",
         params![account_user_id, source_user_id],
     )?;
     // The primary key on (app_id, user_id) is the account-level de-duplication
     // rule. Any source duplicate is discarded without adding public count.
     conn.execute(
-        "INSERT OR IGNORE INTO play_intent_votes (app_id, user_id, created_at_ms)
-         SELECT app_id, ?1, created_at_ms FROM play_intent_votes WHERE user_id = ?2",
+        "INSERT INTO play_intent_votes (app_id, user_id, created_at_ms)
+         SELECT app_id, $1, created_at_ms FROM play_intent_votes WHERE user_id = $2
+         ON CONFLICT (app_id, user_id) DO NOTHING",
         params![account_user_id, source_user_id],
     )?;
     conn.execute(
-        "DELETE FROM play_intent_votes WHERE user_id = ?1",
+        "DELETE FROM play_intent_votes WHERE user_id = $1",
         params![source_user_id],
     )?;
     Ok(())
@@ -1118,7 +1158,7 @@ fn merge_preferences(
         (Some(source), Some(destination)) => (source, destination),
         (Some(_), None) => {
             conn.execute(
-                "UPDATE user_preferences SET user_id = ?1 WHERE user_id = ?2",
+                "UPDATE user_preferences SET user_id = $1 WHERE user_id = $2",
                 params![account_user_id, source_user_id],
             )?;
             return Ok(());
@@ -1141,16 +1181,16 @@ fn merge_preferences(
     };
     if keep_source {
         conn.execute(
-            "DELETE FROM user_preferences WHERE user_id = ?1",
+            "DELETE FROM user_preferences WHERE user_id = $1",
             params![account_user_id],
         )?;
         conn.execute(
-            "UPDATE user_preferences SET user_id = ?1 WHERE user_id = ?2",
+            "UPDATE user_preferences SET user_id = $1 WHERE user_id = $2",
             params![account_user_id, source_user_id],
         )?;
     } else {
         conn.execute(
-            "DELETE FROM user_preferences WHERE user_id = ?1",
+            "DELETE FROM user_preferences WHERE user_id = $1",
             params![source_user_id],
         )?;
     }
@@ -1159,7 +1199,7 @@ fn merge_preferences(
 
 fn load_preferences(conn: &Connection, user_id: &str) -> StorageResult<Option<UserPreferences>> {
     let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_preferences WHERE user_id = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM user_preferences WHERE user_id = $1)",
         params![user_id],
         |row| row.get(0),
     )?;
@@ -1178,7 +1218,7 @@ fn create_anonymous_subject(conn: &Connection, now_ms: i64) -> StorageResult<Str
         "INSERT INTO anonymous_users (
             user_id, created_at_ms, last_active_at_ms, access_token_hash, refresh_token_hash,
             access_expires_at_ms, refresh_expires_at_ms
-         ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)",
+         ) VALUES ($1, $2, $2, $3, $4, $5, $6)",
         params![
             user_id,
             now_ms,
@@ -1193,16 +1233,31 @@ fn create_anonymous_subject(conn: &Connection, now_ms: i64) -> StorageResult<Str
 }
 
 fn ensure_anonymous_subject(conn: &Connection, user_id: &str) -> StorageResult<()> {
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM anonymous_users WHERE user_id = ?1)",
+    conn.query_row(
+        "SELECT user_id FROM anonymous_users WHERE user_id = $1 FOR UPDATE",
+        params![user_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()?
+    .ok_or_else(|| StorageError::not_found("anonymous session"))?;
+    Ok(())
+}
+
+fn lock_active_account(conn: &Connection, user_id: &str) -> StorageResult<()> {
+    if lock_account(conn, user_id)?.as_deref() != Some("active") {
+        return Err(StorageError::not_found("account"));
+    }
+    Ok(())
+}
+
+fn lock_account(conn: &Connection, user_id: &str) -> StorageResult<Option<String>> {
+    conn.query_row(
+        "SELECT status FROM user_accounts WHERE user_id = $1 FOR UPDATE",
         params![user_id],
         |row| row.get(0),
-    )?;
-    if exists {
-        Ok(())
-    } else {
-        Err(StorageError::not_found("anonymous session"))
-    }
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn insert_default_preferences(conn: &Connection, user_id: &str, now_ms: i64) -> StorageResult<()> {
@@ -1213,7 +1268,7 @@ fn insert_default_preferences(conn: &Connection, user_id: &str, now_ms: i64) -> 
             session_minutes_min, session_minutes_max,
             budget_currency, budget_max_each_minor, platforms_json, self_hosting_willingness,
             languages_json, excluded_modes_json, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         params![
             user_id,
             prefs.version,
@@ -1240,7 +1295,7 @@ fn avatar_metadata_for_user(
 ) -> StorageResult<Option<AvatarMetadata>> {
     conn.query_row(
         "SELECT user_id, version, content_hash, media_type, storage_key, updated_at_ms
-         FROM user_avatars WHERE user_id = ?1",
+         FROM user_avatars WHERE user_id = $1",
         params![user_id],
         |row| {
             Ok(AvatarMetadata {
@@ -1351,6 +1406,8 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
     use crate::db::Database;
     use mpgs_domain::FeedbackType;
@@ -1387,7 +1444,7 @@ mod tests {
         assert!(
             db.with_conn(|conn| {
                 let hash: String = conn.query_row(
-                    "SELECT password_hash FROM user_accounts WHERE user_id = ?1",
+                    "SELECT password_hash FROM user_accounts WHERE user_id = $1",
                     params![created.user_id],
                     |row| row.get(0),
                 )?;
@@ -1471,7 +1528,7 @@ mod tests {
             let (moved_id, moved_undo): (i64, Option<i64>) = conn.query_row(
                 "SELECT feedback_id, undone_by
                  FROM feedback_events
-                 WHERE user_id = ?1 AND idempotency_key = 'source-like'",
+                 WHERE user_id = $1 AND idempotency_key = 'source-like'",
                 params![account.user_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
@@ -1525,7 +1582,7 @@ mod tests {
         let encrypted: Option<Vec<u8>> = db
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT encrypted_api_key FROM user_ai_credentials WHERE user_id = ?1",
+                    "SELECT encrypted_api_key FROM user_ai_credentials WHERE user_id = $1",
                     params![anonymous_id],
                     |row| row.get(0),
                 )
@@ -1575,9 +1632,181 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_account_authentication_updates_activity_and_can_log_out() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = Database::open(directory.path().join("accounts.db")).unwrap();
+    fn concurrent_instances_cannot_exceed_an_account_quota() {
+        let (db, user_id) = setup();
+        db.with_conn_mut(|conn| {
+            register_account(
+                conn,
+                &RegisterAccount {
+                    username: "concurrent_quota".into(),
+                    display_name: "Concurrent quota".into(),
+                    password: "long-enough-password".into(),
+                    device_label: "Test".into(),
+                },
+                Some(&user_id),
+                10,
+            )
+        })
+        .unwrap();
+        let handles: Vec<_> = (0..6).map(|_| db.reconnect().unwrap()).collect();
+        let barrier = Arc::new(Barrier::new(handles.len()));
+        let threads: Vec<_> = handles
+            .into_iter()
+            .map(|handle| {
+                let user_id = user_id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle
+                        .with_conn_mut(|conn| consume_account_ai_quota(conn, &user_id, 20, 3))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut accepted: Vec<_> = threads
+            .into_iter()
+            .filter_map(|thread| thread.join().unwrap())
+            .collect();
+        accepted.sort_unstable();
+        assert_eq!(accepted, vec![1, 2, 3]);
+        assert_eq!(
+            db.with_conn(|conn| account_ai_daily_usage(conn, &user_id, 20))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn concurrent_refresh_replay_revokes_the_replacement_across_handles() {
+        let (db, user_id) = setup();
+        let session = db
+            .with_conn_mut(|conn| {
+                register_account(
+                    conn,
+                    &RegisterAccount {
+                        username: "concurrent_refresh".into(),
+                        display_name: "Concurrent refresh".into(),
+                        password: "long-enough-password".into(),
+                        device_label: "Test".into(),
+                    },
+                    Some(&user_id),
+                    10,
+                )
+            })
+            .unwrap();
+        let handles = [db.reconnect().unwrap(), db.reconnect().unwrap()];
+        let barrier = Arc::new(Barrier::new(handles.len()));
+        let threads: Vec<_> = handles
+            .into_iter()
+            .map(|handle| {
+                let token = session.refresh_token.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle.with_conn_mut(|conn| refresh_account_session(conn, &token, 20))
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let replacement = results.into_iter().find_map(Result::ok).unwrap();
+        assert!(
+            db.with_conn(|conn| resolve_account_user_id(conn, &replacement.access_token, 21))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn avatar_retirement_and_cleanup_outbox_commit_together() {
+        let (db, user_id) = setup();
+        db.with_conn_mut(|conn| {
+            register_account(
+                conn,
+                &RegisterAccount {
+                    username: "avatar_outbox".into(),
+                    display_name: "Avatar outbox".into(),
+                    password: "long-enough-password".into(),
+                    device_label: "Test".into(),
+                },
+                Some(&user_id),
+                10,
+            )?;
+            set_avatar_metadata(conn, &user_id, &"a".repeat(64), "first.webp", 20)?;
+            Ok(())
+        })
+        .unwrap();
+        // A conflicting outbox record forces the replacement transaction to
+        // fail. The original object must remain referenced in that case.
+        let blocking_job = db
+            .with_conn_mut(|conn| {
+                crate::jobs::enqueue_job(
+                    conn,
+                    &crate::models::EnqueueJob {
+                        source: "avatar_cleanup".into(),
+                        task_type: "delete_avatar".into(),
+                        entity_key: "different.webp".into(),
+                        priority: 10,
+                        max_attempts: 100,
+                        due_at_ms: 60_030,
+                        idempotency_key: format!("avatar-retired:{}", token_hash("first.webp")),
+                        payload_json: None,
+                    },
+                    30,
+                )
+            })
+            .unwrap();
+        assert!(
+            db.with_conn_mut(|conn| {
+                set_avatar_metadata(conn, &user_id, &"b".repeat(64), "second.webp", 30)
+            })
+            .is_err()
+        );
+        assert!(
+            db.with_conn(|conn| avatar_storage_key_in_use(conn, "first.webp"))
+                .unwrap()
+        );
+        assert!(
+            !db.with_conn(|conn| avatar_storage_key_in_use(conn, "second.webp"))
+                .unwrap()
+        );
+        db.with_conn_mut(|conn| {
+            conn.execute("DELETE FROM jobs WHERE job_id = $1", params![blocking_job])?;
+            set_avatar_metadata(conn, &user_id, &"b".repeat(64), "second.webp", 40)?;
+            delete_avatar_metadata(conn, &user_id, 50)?;
+            set_avatar_metadata(conn, &user_id, &"c".repeat(64), "third.webp", 60)?;
+            delete_account(conn, &user_id, 70)?;
+            Ok(())
+        })
+        .unwrap();
+        let jobs = db
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT entity_key, due_at_ms FROM jobs
+                 WHERE source = 'avatar_cleanup' ORDER BY due_at_ms",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            jobs,
+            vec![
+                ("first.webp".to_owned(), 60_040),
+                ("second.webp".to_owned(), 60_050),
+                ("third.webp".to_owned(), 60_070),
+            ]
+        );
+    }
+
+    #[test]
+    fn account_authentication_and_logout_are_visible_across_database_handles() {
+        let db = Database::open_in_memory().unwrap();
         db.migrate().unwrap();
         let now_ms = db.now_ms();
         let anonymous = db
@@ -1598,7 +1827,7 @@ mod tests {
                 )
             })
             .unwrap();
-        let repo = crate::Repository::new(db);
+        let repo = crate::Repository::new(db.reconnect().unwrap());
         assert_eq!(
             repo.resolve_account_access_token(&account.access_token)
                 .unwrap(),
@@ -1610,6 +1839,10 @@ mod tests {
             .unwrap();
         assert!(
             repo.resolve_account_access_token(&account.access_token)
+                .is_err()
+        );
+        assert!(
+            db.with_conn(|conn| resolve_account_user_id(conn, &account.access_token, now_ms + 2))
                 .is_err()
         );
     }
@@ -1661,7 +1894,7 @@ mod tests {
         let audit: (String, String, String) = db
             .with_conn(|conn| {
                 conn.query_row(
-                    "SELECT action, reason, after_json FROM audit_events WHERE entity_key = ?1",
+                    "SELECT action, reason, after_json FROM audit_events WHERE entity_key = $1",
                     params![anonymous_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )

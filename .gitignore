@@ -18,6 +18,12 @@ dist/
 /.workbuddy/
 deploy/mpgs.env
 deploy/.env
+deploy/cloud.env
+.vercel/
+supabase/.temp/
 local-release.*
 **/__pycache__/
 *.pyc
+
+.vercel
+.env*

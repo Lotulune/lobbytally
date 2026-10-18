@@ -1,5 +1,7 @@
 # 本地开发指南
 
+当前云端代码使用 PostgreSQL 和有限批次 worker；环境设置及验证命令以 [Vercel + Supabase 部署指南](VERCEL_SUPABASE.md) 为准。下文的 SQLite、旧验收和单机命令保留为历史版本记录。
+
 ## 1. 当前基线
 
 仓库当前 **M3–M5 已验收关闭**；M6 发布加固工程基线见 [`M6_ACCEPTANCE.md`](M6_ACCEPTANCE.md)。M5 审查修复记录见 [`M5_ACCEPTANCE_RUN.md`](M5_ACCEPTANCE_RUN.md)。发布前数据富化、合规签字与真实签名仍须并行/人工完成。

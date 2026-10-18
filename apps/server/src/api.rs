@@ -39,6 +39,7 @@ use serde_json::json;
 use utoipa::{OpenApi, ToSchema};
 
 use crate::ai_limits::{AccountAiLimiter, AccountAiPermit};
+use crate::avatars::AvatarStorage;
 use crate::cors::CorsConfig;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 
@@ -46,18 +47,19 @@ tokio::task_local! {
     static CURRENT_REQUEST_ID: String;
 }
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::Cursor;
-use std::path::{Path as FilePath, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct AppState {
     pub repo: Option<Repository>,
     pub admin_token: Option<String>,
+    pub avatar_storage: AvatarStorage,
+    pub cron_secret: Option<String>,
+    pub web_dir: Option<PathBuf>,
     pub rate_limits: RateLimitConfig,
     pub cors: CorsConfig,
     pub account_ai_limits: AccountAiLimiter,
@@ -68,122 +70,15 @@ pub struct AppState {
     pub embedding: Arc<dyn EmbeddingProvider>,
 }
 
-const LOGIN_WINDOW: Duration = Duration::from_secs(60);
-const LOGIN_ATTEMPTS_PER_ACCOUNT: u32 = 10;
-const MAX_LOGIN_IDENTITIES: usize = 100_000;
-const AI_CALL_WINDOW: Duration = Duration::from_secs(60);
-const AI_CALLS_PER_ACCOUNT: u32 = 10;
-const MAX_AI_CALL_IDENTITIES: usize = 100_000;
+const LOGIN_ATTEMPTS_PER_ACCOUNT: u64 = 10;
+const AI_CALLS_PER_ACCOUNT: u64 = 10;
+const AI_OPERATION_TIMEOUT: Duration = Duration::from_secs(20);
 const SCORE_SEMANTICS: &str = "context_percentile_v1";
 const SCORE_CALIBRATION_VERSION: &str = "context-percentile-v1";
 const MIN_INDEX_POOL_SIZE: usize = 10;
 const MIN_INDEX_DATA_CONFIDENCE: f64 = 0.45;
 const MIN_INDEX_FEATURES: usize = 3;
 const NATURAL_LANGUAGE_RECALL_LIMIT: usize = 300;
-
-#[derive(Debug, Clone, Copy)]
-struct LoginAttemptCounter {
-    started: Instant,
-    attempts: u32,
-}
-
-/// Account-name throttle layered on top of the request middleware's IP/device
-/// throttle. It deliberately returns no account-existence signal.
-#[derive(Default)]
-pub struct LoginAttemptLimiter {
-    counters: Mutex<HashMap<String, LoginAttemptCounter>>,
-}
-
-impl LoginAttemptLimiter {
-    fn allow(&self, username: &str) -> bool {
-        let now = Instant::now();
-        // Never retain attacker-controlled username bytes in the process-wide
-        // limiter. Invalid login bodies are rejected later by storage.
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        username.trim().to_ascii_lowercase().hash(&mut hasher);
-        let key = format!("{:016x}", hasher.finish());
-        let mut counters = self
-            .counters
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if counters.len() >= MAX_LOGIN_IDENTITIES {
-            counters.retain(|_, counter| now.duration_since(counter.started) < LOGIN_WINDOW);
-        }
-        if counters.len() >= MAX_LOGIN_IDENTITIES {
-            return false;
-        }
-        let counter = counters.entry(key).or_insert(LoginAttemptCounter {
-            started: now,
-            attempts: 0,
-        });
-        if now.duration_since(counter.started) >= LOGIN_WINDOW {
-            *counter = LoginAttemptCounter {
-                started: now,
-                attempts: 0,
-            };
-        }
-        if counter.attempts >= LOGIN_ATTEMPTS_PER_ACCOUNT {
-            return false;
-        }
-        counter.attempts = counter.attempts.saturating_add(1);
-        true
-    }
-}
-
-fn login_attempt_limiter() -> &'static LoginAttemptLimiter {
-    static LIMITER: OnceLock<LoginAttemptLimiter> = OnceLock::new();
-    LIMITER.get_or_init(LoginAttemptLimiter::default)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct AiCallCounter {
-    started: Instant,
-    attempts: u32,
-}
-
-#[derive(Default)]
-struct AiCallLimiter {
-    counters: Mutex<HashMap<String, AiCallCounter>>,
-}
-
-impl AiCallLimiter {
-    fn allow(&self, user_id: &str) -> bool {
-        let now = Instant::now();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        user_id.hash(&mut hasher);
-        let key = format!("{:016x}", hasher.finish());
-        let mut counters = self
-            .counters
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if counters.len() >= MAX_AI_CALL_IDENTITIES {
-            counters.retain(|_, counter| now.duration_since(counter.started) < AI_CALL_WINDOW);
-        }
-        if counters.len() >= MAX_AI_CALL_IDENTITIES {
-            return false;
-        }
-        let counter = counters.entry(key).or_insert(AiCallCounter {
-            started: now,
-            attempts: 0,
-        });
-        if now.duration_since(counter.started) >= AI_CALL_WINDOW {
-            *counter = AiCallCounter {
-                started: now,
-                attempts: 0,
-            };
-        }
-        if counter.attempts >= AI_CALLS_PER_ACCOUNT {
-            return false;
-        }
-        counter.attempts = counter.attempts.saturating_add(1);
-        true
-    }
-}
-
-fn ai_call_limiter() -> &'static AiCallLimiter {
-    static LIMITER: OnceLock<AiCallLimiter> = OnceLock::new();
-    LIMITER.get_or_init(AiCallLimiter::default)
-}
 
 #[derive(Debug, Serialize, ToSchema)]
 struct HealthResponse {
@@ -222,7 +117,7 @@ struct MetaResponse {
     /// Active rule-parameter configuration; may lag the compiled algorithm on
     /// an existing database until operators activate the new config.
     config_version: Option<String>,
-    /// SQLite schema migration version when storage is enabled.
+    /// PostgreSQL schema migration version when storage is enabled.
     schema_version: Option<i64>,
     /// Compile-time git SHA from `MPGS_BUILD_GIT_SHA`, or `unknown` for local builds.
     build_git_sha: &'static str,
@@ -772,7 +667,10 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let rate_limiter = Arc::new(RateLimiter::new(state.rate_limits.clone()));
+    let rate_limiter = Arc::new(RateLimiter::with_repository(
+        state.rate_limits.clone(),
+        state.repo.clone(),
+    ));
     let cors_config = Arc::new(state.cors.clone());
     let state = Arc::new(state);
     Router::new()
@@ -846,6 +744,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/v1/jobs/lease", post(lease_jobs))
         .route("/internal/v1/jobs/{job_id}/complete", post(complete_job))
         .route("/internal/v1/jobs/{job_id}/fail", post(fail_job))
+        .route(
+            "/internal/v1/maintenance",
+            post(crate::runtime::maintenance),
+        )
+        .route(
+            "/internal/v1/avatar-cleanup",
+            post(crate::runtime::avatar_cleanup),
+        )
+        .fallback(crate::runtime::web_fallback)
         // JSON endpoints are deliberately small. The avatar route overrides this
         // limit locally because encoded image uploads may be as large as 2 MiB.
         .layer(DefaultBodyLimit::max(64 * 1024))
@@ -854,6 +761,7 @@ pub fn build_router(state: AppState) -> Router {
             crate::rate_limit::middleware,
         ))
         .layer(middleware::from_fn(request_id_middleware))
+        .layer(middleware::from_fn(crate::runtime::request_deadline))
         .layer(middleware::from_fn_with_state(
             cors_config,
             crate::cors::middleware,
@@ -1228,17 +1136,29 @@ async fn login_account(
     headers: HeaderMap,
     Json(body): Json<LoginAccountBody>,
 ) -> Response {
-    if !login_attempt_limiter().allow(&body.username) {
-        return error_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
-            "too many login attempts; try again later",
-            None,
-        );
-    }
     let Some(repo) = require_repo(&state) else {
         return storage_disabled();
     };
+    let login_key = format!(
+        "login:{}",
+        hex_sha256(body.username.trim().to_ascii_lowercase().as_bytes())
+    );
+    match storage_result(repo, move |repo| {
+        repo.consume_http_limit(&[login_key], LOGIN_ATTEMPTS_PER_ACCOUNT, 10_000, 60)
+    })
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many login attempts; try again later",
+                None,
+            );
+        }
+        Err(error) => return map_storage_error(error, None),
+    }
     let preference_choice = match body.merge_preference.as_deref() {
         None => None,
         Some("anonymous") => Some(PreferenceChoice::Anonymous),
@@ -1468,14 +1388,12 @@ async fn delete_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Re
         Ok(account) => account,
         Err(response) => return *response,
     };
-    let avatar_dir = avatar_directory(repo);
     match storage_result(repo, move |repo| repo.delete_account(&account.user_id)).await {
         Ok(avatar) => {
-            if let Some(avatar) = avatar {
-                let _ = tokio::task::spawn_blocking(move || {
-                    remove_avatar_file(&avatar_dir, &avatar.storage_key)
-                })
-                .await;
+            if let Some(avatar) = avatar
+                && let Err(error) = state.avatar_storage.delete(&avatar.storage_key).await
+            {
+                tracing::warn!(%error, "account avatar deletion queued for retry");
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -1502,16 +1420,6 @@ async fn put_avatar(
     let account = match require_account(repo, &headers).await {
         Ok(account) => account,
         Err(response) => return *response,
-    };
-    let profile_user_id = account.user_id.clone();
-    let previous_storage_key = match storage_result(repo, move |repo| {
-        repo.account_profile(&profile_user_id)
-            .map(|profile| profile.avatar_storage_key)
-    })
-    .await
-    {
-        Ok(storage_key) => storage_key,
-        Err(error) => return map_account_error(error),
     };
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -1549,17 +1457,14 @@ async fn put_avatar(
         }
     };
     let content_hash = hex_sha256(&encoded);
-    // storage_key is UNIQUE globally. Content-hash alone collides when two
-    // accounts upload the same bytes; include a sanitized user id.
+    // Every upload gets a new object key. A delayed cleanup can therefore never
+    // delete an object that a later upload reused after the reference check.
     let storage_key = avatar_storage_key(&account.user_id, &content_hash);
-    let avatar_dir = avatar_directory(repo);
-    let write_dir = avatar_dir.clone();
-    let write_key = storage_key.clone();
-    if !matches!(
-        tokio::task::spawn_blocking(move || write_avatar_file(&write_dir, &write_key, &encoded))
-            .await,
-        Ok(Ok(()))
-    ) {
+    if let Err(error) = queue_uncommitted_avatar_cleanup(repo, &storage_key).await {
+        return map_storage_error(error, None);
+    }
+    if let Err(error) = state.avatar_storage.put(&storage_key, encoded).await {
+        tracing::warn!(%error, "avatar upload failed");
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "temporarily_unavailable",
@@ -1576,29 +1481,10 @@ async fn put_avatar(
     })
     .await
     {
-        Ok(profile) => {
-            if let Some(previous_storage_key) = previous_storage_key
-                && previous_storage_key != storage_key
-            {
-                let cleanup_dir = avatar_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    remove_avatar_file(&cleanup_dir, &previous_storage_key)
-                })
-                .await;
-            }
-            (StatusCode::OK, Json(account_profile_json(&profile))).into_response()
-        }
-        Err(error) => {
-            if previous_storage_key.as_deref() != Some(storage_key.as_str()) {
-                let cleanup_dir = avatar_dir.clone();
-                let cleanup_key = storage_key.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    remove_avatar_file(&cleanup_dir, &cleanup_key)
-                })
-                .await;
-            }
-            map_account_error(error)
-        }
+        Ok(profile) => (StatusCode::OK, Json(account_profile_json(&profile))).into_response(),
+        // The pre-upload cleanup job checks committed metadata before deletion,
+        // including when a database connection loses the commit acknowledgement.
+        Err(error) => map_account_error(error),
     }
 }
 
@@ -1617,18 +1503,16 @@ async fn delete_avatar(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         Ok(account) => account,
         Err(response) => return *response,
     };
-    let avatar_dir = avatar_directory(repo);
     match storage_result(repo, move |repo| {
         repo.delete_account_avatar_metadata(&account.user_id)
     })
     .await
     {
         Ok(avatar) => {
-            if let Some(avatar) = avatar {
-                let _ = tokio::task::spawn_blocking(move || {
-                    remove_avatar_file(&avatar_dir, &avatar.storage_key)
-                })
-                .await;
+            if let Some(avatar) = avatar
+                && let Err(error) = state.avatar_storage.delete(&avatar.storage_key).await
+            {
+                tracing::warn!(%error, "avatar deletion queued for retry");
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -1698,21 +1582,35 @@ async fn get_avatar(State(state): State<Arc<AppState>>, Path(avatar_id): Path<St
         Err(error) => return map_storage_error(error, None),
     };
     if let Some(storage_key) = lookup.storage_key {
-        let avatar_dir = avatar_directory(repo);
         let media_type = lookup.media_type.unwrap_or_else(|| "image/webp".to_owned());
-        match tokio::task::spawn_blocking(move || read_avatar_file(&avatar_dir, &storage_key)).await
-        {
-            Ok(Ok(bytes)) => {
-                return ([(header::CONTENT_TYPE, media_type)], bytes).into_response();
+        match state.avatar_storage.get(&storage_key).await {
+            Ok(Some(bytes)) => {
+                return (
+                    [
+                        (header::CONTENT_TYPE, media_type),
+                        (header::CACHE_CONTROL, "private, no-store".to_owned()),
+                    ],
+                    bytes,
+                )
+                    .into_response();
             }
-            Ok(Err(_)) | Err(_) => {
-                // A missing or corrupt file degrades to the deterministic default
-                // avatar without exposing storage details to callers.
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "avatar download failed");
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "avatar storage is unavailable",
+                    None,
+                );
             }
         }
     }
     (
-        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "private, no-store"),
+        ],
         default_avatar_svg(&lookup.display_name, &avatar_id),
     )
         .into_response()
@@ -1731,22 +1629,6 @@ fn avatar_url(public_id: &str, version: u32) -> String {
     format!("/v1/avatars/{public_id}?v={version}")
 }
 
-fn avatar_directory(repo: &Repository) -> PathBuf {
-    if let Ok(configured) = std::env::var("MPGS_AVATAR_DIR")
-        && !configured.trim().is_empty()
-    {
-        return PathBuf::from(configured);
-    }
-    let db_path = repo.database().path();
-    if db_path == FilePath::new(":memory:") {
-        return std::env::temp_dir().join("mpgs-avatars");
-    }
-    db_path
-        .parent()
-        .unwrap_or_else(|| FilePath::new("."))
-        .join("avatars")
-}
-
 fn avatar_storage_key(user_id: &str, content_hash: &str) -> String {
     let safe_user: String = user_id
         .chars()
@@ -1758,44 +1640,28 @@ fn avatar_storage_key(user_id: &str, content_hash: &str) -> String {
             }
         })
         .collect();
-    format!("{safe_user}_{content_hash}.webp")
+    format!("{safe_user}_{content_hash}_{:016x}.webp", getrandom_u64())
 }
 
-fn avatar_file_path(root: &FilePath, storage_key: &str) -> Result<PathBuf, String> {
-    if storage_key.is_empty()
-        || storage_key.len() > 160
-        || !storage_key.ends_with(".webp")
-        || !storage_key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        return Err("invalid avatar storage key".to_owned());
-    }
-    Ok(root.join(storage_key))
-}
-
-fn write_avatar_file(root: &FilePath, storage_key: &str, bytes: &[u8]) -> Result<(), String> {
-    let path = avatar_file_path(root, storage_key)?;
-    fs::create_dir_all(root).map_err(|error| error.to_string())?;
-    fs::write(path, bytes).map_err(|error| error.to_string())
-}
-
-fn read_avatar_file(root: &FilePath, storage_key: &str) -> Result<Vec<u8>, String> {
-    let path = avatar_file_path(root, storage_key)?;
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    if bytes.len() > 256 * 1024 {
-        return Err("avatar file exceeds expected processed size".to_owned());
-    }
-    Ok(bytes)
-}
-
-fn remove_avatar_file(root: &FilePath, storage_key: &str) -> Result<(), String> {
-    let path = avatar_file_path(root, storage_key)?;
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.to_string()),
-    }
+async fn queue_uncommitted_avatar_cleanup(
+    repo: &Repository,
+    storage_key: &str,
+) -> Result<(), StorageError> {
+    let storage_key = storage_key.to_owned();
+    storage_result(repo, move |repo| {
+        repo.enqueue_job(&EnqueueJob {
+            source: "avatar_cleanup".into(),
+            task_type: "delete_avatar".into(),
+            entity_key: storage_key.clone(),
+            priority: 10,
+            due_at_ms: repo.database().now_ms().saturating_add(60 * 60 * 1000),
+            idempotency_key: format!("avatar-upload-{}", hex_sha256(storage_key.as_bytes())),
+            payload_json: None,
+            max_attempts: 100,
+        })
+        .map(|_| ())
+    })
+    .await
 }
 
 fn sniff_avatar_image_format(raw: &[u8]) -> Option<ImageFormat> {
@@ -3725,7 +3591,7 @@ async fn natural_language_recommendations(
         query: raw_query,
         limit,
         custom_ai,
-        r#async: async_mode,
+        r#async: _async_mode,
         intent_delta,
     } = body;
     let Some(query) = normalized_ai_query(&raw_query) else {
@@ -3745,7 +3611,6 @@ async fn natural_language_recommendations(
             None,
         );
     }
-    let skip_rank_ai = async_mode.unwrap_or(false);
 
     let account_user_id = match state.repo.as_ref() {
         Some(repo) => optional_account_user_id(repo, &headers).await,
@@ -3945,24 +3810,18 @@ async fn natural_language_recommendations(
     // Prefer device-local multi-model custom router; otherwise built-in TaskRouter.
     let task_router = resolved_task_router(&resolved_ai, &state);
 
-    let enhance = if skip_rank_ai {
-        if resolved_ai.gateway.is_available() || task_router.is_some_and(|r| r.is_available()) {
-            AiEnhanceOutcome::pending("base ranking returned; AI enhancement is pending")
-        } else {
-            AiEnhanceOutcome::fallback(mpgs_ai::AiError::Disabled.fallback_reason())
-        }
-    } else {
-        enhance_natural_language_with_ai(
-            &resolved_ai.gateway,
-            task_router,
-            state.repo.as_ref(),
-            &cache_scope,
-            &query,
-            &mut items,
-            resolved_ai.admission.as_ref(),
-        )
-        .await
-    };
+    // Vercel may freeze a process immediately after its response. Complete all
+    // AI work inside the request, with a finite provider budget.
+    let enhance = enhance_natural_language_with_ai(
+        &resolved_ai.gateway,
+        task_router,
+        state.repo.as_ref(),
+        &cache_scope,
+        &query,
+        &mut items,
+        resolved_ai.admission.as_ref(),
+    )
+    .await;
     // Section feeds have already been diversified independently. Once their
     // candidates are unioned and AI has supplied its bounded numeric blend,
     // rebuild one global baseline and run MMR exactly once for the response.
@@ -4379,13 +4238,22 @@ async fn acquire_ai_call(
 ) -> Result<AccountAiPermit, AiAdmissionError> {
     let permit = admission
         .limiter
-        .try_acquire(&admission.user_id)
+        .try_acquire_shared(repo, &admission.user_id)
+        .await
+        .map_err(|_| AiAdmissionError::TemporarilyUnavailable)?
         .ok_or(AiAdmissionError::BudgetExhausted)?;
-    if !ai_call_limiter().allow(&admission.user_id) {
-        return Err(AiAdmissionError::BudgetExhausted);
+    let repo = repo.ok_or(AiAdmissionError::TemporarilyUnavailable)?;
+    let key = format!("ai:{}", hex_sha256(admission.user_id.as_bytes()));
+    match storage_result(repo, move |repo| {
+        repo.consume_http_limit(&[key], AI_CALLS_PER_ACCOUNT, 10_000, 60)
+    })
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Err(AiAdmissionError::BudgetExhausted),
+        Err(_) => return Err(AiAdmissionError::TemporarilyUnavailable),
     }
     if admission.charge_daily_quota {
-        let repo = repo.ok_or(AiAdmissionError::TemporarilyUnavailable)?;
         let user_id = admission.user_id.clone();
         let day_utc = chrono_like_now_ms() / 86_400_000;
         let daily_limit = admission.limiter.daily_budget();
@@ -4677,14 +4545,6 @@ impl AiEnhanceOutcome {
     fn fallback(reason: impl Into<String>) -> Self {
         Self {
             status: AiStatus::Fallback,
-            fallback_reason: Some(reason.into()),
-            ..Self::default()
-        }
-    }
-
-    fn pending(reason: impl Into<String>) -> Self {
-        Self {
-            status: AiStatus::Pending,
             fallback_reason: Some(reason.into()),
             ..Self::default()
         }
@@ -5242,20 +5102,24 @@ async fn run_rank_completion(
     task_router: Option<&TaskRouter>,
     request: StructuredRequest,
 ) -> Result<(mpgs_ai::StructuredResponse, bool, Vec<String>), AiError> {
-    if let Some(router) = task_router
-        && router.is_available()
-    {
-        let routed = router.structured_completion(request).await?;
-        return Ok((
-            routed.response,
-            routed.used_fallback,
-            routed.attempted_models,
-        ));
-    }
-    gateway
-        .structured_completion(request)
-        .await
-        .map(|response| (response, false, Vec::new()))
+    tokio::time::timeout(AI_OPERATION_TIMEOUT, async {
+        if let Some(router) = task_router
+            && router.is_available()
+        {
+            let routed = router.structured_completion(request).await?;
+            return Ok((
+                routed.response,
+                routed.used_fallback,
+                routed.attempted_models,
+            ));
+        }
+        gateway
+            .structured_completion(request)
+            .await
+            .map(|response| (response, false, Vec::new()))
+    })
+    .await
+    .map_err(|_| AiError::Timeout)?
 }
 
 fn new_analysis_id() -> String {
@@ -5275,12 +5139,9 @@ fn new_analysis_id() -> String {
 }
 
 fn getrandom_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        ^ std::process::id() as u64
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes).expect("operating-system randomness is required for object IDs");
+    u64::from_le_bytes(bytes)
 }
 
 #[derive(Debug, Deserialize)]
@@ -5332,7 +5193,8 @@ async fn ai_search(
         );
     }
 
-    // Progressive search: base ranking first without waiting for rank AI.
+    // Keep the existing async request field compatible, while retaining all
+    // provider work within this HTTP invocation.
     let nl_body = NaturalLanguageRequest {
         query: query.clone(),
         limit: Some(i64::from(output_limit)),
@@ -5371,10 +5233,8 @@ async fn ai_search(
         }
     };
 
-    // Progressive mode records an analysis_id so clients can poll enhancement
-    // without blocking the first paint. When async=false, the NL path already
-    // waited for AI and we still expose a completed analysis id when storage
-    // is available.
+    // Completed results remain available through the existing analysis polling
+    // endpoint, but no in-process job survives the originating request.
     let analysis_id = new_analysis_id();
     let ai_status = payload
         .get("ai_status")
@@ -5384,146 +5244,51 @@ async fn ai_search(
     let Some(repo) = state.repo.as_ref() else {
         return storage_disabled();
     };
-    let account_user_id = optional_account_user_id(repo, &headers).await;
-    let resolved_ai = account_ai_gateway(&state, account_user_id.as_deref()).await;
-    let cache_scope = account_user_id
-        .as_deref()
-        .map(|user_id| format!("account:{user_id}"))
-        .unwrap_or_else(|| "anonymous".to_owned());
-    {
-        let now_ms = chrono_like_now_ms();
-        let request_json = json!({ "query": query, "limit": output_limit }).to_string();
-        let base_result_json = payload.to_string();
-        let status_for_row = if body.r#async && ai_status == "used" {
-            // Enhancement already finished synchronously via NL path.
-            "used"
-        } else if body.r#async && matches!(ai_status.as_str(), "fallback" | "disabled") {
-            ai_status.as_str()
-        } else if body.r#async {
-            "pending"
-        } else {
-            ai_status.as_str()
-        };
-        let insert = mpgs_storage::InsertProgressiveAnalysis {
-            analysis_id: analysis_id.clone(),
-            task_type: "rank_explain".into(),
-            status: status_for_row.into(),
-            prompt_version: RANK_PROMPT_VERSION.into(),
-            input_hash: analysis_id.clone(),
-            preference_hash: String::new(),
-            data_snapshot_hash: String::new(),
-            request_json,
-            base_result_json: Some(base_result_json),
-            created_at_ms: now_ms,
-            expires_at_ms: now_ms.saturating_add(6 * 60 * 60 * 1000),
-        };
-        if let Err(error) =
-            storage_result(repo, move |repo| repo.insert_progressive_analysis(&insert)).await
-        {
-            return map_storage_error(error, None);
-        }
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("analysis_id".into(), json!(analysis_id));
-            if body.r#async && status_for_row == "pending" {
-                obj.insert("ai_status".into(), json!("pending"));
-            }
-        }
-        // Finish rank_explain in the background so the first paint never waits.
-        if body.r#async && status_for_row == "pending" {
-            let state_bg = state.clone();
-            let analysis_id_bg = analysis_id.clone();
-            let query_bg = query.clone();
-            let items_bg = payload.get("items").cloned().unwrap_or_else(|| json!([]));
-            let resolved_ai_bg = resolved_ai.clone();
-            let cache_scope_bg = cache_scope.clone();
-            tokio::spawn(async move {
-                enhance_progressive_analysis_in_background(
-                    state_bg,
-                    analysis_id_bg,
-                    query_bg,
-                    items_bg,
-                    resolved_ai_bg,
-                    cache_scope_bg,
-                )
-                .await;
-            });
-        }
-    }
-
-    Json(payload).into_response()
-}
-
-async fn enhance_progressive_analysis_in_background(
-    state: Arc<AppState>,
-    analysis_id: String,
-    query: String,
-    items_value: serde_json::Value,
-    resolved_ai: ResolvedAiGateway,
-    cache_scope: String,
-) {
-    let Some(repo) = state.repo.as_ref() else {
-        return;
-    };
-    let mut items = items_value.as_array().cloned().unwrap_or_default();
-    let router = resolved_task_router(&resolved_ai, &state);
-    let enhance = enhance_natural_language_with_ai(
-        &resolved_ai.gateway,
-        router,
-        Some(repo),
-        &cache_scope,
-        &query,
-        &mut items,
-        resolved_ai.admission.as_ref(),
-    )
-    .await;
     let now_ms = chrono_like_now_ms();
-    let provider_name = resolved_ai.gateway.provider_name().to_owned();
-    let result = json!({
-        "items": items,
-        "ai_status": enhance.status.as_str(),
-        "fallback_reason": enhance.fallback_reason,
-        "ai_summary": enhance.summary,
-        "ai_summary_evidence_ids": enhance.summary_evidence_ids,
-        "ai_provider": provider_name,
-        "ai_model": enhance.model,
-        "ai_protocol": enhance.protocol,
-        "ai_route_version": enhance.route_version,
-        "ai_used_model_fallback": enhance.used_model_fallback,
-        "ai_attempted_models": enhance.attempted_models,
-    });
-    let result_json = result.to_string();
-    let status = enhance.status.as_str().to_owned();
+    let result_json = payload.to_string();
+    let insert = mpgs_storage::InsertProgressiveAnalysis {
+        analysis_id: analysis_id.clone(),
+        task_type: "rank_explain".into(),
+        status: ai_status.clone(),
+        prompt_version: RANK_PROMPT_VERSION.into(),
+        input_hash: analysis_id.clone(),
+        preference_hash: String::new(),
+        data_snapshot_hash: String::new(),
+        request_json: json!({"query": query, "limit": output_limit}).to_string(),
+        base_result_json: Some(result_json.clone()),
+        created_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(6 * 60 * 60 * 1000),
+    };
+    let text_field = |name: &str| {
+        payload
+            .get(name)
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    };
     let update = mpgs_storage::CompleteProgressiveAnalysis {
         analysis_id: analysis_id.clone(),
-        status,
-        provider: Some(provider_name),
-        model: enhance.model.clone(),
-        protocol: enhance.protocol.clone(),
-        route_version: enhance.route_version.or_else(|| {
-            router.map(|router| router.route_version(AiTaskType::RankExplain).to_owned())
-        }),
+        status: ai_status,
+        provider: text_field("ai_provider"),
+        model: text_field("ai_model"),
+        protocol: text_field("ai_protocol"),
+        route_version: text_field("ai_route_version"),
         result_json: Some(result_json),
-        error_category: enhance
-            .fallback_reason
-            .as_ref()
-            .map(|_| "ai_fallback".into()),
-        fallback_reason: enhance.fallback_reason,
+        error_category: text_field("fallback_reason").map(|_| "ai_fallback".into()),
+        fallback_reason: text_field("fallback_reason"),
         completed_at_ms: now_ms,
     };
     if let Err(error) = storage_result(repo, move |repo| {
+        repo.insert_progressive_analysis(&insert)?;
         repo.complete_progressive_analysis(&update)
     })
     .await
     {
-        tracing::warn!(%analysis_id, %error, "progressive AI enhancement persistence failed");
-    } else {
-        tracing::info!(
-            %analysis_id,
-            status = enhance.status.as_str(),
-            model = ?enhance.model,
-            "progressive AI enhancement completed"
-        );
+        return map_storage_error(error, None);
     }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("analysis_id".into(), json!(analysis_id));
+    }
+    Json(payload).into_response()
 }
 
 async fn get_ai_analysis(
@@ -5742,14 +5507,9 @@ async fn ai_compare(
         };
         match acquire_ai_call(Some(repo), admission).await {
             Ok(_permit) => {
-                let completion = if let Some(router) = task_router {
-                    router
-                        .structured_completion(request)
-                        .await
-                        .map(|r| r.response)
-                } else {
-                    resolved_ai.gateway.structured_completion(request).await
-                };
+                let completion = run_rank_completion(&resolved_ai.gateway, task_router, request)
+                    .await
+                    .map(|(response, _, _)| response);
                 match completion {
                     Ok(response) => {
                         match parse_compare_explanation(
@@ -6077,14 +5837,9 @@ async fn ai_group_advice(
         };
         match acquire_ai_call(state.repo.as_ref(), admission).await {
             Ok(_permit) => {
-                let completion = if let Some(router) = task_router {
-                    router
-                        .structured_completion(structured)
-                        .await
-                        .map(|r| r.response)
-                } else {
-                    resolved_ai.gateway.structured_completion(structured).await
-                };
+                let completion = run_rank_completion(&resolved_ai.gateway, task_router, structured)
+                    .await
+                    .map(|(response, _, _)| response);
                 match completion {
                     Ok(response) => {
                         match parse_group_advice(
@@ -6635,11 +6390,9 @@ async fn try_ai_intent_parse(
     };
     let admission = admission?;
     let _permit = acquire_ai_call(repo, admission).await.ok()?;
-    let response = if router.is_available() {
-        router.structured_completion(request).await.ok()?.response
-    } else {
-        gateway.structured_completion(request).await.ok()?
-    };
+    let (response, _, _) = run_rank_completion(gateway, Some(router), request)
+        .await
+        .ok()?;
     let ai = parse_structured_intent(&response.content).ok()?;
     Some(merge_intent_with_rules(ai, &baseline))
 }
@@ -8305,6 +8058,9 @@ mod tests {
         AppState {
             repo: None,
             admin_token: None,
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits: RateLimitConfig {
                 enabled: false,
                 ..RateLimitConfig::default()

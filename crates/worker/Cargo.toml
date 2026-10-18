@@ -1,0 +1,13 @@
+[package]
+name = "mpgs-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+mpgs-steam-source = { path = "../steam-source" }
+mpgs-storage = { path = "../storage" }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

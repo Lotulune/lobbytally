@@ -1,6 +1,7 @@
 name: CI
 
-# Default path is cheap (Linux web + rust quality + Linux x64 build).
+# Documentation-only changes run CI routing and the stable CI result check.
+# Other changes run web, Rust quality, Linux x64 and the Vercel container build.
 # Full multi-platform / desktop smoke / E2E only on:
 #   - workflow_dispatch with full=true
 #   - tags matching v*
@@ -8,6 +9,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
     inputs:
@@ -29,8 +32,36 @@ env:
   MPGS_BUILD_GIT_SHA: ${{ github.sha }}
 
 jobs:
+  route:
+    name: CI routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_checks: ${{ steps.route.outputs.run_checks }}
+      run_full: ${{ steps.route.outputs.run_full }}
+      reason: ${{ steps.route.outputs.reason }}
+    steps:
+      - name: Check out complete history for change detection
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Test CI routing and result policy
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
+
+      - name: Determine required checks
+        id: route
+        run: python3 scripts/ci/route.py route
+
   web:
     name: Web test and build
+    needs: route
+    # Existing required-check names must not silently skip if routing fails.
+    if: >-
+      ${{ !cancelled() && !(needs.route.result == 'success' &&
+      needs.route.outputs.run_checks == 'false' &&
+      needs.route.outputs.run_full == 'false' &&
+      needs.route.outputs.reason == 'documentation_only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -58,13 +89,33 @@ jobs:
 
   quality:
     name: Format, test, and lint
+    needs: route
+    if: >-
+      ${{ !cancelled() && !(needs.route.result == 'success' &&
+      needs.route.outputs.run_checks == 'false' &&
+      needs.route.outputs.run_full == 'false' &&
+      needs.route.outputs.reason == 'documentation_only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      MPGS_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Test deployment scripts
+      - name: Test retained legacy deployment scripts
         run: |
           sh deploy/tests/materialize-release-compose.sh
           sh deploy/tests/deployment-healthcheck-retry.sh
@@ -80,14 +131,20 @@ jobs:
         run: cargo +1.97.0 fmt --all -- --check
 
       - name: Run tests
-        run: cargo +1.97.0 test --workspace --locked
+        run: cargo +1.97.0 test --workspace --locked -- --test-threads=4
 
       - name: Run Clippy
         run: cargo +1.97.0 clippy --workspace --all-targets --locked -- -D warnings
 
-  # Always: one Linux release package smoke (covers packaging script).
+  # Code/config changes: one Linux release build.
   build-linux:
     name: Build Linux x64
+    needs: route
+    if: >-
+      ${{ !cancelled() && !(needs.route.result == 'success' &&
+      needs.route.outputs.run_checks == 'false' &&
+      needs.route.outputs.run_full == 'false' &&
+      needs.route.outputs.reason == 'documentation_only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -100,24 +157,23 @@ jobs:
       - name: Build release binaries
         run: cargo +1.97.0 build --workspace --release --locked --target x86_64-unknown-linux-gnu
 
-      - name: Build traceable server package
-        shell: pwsh
-        run: ./scripts/package_server.ps1 -OutDir dist -Target x86_64-unknown-linux-gnu -SkipBuild
-
-      - name: Upload traceable server package
+      - name: Upload native development tools
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mpgs-linux-x64
-          path: dist/mpgs-server-*/
+          path: |
+            target/x86_64-unknown-linux-gnu/release/mpgs-server
+            target/x86_64-unknown-linux-gnu/release/mpgs-dbtool
           if-no-files-found: error
           retention-days: 14
 
   # Expensive multi-arch / multi-OS builds — manual full CI or version tags only.
   build:
     name: Build ${{ matrix.name }}
+    needs: route
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.full == true) ||
-      startsWith(github.ref, 'refs/tags/v')
+      ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && inputs.full == true) ||
+      startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     strategy:
@@ -146,23 +202,22 @@ jobs:
       - name: Build release binaries
         run: cargo +1.97.0 build --workspace --release --locked --target ${{ matrix.target }}
 
-      - name: Build traceable server package
-        shell: pwsh
-        run: ./scripts/package_server.ps1 -OutDir dist -Target ${{ matrix.target }} -SkipBuild
-
-      - name: Upload traceable server package
+      - name: Upload native development tools
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact }}
-          path: dist/mpgs-server-*/
+          path: |
+            target/${{ matrix.target }}/release/mpgs-server*
+            target/${{ matrix.target }}/release/mpgs-dbtool*
           if-no-files-found: error
           retention-days: 14
 
   desktop-smoke:
     name: Tauri bundle smoke (${{ matrix.name }})
+    needs: route
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.full == true) ||
-      startsWith(github.ref, 'refs/tags/v')
+      ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && inputs.full == true) ||
+      startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     strategy:
@@ -209,11 +264,14 @@ jobs:
 
   desktop-e2e:
     name: Native desktop E2E (${{ matrix.name }})
+    needs: route
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.full == true) ||
-      startsWith(github.ref, 'refs/tags/v')
+      ${{ !cancelled() && ((github.event_name == 'workflow_dispatch' && inputs.full == true) ||
+      startsWith(github.ref, 'refs/tags/v')) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      MPGS_TEST_DATABASE_URL: postgresql://lobbytally_test@127.0.0.1:5432/postgres?sslmode=disable
     strategy:
       fail-fast: false
       matrix:
@@ -225,6 +283,11 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Prepare isolated PostgreSQL test service
+        uses: ankane/setup-postgres@b1a598d92f86cb2ed364411898d150d4eac6d5ca # v1
+        with:
+          user: lobbytally_test
 
       - name: Install Linux WebDriver dependencies
         if: runner.os == 'Linux'
@@ -265,8 +328,8 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build seeded API server
-        run: cargo +1.97.0 build -p mpgs-server --locked
+      - name: Build API server and fixture tool
+        run: cargo +1.97.0 build -p mpgs-server -p mpgs-dbtool --locked
 
       - name: Build native Tauri test application
         run: pnpm exec tauri build --config apps/desktop/src-tauri/tauri.conf.json --config apps/desktop/src-tauri/tauri.e2e.conf.json --ci --no-sign --debug --no-bundle
@@ -288,48 +351,29 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  release_scope:
-    name: Detect production runtime changes
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  cloud-container:
+    name: Build Vercel container
+    needs: [route, web, quality]
+    if: ${{ !cancelled() && needs.web.result == 'success' && needs.quality.result == 'success' }}
     runs-on: ubuntu-latest
-    outputs:
-      runtime_changed: ${{ steps.scope.outputs.runtime_changed }}
+    timeout-minutes: 45
     steps:
-      - name: Check out repository history
+      - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 2
+      - name: Validate production container build
+        run: docker build --file Dockerfile.vercel --tag lobbytally-cloud:check .
 
-      - name: Classify changed paths
-        id: scope
+  ci-result:
+    name: CI result
+    if: always()
+    needs: [route, web, quality, build-linux, build, desktop-smoke, desktop-e2e, cloud-container]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out result policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Require successful checks for the selected route
         env:
-          BEFORE_SHA: ${{ github.event.before }}
-          RELEASE_SHA: ${{ github.sha }}
-        run: |
-          runtime_changed=$(sh scripts/release_scope_from_git.sh "$BEFORE_SHA" "$RELEASE_SHA")
-          case "$runtime_changed" in
-            true|false) ;;
-            *)
-              printf 'Invalid release-scope result: %s\n' "$runtime_changed" >&2
-              exit 1
-              ;;
-          esac
-          printf 'runtime_changed=%s\n' "$runtime_changed" | tee -a "$GITHUB_OUTPUT"
-
-  publish-containers:
-    name: Publish paired production containers
-    if: >-
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' &&
-      needs.release_scope.outputs.runtime_changed == 'true'
-    needs:
-      - release_scope
-      - web
-      - quality
-      - build-linux
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/container-images.yml
-    with:
-      release_sha: ${{ github.sha }}
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: python3 scripts/ci/route.py result

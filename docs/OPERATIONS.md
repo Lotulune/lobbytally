@@ -1,5 +1,7 @@
 # MPGS 运维手册（M6）
 
+本页保留 SQLite 单机版本的运维记录。当前代码的部署、调度、头像存储及验收流程见 [Vercel + Supabase 部署指南](VERCEL_SUPABASE.md)。
+
 面向单节点 MVP：一个 `mpgs-server` 进程 + 本机 SQLite。数据库文件不得放在网络共享或同步盘上。
 
 ## 1. 组件
@@ -227,12 +229,15 @@ image ID 临时标记为标准回滚镜像引用后自动重启，避免依赖�
 完整部署成功切换后 updater 会输出实测 `Public cutover window`
 秒数，生产验收应记录该值而不是用整个 update service 运行时长代替用户可见停机时间。
 
-main 分支仍对每次 push 执行常规 CI，但 `release-main` 只在生产 runtime 路径发生变化时
-才构建并推进。`scripts/release_scope.sh` 对文档、CI/测试、桌面/E2E、打包脚本和仅供人工
-安装的 host 示例配置进行明确豁免；任何未分类的新路径默认视为生产变更，以避免漏发。
-Git 比较显式关闭 rename detection，从而同时检查重命名前后的路径；历史抓取、diff 或分类
-发生异常时也统一回退为“需要发布”。因此纯测试/文档提交不会再触发无意义的 GHCR 重建
-和公网切换，同时分类器自身故障不会静默吞掉真实生产发布。
+历史 GHCR 发布流程通过 `scripts/release_scope.sh` 判断是否需要推进 `release-main`：
+文档、CI/测试、桌面/E2E、打包脚本和仅供人工安装的 host 示例配置被明确豁免，未分类路径
+则视为 runtime 变化。Git 比较关闭 rename detection，以同时检查重命名前后的路径；
+历史抓取、diff 或分类失败时回退为“需要发布”。这些分类器及对应的
+`deploy/tests/release-scope.sh` 保留作为旧流程的回归工具，不参与当前生产发布。
+
+当前 GitHub CI 由 `scripts/ci/route.py` 执行文档分流，并继续验证保留的旧部署脚本；
+工作流不再构建或推进 GHCR 发布指针，也不触发 VPS 切换。当前发布使用
+[Vercel + Supabase 流程](VERCEL_SUPABASE.md)。
 
 PR 2 镜像部署并稳定观察新游入库至少 24 小时后，先保持所有应用 writer 停止并验证
 最新备份，再从同一 immutable server 镜像运行存量清理 dry-run：

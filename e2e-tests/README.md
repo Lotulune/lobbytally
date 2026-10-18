@@ -10,6 +10,8 @@ Prerequisites:
 - `tauri-driver` 2.0.6
 - Windows: a Microsoft EdgeDriver matching the installed Edge version
 - Linux: `webkit2gtk-driver` and `xvfb`
+- Local PostgreSQL 17 with a test role permitted to create databases; set
+  `MPGS_TEST_DATABASE_URL` to its loopback connection URL.
 
 From the repository root:
 
@@ -25,11 +27,18 @@ Linux runs the last command through a virtual display:
 xvfb-run -a pnpm desktop:e2e
 ```
 
-The runner starts `mpgs-server` against a unique temporary SQLite database with
-the deterministic demo seed, sets `MPGS_CLIENT_DATA_DIR` to isolate the desktop
-SQLite state, and stops both processes after the suite. Successful layout
+The runner uses `mpgs-dbtool e2e-fixture` to create, migrate, and seed a unique
+PostgreSQL test database, then starts `mpgs-server` against that database. It
+sets `MPGS_CLIENT_DATA_DIR` to isolate desktop client state and stops both
+processes after the suite. The database is dropped after the server stops,
+including failed runs. Fixture commands accept only loopback PostgreSQL and
+generated `mpgs_e2e_` database names. Successful layout
 screenshots, failure screenshots, and process logs are written under
 `e2e-tests/artifacts/`.
+
+AI providers are disabled for deterministic fallback assertions. This suite
+does not exercise avatar upload; its Storage origin is a reserved `.invalid`
+hostname and no Supabase credentials are needed.
 
 The E2E build merges `tauri.e2e.conf.json`, which enables WebView2's ephemeral
 remote-debugging port for EdgeDriver. Production builds use only

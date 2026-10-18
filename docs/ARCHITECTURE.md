@@ -10,7 +10,7 @@ MVP 的首要目标是边界清晰、可回退和跨平台，而不是主动引�
 
 - 服务端必须可构建为 Windows/Linux 的 `x86_64` 与 `aarch64` 产物。
 - 客户端目标为 Windows/Linux/macOS；Android 是后续目标。
-- 权威数据库使用 SQLite，数据库文件与访问它的服务进程同机。
+- 权威数据库使用 Supabase PostgreSQL；Vercel 实例不保存持久数据库文件。
 - Steam Web API Key、内置 AI Key 和内部管理凭据不能进入客户端；用户自定义 AI Key 属于设备本地凭据，只在单次自定义调用时临时传输，不进入服务端持久化层。
 - 推荐必须在 AI 不可用时保持完整的基础功能。
 - 所有外部数据都带来源、抓取时间和可信度。
@@ -21,15 +21,16 @@ MVP 的首要目标是边界清晰、可回退和跨平台，而不是主动引�
 flowchart LR
     User["用户"] --> Desktop["Tauri 桌面客户端"]
     Admin["内部维护人员"] --> AdminUI["管理界面"]
-    Desktop -->|"HTTPS JSON"| Server["MPGS Server"]
+    Desktop -->|"HTTPS JSON"| Server["Vercel Rust API"]
     AdminUI -->|"HTTPS 管理 API"| Server
     Server --> Steam["Steam 官方接口/商店适配器"]
     Server --> AI["AI 与 Embedding API"]
-    Server --> DB["本机 SQLite"]
-    Collector["可选远程采集节点"] -->|"幂等任务 API"| Server
+    Server --> DB["Supabase PostgreSQL"]
+    Server --> Files["Supabase 私有 Storage"]
+    Cron["Supabase Cron + Vault"] -->|"带独立密钥的有限批次请求"| Server
 ```
 
-客户端永远不连接权威 SQLite。远程采集器和 AI Worker 也不直接打开数据库文件。
+客户端通过 API 访问权威数据。数据库连接和 Storage 服务密钥仅保存在 Vercel 服务端；任务游标和租约持久化到 PostgreSQL。
 
 ## 4. 逻辑组件
 
@@ -43,14 +44,14 @@ flowchart TB
         Bridge --> Cache
     end
 
-    subgraph Server["MPGS Server"]
+    subgraph Server["Vercel Rust API"]
         API["Axum API"]
         Auth["匿名会话/管理鉴权"]
         Catalog["目录查询"]
         Ranker["确定性推荐器"]
         AIGateway["AI Gateway"]
         Retrieval["SQL + FTS + Vector 检索"]
-        Scheduler["调度器"]
+        Scheduler["Cron 触发的有限批次"]
         Ingest["数据采集与规范化"]
         Curation["人工校正"]
         Storage["Storage Repository"]
@@ -69,7 +70,7 @@ flowchart TB
     end
 
     Bridge -->|"HTTPS"| API
-    Storage --> DB["SQLite + FTS5"]
+    Storage --> DB["Supabase PostgreSQL + pg_trgm/全文检索"]
 ```
 
 ### 4.1 桌面客户端
@@ -121,7 +122,7 @@ MVP 不引入独立 API Gateway 产品，Axum 服务本身承担入口职责。
 
 普通 Feed 不调用 AI。`rules-0.3` 的通用自然语言请求先从已同步的 FTS/向量索引取得最多 300 个 RRF AppID，再从四分区完整排名集合中准入仍通过资格、请求硬条件和负反馈过滤的命中；严格相关性补足去重联合池到最多 300。显式分区请求保持单区范围。可选 AI 只做最多 15% 的数值融合，随后统一执行一次全局 MMR；内部 Feed 不落归因 run，最终响应只保存一个自然语言 run。
 
-推荐器是纯 Rust 领域组件，不依赖 Axum、SQLite 或具体 AI SDK，便于离线测试和多平台复用。
+推荐器是纯 Rust 领域组件，不依赖 Axum、数据库驱动或具体 AI SDK，便于离线测试和多平台复用。
 
 ### 4.5 AI Gateway
 
@@ -152,12 +153,13 @@ apps/
 crates/
   domain/                 AppID、分区、特征、API 无关领域类型
   recommender/            候选评分、个性化、解释和黄金测试
-  storage/                Repository trait、SQLite 实现、迁移
+  storage/                PostgreSQL Repository、共享租约、迁移
+  worker/                 有限批次采集与维护
   steam-source/           Steam 接口、限流和规范化
   retrieval/              SQL/FTS/向量混合检索
   ai/                     Provider、工具、结构化验证和缓存
   api-contract/           OpenAPI DTO 与错误模型
-migrations/               SQLite 迁移
+supabase/migrations/      PostgreSQL 与 Supabase 平台迁移
 web/                      React/TypeScript UI
 docs/                     规格与决策
 ```
@@ -168,39 +170,21 @@ docs/                     规格与决策
 
 ## 6. 部署模型
 
-### 6.1 MVP 单节点模式
+### 6.1 Vercel + Supabase
 
-一个 `mpgs-server` 进程包含 API、调度、采集、推荐和 AI Gateway，使用一个本机 SQLite 数据库。可通过进程角色开关禁用调度器，但同一数据库仍只有一个权威写入服务。
+前端与 Rust/Axum API 由 `Dockerfile.vercel` 构建为 Vercel 容器函数。实例无流量时可缩容；数据库、头像、任务游标及共享限流状态均放在 Supabase。当前数据库从空库初始化，不导入历史 SQLite 数据。
 
-推荐运行方式：
+PostgreSQL 连接使用小型连接池，经 Supabase Session pooler 或直接连接访问私有 `mpgs` schema。账号体系与现有 API 契约保持一致，浏览器不直接访问数据库表。
 
-- Windows：WinSW 托管的 Windows Service（模板 `packaging/windows/`）。
-- Linux：systemd service（单元文件 `packaging/linux/mpgs-server.service`）。
-- 数据目录、日志目录和密钥目录与可执行文件分离；环境模板见 `packaging/common/mpgs.env.example`。
-- 监听地址默认仅本机；正式部署由 HTTPS 反向代理或内建 TLS 终止层暴露。
-- 发布布局由 `scripts/package_server.ps1` 生成，含 `PROVENANCE.json` 与 `SHA256SUMS.txt`（见 [OPERATIONS.md](OPERATIONS.md)）。
+### 6.2 定时采集和维护
 
-服务端部署可选择只运行 API + worker 的 `backend` 模式，也可选择额外提供浏览器 UI 的 `full` 模式。两种模式共享 API 契约与同机 SQLite；Web UI 和桌面客户端都不是后端运行依赖。
+Supabase Cron 使用 Vault 中的独立密钥调用内部 HTTP 端点。每次采集默认为 45 秒预算，保存分页游标和任务阶段后返回。数据库租约阻止重复批次并发执行；中断任务在租约到期后恢复。头像退休清理使用独立调度，避免与采集共享一次请求的时长预算。
 
-### 6.2 可选采集节点
+API 不在启动时运行迁移或常驻调度器，AI 操作在有时限的请求内完成。空库先通过健康检查，再由采集批次逐步填充目录。
 
-远程采集节点用于分散外部网络请求或验证不同平台，但不持有数据库：
+### 6.3 部署与验证
 
-1. 通过内部 API 领取带租约的任务。
-2. 请求外部源并提交原始响应哈希、状态和规范化候选。
-3. 主服务校验幂等键后写入 SQLite。
-4. 租约超时后任务可安全重派。
-
-### 6.3 扩展边界
-
-以下需求出现时迁移 PostgreSQL，而不是把 SQLite 放在网络文件系统：
-
-- 两台以上服务同时写入同一权威数据集。
-- 写入排队影响前台 P95。
-- 需要数据库级自动故障转移或读副本。
-- 向量数据达到独立 ANN 服务更适合的规模。
-
-Repository 边界应使迁移不改变领域和 API 层。
+完整设置及上线验收见 [Vercel + Supabase 部署指南](VERCEL_SUPABASE.md)。本地数据库测试使用独立 PostgreSQL 测试库及隔离 schema；云端平台扩展、Vault、Storage 和 Cron 需要在目标 Supabase 项目验收。
 
 ## 7. 目标平台
 

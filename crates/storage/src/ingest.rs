@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use rusqlite::params;
-use rusqlite::{Connection, OptionalExtension};
+use crate::pg::params;
+use crate::pg::{Connection, OptionalExtension};
 
 use mpgs_steam_source::{
     APP_LIST_ADAPTER_VERSION, APP_LIST_SOURCE_NAME, AppCatalogProposal, AppListPage,
@@ -42,7 +42,7 @@ pub fn ingest_app_catalog(
     );
     conn.execute(
         "INSERT INTO app_media (app_id, capsule_url, source, updated_at_ms)
-         VALUES (?1, ?2, 'steam_catalog', ?3)
+         VALUES ($1, $2, 'steam_catalog', $3)
          ON CONFLICT(app_id) DO UPDATE SET
              capsule_url = excluded.capsule_url,
              source = excluded.source,
@@ -66,7 +66,7 @@ pub fn ingest_app_list_page(
         "INSERT INTO source_documents (
             source, entity_type, entity_key, content_type, content_hash,
             content_text, fetched_at_ms, parse_version
-         ) VALUES (?1, 'app_list_page', ?2, 'application/json', ?3, NULL, ?4, ?5)",
+         ) VALUES ($1, 'app_list_page', $2, 'application/json', $3, NULL, $4, $5)",
         params![
             APP_LIST_SOURCE_NAME,
             format!(
@@ -98,11 +98,22 @@ pub fn ingest_review_summary(
     )?;
     let wilson = wilson_lower_bound(proposal.total_positive, proposal.total_reviews);
     conn.execute(
-        "INSERT OR REPLACE INTO review_snapshots (
+        "INSERT INTO review_snapshots (
             app_id, region_scope, language_scope, captured_at_ms,
             total_positive, total_negative, total_reviews, review_score, review_score_desc,
             wilson_lower, filter_offtopic_activity, parameter_hash, content_hash, source
-         ) VALUES (?1, 'all', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         ) VALUES ($1, 'all', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         ON CONFLICT(app_id, region_scope, language_scope, captured_at_ms) DO UPDATE SET
+             total_positive = excluded.total_positive,
+             total_negative = excluded.total_negative,
+             total_reviews = excluded.total_reviews,
+             review_score = excluded.review_score,
+             review_score_desc = excluded.review_score_desc,
+             wilson_lower = excluded.wilson_lower,
+             filter_offtopic_activity = excluded.filter_offtopic_activity,
+             parameter_hash = excluded.parameter_hash,
+             content_hash = excluded.content_hash,
+             source = excluded.source",
         params![
             proposal.app_id,
             proposal.language_scope,
@@ -138,7 +149,7 @@ pub fn ingest_popular_reviews(
         now_ms,
     )?;
     conn.execute(
-        "DELETE FROM popular_reviews WHERE app_id = ?1",
+        "DELETE FROM popular_reviews WHERE app_id = $1",
         params![proposal.app_id],
     )?;
     for (index, review) in proposal.reviews.iter().take(10).enumerate() {
@@ -149,8 +160,8 @@ pub fn ingest_popular_reviews(
                 playtime_forever_minutes, playtime_at_review_minutes, created_at_s, updated_at_s,
                 steam_purchase, received_for_free, written_during_early_access,
                 parameter_hash, content_hash, source, captured_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                       ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                       $14, $15, $16, $17, $18, $19, $20, $21, $22)",
             params![
                 proposal.app_id,
                 review.recommendation_id,
@@ -179,7 +190,7 @@ pub fn ingest_popular_reviews(
     }
     conn.execute(
         "INSERT INTO popular_review_refresh_state(app_id, captured_at_ms, result_count, source)
-         VALUES (?1, ?2, ?3, ?4)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT(app_id) DO UPDATE SET
              captured_at_ms = excluded.captured_at_ms,
              result_count = excluded.result_count,
@@ -202,10 +213,17 @@ pub fn ingest_ccu(conn: &Connection, proposal: &CcuProposal, now_ms: i64) -> Sto
         now_ms,
     )?;
     conn.execute(
-        "INSERT OR REPLACE INTO player_snapshots (
+        "INSERT INTO player_snapshots (
             app_id, captured_at_ms, player_count, result_code, missing_reason,
             content_hash, source, offline_players_excluded
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT(app_id, captured_at_ms) DO UPDATE SET
+             player_count = excluded.player_count,
+             result_code = excluded.result_code,
+             missing_reason = excluded.missing_reason,
+             content_hash = excluded.content_hash,
+             source = excluded.source,
+             offline_players_excluded = excluded.offline_players_excluded",
         params![
             proposal.app_id,
             now_ms,
@@ -271,7 +289,7 @@ pub fn ingest_store_details(
              app_id, country_code, language, captured_at_ms, status, source,
              checked_empty, store_core_empty, price_empty,
              store_checked_at_ms, price_checked_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, 'succeeded', ?5, ?6, ?7, ?8, ?4, ?4)
+         ) VALUES ($1, $2, $3, $4, 'succeeded', $5, $6, $7, $8, $4, $4)
          ON CONFLICT(app_id, country_code, language) DO UPDATE SET
              captured_at_ms = excluded.captured_at_ms,
              status = excluded.status,
@@ -304,7 +322,7 @@ pub fn ingest_store_details(
     if let Some(header_image_url) = details.header_image_url.as_deref() {
         conn.execute(
             "INSERT INTO app_media (app_id, capsule_url, source, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT(app_id) DO UPDATE SET
                  capsule_url = excluded.capsule_url,
                  source = excluded.source,
@@ -318,9 +336,9 @@ pub fn ingest_store_details(
     if details.release_date_observed {
         conn.execute(
             "UPDATE apps
-             SET release_date = ?1, release_date_raw = ?2, release_date_precision = ?3,
-                 updated_at_ms = ?4
-             WHERE app_id = ?5",
+             SET release_date = $1, release_date_raw = $2, release_date_precision = $3,
+                 updated_at_ms = $4
+             WHERE app_id = $5",
             params![
                 details.release_date,
                 details.release_date_raw,
@@ -342,7 +360,7 @@ pub fn ingest_store_details(
             "INSERT INTO release_events (
                 app_id, old_release_date, new_release_date, old_precision, new_precision,
                 old_release_state, new_release_state, source, observed_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             params![
                 details.app_id,
                 prev.release_date.or(prev.release_date_raw),
@@ -479,11 +497,18 @@ pub fn ingest_store_details(
 
     if let Some(price) = &details.price {
         conn.execute(
-            "INSERT OR REPLACE INTO price_snapshots (
+            "INSERT INTO price_snapshots (
                 app_id, country_code, currency, captured_at_ms,
                 initial_price_minor, final_price_minor, discount_percent,
                 is_purchasable, package_id, source
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT(app_id, country_code, currency, captured_at_ms) DO UPDATE SET
+                 initial_price_minor = excluded.initial_price_minor,
+                 final_price_minor = excluded.final_price_minor,
+                 discount_percent = excluded.discount_percent,
+                 is_purchasable = excluded.is_purchasable,
+                 package_id = excluded.package_id,
+                 source = excluded.source",
             params![
                 details.app_id,
                 price.country_code,
@@ -516,7 +541,7 @@ fn replace_app_media_assets(
 ) -> StorageResult<()> {
     if let Some(screenshots) = details.screenshots.as_ref() {
         conn.execute(
-            "DELETE FROM app_media_assets WHERE app_id = ?1 AND kind = 'screenshot'",
+            "DELETE FROM app_media_assets WHERE app_id = $1 AND kind = 'screenshot'",
             params![details.app_id],
         )?;
         for shot in screenshots {
@@ -525,7 +550,7 @@ fn replace_app_media_assets(
                      app_id, kind, source_id, sort_order, title,
                      thumbnail_url, full_url, mp4_url, hls_h264_url, dash_h264_url,
                      is_highlight, source, updated_at_ms
-                 ) VALUES (?1, 'screenshot', ?2, ?3, NULL, ?4, ?5, NULL, NULL, NULL, 0, ?6, ?7)",
+                 ) VALUES ($1, 'screenshot', $2, $3, NULL, $4, $5, NULL, NULL, NULL, 0, $6, $7)",
                 params![
                     details.app_id,
                     shot.source_id,
@@ -540,7 +565,7 @@ fn replace_app_media_assets(
     }
     if let Some(movies) = details.movies.as_ref() {
         conn.execute(
-            "DELETE FROM app_media_assets WHERE app_id = ?1 AND kind = 'movie'",
+            "DELETE FROM app_media_assets WHERE app_id = $1 AND kind = 'movie'",
             params![details.app_id],
         )?;
         for movie in movies {
@@ -549,7 +574,7 @@ fn replace_app_media_assets(
                      app_id, kind, source_id, sort_order, title,
                      thumbnail_url, full_url, mp4_url, hls_h264_url, dash_h264_url,
                      is_highlight, source, updated_at_ms
-                 ) VALUES (?1, 'movie', ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 ) VALUES ($1, 'movie', $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10, $11)",
                 params![
                     details.app_id,
                     movie.source_id,
@@ -648,7 +673,7 @@ fn materialize_store_category_profile(
 
     conn.execute(
         "INSERT INTO multiplayer_profiles (app_id, computed_at_ms)
-         VALUES (?1, ?2) ON CONFLICT(app_id) DO NOTHING",
+         VALUES ($1, $2) ON CONFLICT(app_id) DO NOTHING",
         params![app_id, now_ms],
     )?;
     let mut applied = false;
@@ -672,10 +697,10 @@ fn materialize_store_category_profile(
         )?;
         if !has_active_override(conn, app_id, feature)? {
             let sql = format!(
-                "UPDATE multiplayer_profiles SET {column} = 1, computed_at_ms = ?1
-                 WHERE app_id = ?2 AND (
+                "UPDATE multiplayer_profiles SET {column} = 1, computed_at_ms = $1
+                 WHERE app_id = $2 AND (
                      {column} IS NULL
-                     OR ({column} <> 1 AND COALESCE(profile_confidence, 0) <= ?3)
+                     OR ({column} <> 1 AND COALESCE(profile_confidence, 0) <= $3)
                  )"
             );
             applied |= conn.execute(
@@ -699,11 +724,11 @@ fn materialize_store_category_profile(
         if !has_active_override(conn, app_id, "dominant_mode")? {
             applied |= conn.execute(
                 "UPDATE multiplayer_profiles
-                 SET dominant_mode = ?1, computed_at_ms = ?2
-                 WHERE app_id = ?3
+                 SET dominant_mode = $1, computed_at_ms = $2
+                 WHERE app_id = $3
                    AND (
                        dominant_mode IS NULL
-                       OR (dominant_mode <> ?1 AND COALESCE(profile_confidence, 0) <= ?4)
+                       OR (dominant_mode <> $1 AND COALESCE(profile_confidence, 0) <= $4)
                    )",
                 params![mode, now_ms, app_id, STORE_CATEGORY_PROFILE_CONFIDENCE],
             )? > 0;
@@ -722,14 +747,14 @@ fn materialize_store_category_profile(
     )?;
     applied |= conn.execute(
         "UPDATE multiplayer_profiles
-         SET recommended_min_players = 2, computed_at_ms = ?1
-         WHERE app_id = ?2 AND recommended_min_players IS NULL",
+         SET recommended_min_players = 2, computed_at_ms = $1
+         WHERE app_id = $2 AND recommended_min_players IS NULL",
         params![now_ms, app_id],
     )? > 0;
     conn.execute(
         "UPDATE multiplayer_profiles
-         SET profile_confidence = MAX(COALESCE(profile_confidence, 0), ?1), computed_at_ms = ?2
-         WHERE app_id = ?3",
+         SET profile_confidence = GREATEST(COALESCE(profile_confidence, 0), $1), computed_at_ms = $2
+         WHERE app_id = $3",
         params![STORE_CATEGORY_PROFILE_CONFIDENCE, now_ms, app_id],
     )?;
     Ok(applied)
@@ -793,7 +818,7 @@ pub fn materialize_store_category_profiles_for_apps(
 ) -> StorageResult<usize> {
     let mut stmt = conn.prepare(
         "SELECT value_json, source_type FROM feature_evidence
-         WHERE app_id = ?1
+         WHERE app_id = $1
            AND feature_name = 'category_hint'
            AND source_type IN ('store_category', 'store_search_category')
            AND is_active = 1
@@ -834,11 +859,12 @@ pub fn ingest_store_search_page(
     page: &StoreSearchPage,
     now_ms: i64,
 ) -> StorageResult<usize> {
-    conn.execute(
+    let document_id = conn.query_row(
         "INSERT INTO source_documents (
             source, entity_type, entity_key, content_type, content_hash,
             content_text, fetched_at_ms, parse_version
-         ) VALUES (?1, 'search_page', ?2, 'application/json', ?3, NULL, ?4, ?5)",
+         ) VALUES ($1, 'search_page', $2, 'application/json', $3, NULL, $4, $5)
+         RETURNING document_id",
         params![
             STORE_SEARCH_SOURCE_NAME,
             format!(
@@ -850,8 +876,8 @@ pub fn ingest_store_search_page(
             now_ms,
             STORE_SEARCH_ADAPTER_VERSION,
         ],
+        |row| row.get(0),
     )?;
-    let document_id = conn.last_insert_rowid();
     let sort = page.sort.as_query_value();
     let source_ref = format!(
         "steam_store_search:category2=1;sort={sort};start={};sha256={}",
@@ -1035,7 +1061,7 @@ pub fn import_golden_multiplayer_profile(
 
     // Ensure profile row exists before bounds/confidence updates.
     conn.execute(
-        "INSERT INTO multiplayer_profiles (app_id, computed_at_ms) VALUES (?1, ?2)
+        "INSERT INTO multiplayer_profiles (app_id, computed_at_ms) VALUES ($1, $2)
          ON CONFLICT(app_id) DO NOTHING",
         params![game.app_id, now_ms],
     )?;
@@ -1043,12 +1069,12 @@ pub fn import_golden_multiplayer_profile(
     if mp.recommended_min_players.is_some() || mp.recommended_max_players.is_some() {
         let changed = conn.execute(
             "UPDATE multiplayer_profiles
-             SET recommended_min_players = COALESCE(?1, recommended_min_players),
-                 recommended_max_players = COALESCE(?2, recommended_max_players),
-                 computed_at_ms = ?3
-             WHERE app_id = ?4
-               AND (recommended_min_players IS NOT COALESCE(?1, recommended_min_players)
-                    OR recommended_max_players IS NOT COALESCE(?2, recommended_max_players))",
+             SET recommended_min_players = COALESCE($1, recommended_min_players),
+                 recommended_max_players = COALESCE($2, recommended_max_players),
+                 computed_at_ms = $3
+             WHERE app_id = $4
+               AND (recommended_min_players IS DISTINCT FROM COALESCE($1, recommended_min_players)
+                    OR recommended_max_players IS DISTINCT FROM COALESCE($2, recommended_max_players))",
             params![
                 mp.recommended_min_players.map(i64::from),
                 mp.recommended_max_players.map(i64::from),
@@ -1061,9 +1087,9 @@ pub fn import_golden_multiplayer_profile(
 
     let confidence_changed = conn.execute(
         "UPDATE multiplayer_profiles
-         SET profile_confidence = MAX(COALESCE(profile_confidence, 0), ?1),
-             computed_at_ms = ?2
-         WHERE app_id = ?3 AND COALESCE(profile_confidence, 0) < ?1",
+         SET profile_confidence = GREATEST(COALESCE(profile_confidence, 0), $1),
+             computed_at_ms = $2
+         WHERE app_id = $3 AND COALESCE(profile_confidence, 0) < $1",
         params![confidence, now_ms, game.app_id],
     )?;
     applied_any |= confidence_changed > 0;
@@ -1083,7 +1109,7 @@ fn golden_source_document(
         .query_row(
             "SELECT document_id FROM source_documents
              WHERE source = 'human_golden' AND entity_type = 'golden_game'
-               AND entity_key = ?1 AND content_hash = ?2
+               AND entity_key = $1 AND content_hash = $2
              ORDER BY document_id DESC LIMIT 1",
             params![entity_key, hash],
             |row| row.get(0),
@@ -1092,14 +1118,16 @@ fn golden_source_document(
     if let Some(document_id) = existing {
         return Ok(document_id);
     }
-    conn.execute(
+    conn.query_row(
         "INSERT INTO source_documents (
             source, entity_type, entity_key, content_type, content_hash,
             content_text, fetched_at_ms, parse_version
-         ) VALUES ('human_golden', 'golden_game', ?1, 'application/json', ?2, ?3, ?4, ?5)",
+         ) VALUES ('human_golden', 'golden_game', $1, 'application/json', $2, $3, $4, $5)
+         RETURNING document_id",
         params![entity_key, hash, content_text, now_ms, GOLDEN_SET_VERSION],
-    )?;
-    Ok(conn.last_insert_rowid())
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1117,9 +1145,9 @@ fn insert_golden_evidence(
     let exists: bool = conn.query_row(
         "SELECT EXISTS (
              SELECT 1 FROM feature_evidence
-             WHERE app_id = ?1 AND feature_name = ?2
-               AND source_type = 'human_golden' AND source_ref = ?3
-               AND value_json = ?4 AND confidence = ?5 AND is_active = 1
+             WHERE app_id = $1 AND feature_name = $2
+               AND source_type = 'human_golden' AND source_ref = $3
+               AND value_json = $4 AND confidence = $5 AND is_active = 1
          )",
         params![app_id, feature_name, source_ref, value_json, confidence],
         |row| row.get(0),
@@ -1164,7 +1192,7 @@ fn upsert_player_daily(
     let mut stmt = conn.prepare(
         "SELECT player_count
          FROM player_snapshots
-         WHERE app_id = ?1 AND captured_at_ms >= ?2 AND captured_at_ms < ?3
+         WHERE app_id = $1 AND captured_at_ms >= $2 AND captured_at_ms < $3
          ORDER BY player_count",
     )?;
     let samples = stmt
@@ -1193,7 +1221,7 @@ fn upsert_player_daily(
         "INSERT INTO player_daily (
             app_id, day_utc, min_ccu, max_ccu, mean_ccu, median_approx_ccu,
             sample_count, missing_rate, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT(app_id, day_utc) DO UPDATE SET
             min_ccu = excluded.min_ccu,
             max_ccu = excluded.max_ccu,

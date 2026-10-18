@@ -4,7 +4,7 @@
 //! evidence ids so AI enhancement layers can cite real sources, and high-impact
 //! unknowns stay marked for review rather than invented.
 
-use rusqlite::params;
+use crate::pg::params;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -78,9 +78,9 @@ impl Repository {
                             LIMIT 1
                         ), '')
                  FROM multiplayer_profiles p
-                 WHERE p.app_id > ?1
+                 WHERE p.app_id > $1
                  ORDER BY p.app_id ASC
-                 LIMIT ?2",
+                 LIMIT $2",
             )?;
             let mapped = stmt.query_map(params![after_app_id as i64, limit as i64], |row| {
                 Ok(ProfileRow {
@@ -143,9 +143,10 @@ impl Repository {
     /// Insert analysis only when this input_hash is new for the app/task/provider.
     pub fn put_ai_analysis_if_new(&self, analysis: &PutAiAnalysis) -> StorageResult<bool> {
         self.db.with_conn_mut(|conn| {
-            let exists: bool = conn.query_row(
+            let tx = conn.transaction()?;
+            let exists: bool = tx.query_row(
                 "SELECT COUNT(*) > 0 FROM ai_analyses
-                 WHERE app_id = ?1 AND task_type = ?2 AND provider = ?3 AND input_hash = ?4",
+                 WHERE app_id = $1 AND task_type = $2 AND provider = $3 AND input_hash = $4",
                 params![
                     analysis.app_id,
                     analysis.task_type,
@@ -157,11 +158,11 @@ impl Repository {
             if exists {
                 return Ok(false);
             }
-            conn.execute(
+            tx.execute(
                 "INSERT INTO ai_analyses(
                     analysis_id, app_id, task_type, provider, model, prompt_version,
                     input_hash, raw_output_json, accepted_json, validation_status, created_at_ms
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
                 params![
                     analysis.analysis_id,
                     analysis.app_id,
@@ -176,6 +177,7 @@ impl Repository {
                     analysis.created_at_ms
                 ],
             )?;
+            tx.commit()?;
             Ok(true)
         })
     }
@@ -184,7 +186,7 @@ impl Repository {
         self.db.with_conn(|conn| {
             conn.query_row(
                 "SELECT accepted_json FROM ai_analyses
-                 WHERE app_id = ?1 AND task_type = ?2 AND provider = ?3
+                 WHERE app_id = $1 AND task_type = $2 AND provider = $3
                    AND validation_status = 'accepted' AND accepted_json IS NOT NULL
                  ORDER BY created_at_ms DESC LIMIT 1",
                 params![app_id, OFFLINE_FEATURE_TASK, OFFLINE_FEATURE_PROVIDER],
@@ -205,7 +207,7 @@ impl Repository {
     }
 }
 
-use rusqlite::OptionalExtension;
+use crate::pg::OptionalExtension;
 
 fn build_offline_feature_payload(row: &ProfileRow) -> Value {
     let mut features = Vec::new();

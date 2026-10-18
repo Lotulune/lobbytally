@@ -1,15 +1,13 @@
-//! Game retrieval documents, FTS sync, embeddings, hybrid search, and AI cache.
+//! Game retrieval documents, PostgreSQL text search, embeddings, hybrid search, and AI cache.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::time::Duration;
 
 const MAX_FTS_HITS: u32 = 900;
 const MAX_HYBRID_RESULTS: u32 = 300;
 const HYBRID_SOURCE_OVERSAMPLE: u32 = 3;
-const RETRIEVAL_WRITER_HANDOFF: Duration = Duration::from_secs(1);
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use crate::pg::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StorageError, StorageResult};
@@ -162,8 +160,8 @@ fn upsert_game_document_on_conn(
     conn.execute(
         "INSERT INTO game_documents(
             document_id, app_id, doc_type, language, title, body,
-            content_hash, visibility, updated_at_ms
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            content_hash, visibility, updated_at_ms, aliases, tags
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          ON CONFLICT(document_id) DO UPDATE SET
             app_id=excluded.app_id,
             doc_type=excluded.doc_type,
@@ -172,7 +170,9 @@ fn upsert_game_document_on_conn(
             body=excluded.body,
             content_hash=excluded.content_hash,
             visibility=excluded.visibility,
-            updated_at_ms=excluded.updated_at_ms",
+            updated_at_ms=excluded.updated_at_ms,
+            aliases=excluded.aliases,
+            tags=excluded.tags",
         params![
             doc.document_id,
             doc.app_id,
@@ -182,29 +182,15 @@ fn upsert_game_document_on_conn(
             doc.body,
             doc.content_hash,
             doc.visibility,
-            now_ms
+            now_ms,
+            doc.aliases,
+            doc.tags
         ],
     )?;
     conn.execute(
         "DELETE FROM game_embeddings
-         WHERE document_id = ?1 AND content_hash <> ?2",
+         WHERE document_id = $1 AND content_hash <> $2",
         params![doc.document_id, doc.content_hash],
-    )?;
-    conn.execute(
-        "DELETE FROM game_fts WHERE document_id = ?1",
-        params![doc.document_id],
-    )?;
-    conn.execute(
-        "INSERT INTO game_fts(document_id, app_id, title, aliases, tags, body)
-         VALUES (?1,?2,?3,?4,?5,?6)",
-        params![
-            doc.document_id,
-            doc.app_id as i64,
-            doc.title,
-            doc.aliases,
-            doc.tags,
-            doc.body
-        ],
     )?;
     Ok(true)
 }
@@ -212,7 +198,7 @@ fn upsert_game_document_on_conn(
 fn game_document_matches(conn: &Connection, doc: &UpsertGameDocument) -> StorageResult<bool> {
     let existing: Option<String> = conn
         .query_row(
-            "SELECT content_hash FROM game_documents WHERE document_id = ?1",
+            "SELECT content_hash FROM game_documents WHERE document_id = $1",
             params![doc.document_id],
             |row| row.get(0),
         )
@@ -241,7 +227,7 @@ fn put_embedding_on_conn(
         "INSERT INTO game_embeddings(
             document_id, provider, model, dimensions, vector_blob,
             is_l2_normalized, content_hash, created_at_ms
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          ON CONFLICT(document_id, provider, model, content_hash) DO UPDATE SET
             dimensions=excluded.dimensions,
             vector_blob=excluded.vector_blob,
@@ -265,7 +251,7 @@ fn embedding_matches(conn: &Connection, embedding: &PutEmbedding) -> StorageResu
     let existing: Option<(i64, Vec<u8>, i64)> = conn
         .query_row(
             "SELECT dimensions, vector_blob, is_l2_normalized FROM game_embeddings
-             WHERE document_id = ?1 AND provider = ?2 AND model = ?3 AND content_hash = ?4",
+             WHERE document_id = $1 AND provider = $2 AND model = $3 AND content_hash = $4",
             params![
                 embedding.document_id,
                 embedding.provider,
@@ -291,11 +277,7 @@ fn prune_managed_documents_on_conn(
 ) -> StorageResult<()> {
     for document_id in stale_managed_document_ids(conn, app_id, keep_ids)? {
         conn.execute(
-            "DELETE FROM game_fts WHERE document_id = ?1",
-            params![document_id],
-        )?;
-        conn.execute(
-            "DELETE FROM game_documents WHERE document_id = ?1",
+            "DELETE FROM game_documents WHERE document_id = $1",
             params![document_id],
         )?;
     }
@@ -315,7 +297,7 @@ fn stale_managed_document_ids(
     let stale_ids = {
         let mut stmt = conn.prepare(
             "SELECT document_id FROM game_documents
-             WHERE app_id = ?1
+             WHERE app_id = $1
                AND doc_type IN ('identity', 'multiplayer_profile', 'store_summary')",
         )?;
         let rows = stmt.query_map(params![app_id as i64], |row| row.get(0))?;
@@ -354,7 +336,7 @@ fn retrieval_app_needs_write(
 }
 
 impl Repository {
-    /// Upsert a retrieval document and keep FTS in sync.
+    /// Upsert a retrieval document; PostgreSQL updates its generated search vector atomically.
     /// Returns `true` when content changed (or was newly inserted).
     pub fn upsert_game_document(&self, doc: &UpsertGameDocument) -> StorageResult<bool> {
         let now = self.db.now_ms();
@@ -362,7 +344,7 @@ impl Repository {
             if game_document_matches(conn, doc)? {
                 return Ok(false);
             }
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.transaction()?;
             let changed = upsert_game_document_on_conn(&tx, doc, now)?;
             tx.commit()?;
             Ok(changed)
@@ -380,12 +362,13 @@ impl Repository {
         }
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT game_fts.document_id, game_fts.app_id, bm25(game_fts) AS rank
-                 FROM game_fts
-                 JOIN game_documents d ON d.document_id = game_fts.document_id
-                 WHERE game_fts MATCH ?1 AND d.visibility = 'public'
-                 ORDER BY rank
-                 LIMIT ?2",
+                "SELECT d.document_id, d.app_id,
+                        -ts_rank_cd(d.search_vector, websearch_to_tsquery('simple', $1))::double precision AS rank
+                 FROM game_documents d
+                 WHERE d.search_vector @@ websearch_to_tsquery('simple', $1)
+                   AND d.visibility = 'public'
+                 ORDER BY rank, d.document_id
+                 LIMIT $2",
             )?;
             let rows = stmt.query_map(params![q, limit as i64], |row| {
                 Ok(FtsHit {
@@ -410,7 +393,7 @@ impl Repository {
             if embedding_matches(conn, embedding)? {
                 return Ok(false);
             }
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = conn.transaction()?;
             let changed = put_embedding_on_conn(&tx, embedding, now)?;
             tx.commit()?;
             Ok(changed)
@@ -429,10 +412,10 @@ impl Repository {
                 "SELECT e.document_id, d.app_id, e.vector_blob, e.dimensions
                  FROM game_embeddings e
                  JOIN game_documents d ON d.document_id = e.document_id
-                 WHERE e.provider = ?1 AND e.model = ?2
+                 WHERE e.provider = $1 AND e.model = $2
                    AND e.content_hash = d.content_hash
                  ORDER BY e.created_at_ms DESC
-                 LIMIT ?3",
+                 LIMIT $3",
             )?;
             let rows = stmt.query_map(params![provider, model, limit as i64], |row| {
                 Ok(StoredEmbedding {
@@ -461,7 +444,7 @@ impl Repository {
                         output_json, validation_status, usage_input, usage_output,
                         created_at_ms, expires_at_ms
                  FROM ai_analysis_cache
-                 WHERE cache_key = ?1 AND expires_at_ms > ?2",
+                 WHERE cache_key = $1 AND expires_at_ms > $2",
                 params![cache_key, now_ms],
                 |row| {
                     Ok(AiCacheEntry {
@@ -492,7 +475,7 @@ impl Repository {
                     cache_key, task_type, provider, model, prompt_version, input_hash,
                     output_json, validation_status, usage_input, usage_output,
                     created_at_ms, expires_at_ms
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                  ON CONFLICT(cache_key) DO UPDATE SET
                     task_type=excluded.task_type,
                     provider=excluded.provider,
@@ -549,7 +532,7 @@ impl Repository {
                             WHERE evidence.app_id = a.app_id
                               AND evidence.feature_name IN ('catalog_taxonomy', 'catalog_tags')
                               AND evidence.is_active = 1
-                              AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms > ?3)
+                              AND (evidence.expires_at_ms IS NULL OR evidence.expires_at_ms > $3)
                             ORDER BY CASE evidence.feature_name
                                          WHEN 'catalog_taxonomy' THEN 0 ELSE 1 END,
                                      evidence.observed_at_ms DESC, evidence.evidence_id DESC
@@ -596,9 +579,9 @@ impl Repository {
                         ELSE 9 END
                     LIMIT 1
                  )
-                 WHERE a.app_id > ?1
+                 WHERE a.app_id > $1
                  ORDER BY a.app_id ASC
-                 LIMIT ?2",
+                 LIMIT $2",
             )?;
             let mapped = stmt.query_map(
                 params![
@@ -696,9 +679,8 @@ impl Repository {
             ..RetrievalSyncStats::default()
         };
 
-        // Hash and compare through a WAL reader before taking the writer. Only
-        // changed apps need a short transaction; yielding between them prevents
-        // background FTS maintenance from starving the external Steam worker.
+        // Compare before opening a transaction. Unchanged catalog pages remain
+        // read-only; each changed app commits its documents and embeddings atomically.
         let prepared = rows
             .iter()
             .map(|source| {
@@ -745,7 +727,7 @@ impl Repository {
                 continue;
             }
             self.db.with_conn_mut(|conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = conn.transaction()?;
                 prune_managed_documents_on_conn(&tx, *app_id, keep_ids)?;
                 for (doc, embedding) in docs {
                     if upsert_game_document_on_conn(&tx, doc, now_ms)? {
@@ -764,14 +746,6 @@ impl Repository {
                 tx.commit()?;
                 Ok(())
             })?;
-            // SQLite's busy handler does not queue waiting writers fairly. A
-            // short pause can let this connection reacquire the writer before
-            // the external Steam worker wakes up, so leave a full handoff
-            // window after every file-backed commit. In-memory databases
-            // cannot have a second-process writer and should not slow tests.
-            if self.db.path() != std::path::Path::new(":memory:") {
-                std::thread::sleep(RETRIEVAL_WRITER_HANDOFF);
-            }
         }
         stats.apps_covered = self.db.with_conn(|conn| {
             let count = conn.query_row(
@@ -825,13 +799,13 @@ impl Repository {
                  WHERE NOT EXISTS (
                     SELECT 1 FROM game_embeddings e
                     WHERE e.document_id = d.document_id
-                      AND e.provider = ?1
-                      AND e.model = ?2
+                      AND e.provider = $1
+                      AND e.model = $2
                       AND e.content_hash = d.content_hash
-                      AND e.dimensions = ?3
+                      AND e.dimensions = $3
                  )
                  ORDER BY d.app_id ASC, d.document_id ASC
-                 LIMIT ?4",
+                 LIMIT $4",
             )?;
             let rows = stmt.query_map(
                 params![provider, model, dimensions as i64, limit as i64],
@@ -897,10 +871,10 @@ impl Repository {
                 "SELECT d.app_id, e.vector_blob, e.dimensions
                  FROM game_embeddings e
                  JOIN game_documents d ON d.document_id = e.document_id
-                 WHERE e.provider = ?1 AND e.model = ?2
+                 WHERE e.provider = $1 AND e.model = $2
                    AND e.content_hash = d.content_hash
                    AND d.visibility = 'public'
-                 ORDER BY e.rowid ASC",
+                 ORDER BY e.document_id ASC, e.content_hash ASC",
             )?;
             let rows = stmt.query_map(params![provider, model], |row| {
                 Ok((
@@ -1362,6 +1336,11 @@ mod tests {
         let hits = repo.search_game_fts("cooperative", 10).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].app_id, app_id);
+        for term in ["cozycoop", "multiplayer", "\"missingterm\" OR \"cozycoop\""] {
+            let hits = repo.search_game_fts(term, 10).unwrap();
+            assert!(hits.iter().any(|hit| hit.app_id == app_id));
+        }
+        assert!(repo.search_game_fts("\"", 10).unwrap().is_empty());
 
         repo.upsert_game_document(&UpsertGameDocument {
             document_id: format!("doc-{app_id}-internal"),
@@ -1524,58 +1503,71 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_catalog_sync_does_not_wait_for_the_sqlite_writer() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("retrieval-writer.db");
-        let db = Database::open(&path).unwrap();
-        let repo = Repository::new(db);
-        repo.migrate().unwrap();
-        repo.ensure_runtime_defaults().unwrap();
-        repo.seed_demo_if_empty().unwrap();
-
+    fn unchanged_catalog_sync_preserves_document_versions() {
+        let repo = repo();
         let initial = repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
         assert!(initial.documents_written > 0);
-
-        let blocker = Connection::open(&path).unwrap();
-        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let started = std::time::Instant::now();
+        let versions = || {
+            repo.database()
+                .with_conn(|conn| {
+                    let mut stmt = conn.prepare(
+                        "SELECT document_id, content_hash, updated_at_ms
+                         FROM game_documents ORDER BY document_id",
+                    )?;
+                    let rows = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()
+                        .map_err(StorageError::from)
+                })
+                .unwrap()
+        };
+        let before = versions();
         let unchanged = repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
-        let elapsed = started.elapsed();
-        blocker.execute_batch("ROLLBACK").unwrap();
-
         assert_eq!(unchanged.documents_written, 0);
         assert_eq!(unchanged.embeddings_written, 0);
         assert!(unchanged.documents_unchanged > 0);
-        assert!(elapsed < RETRIEVAL_WRITER_HANDOFF);
+        assert_eq!(versions(), before);
     }
 
     #[test]
-    fn changed_catalog_sync_leaves_an_interprocess_writer_handoff_window() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("retrieval-handoff.db");
-        let db = Database::open(&path).unwrap();
-        let repo = Repository::new(db);
-        repo.migrate().unwrap();
-        repo.ensure_runtime_defaults().unwrap();
-        repo.seed_demo_if_empty().unwrap();
+    fn changed_catalog_sync_updates_the_search_index() {
+        let repo = repo();
         repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
-
-        repo.db
-            .with_conn_mut(|conn| {
-                conn.execute(
-                    "UPDATE apps SET canonical_name = canonical_name || ' updated'
-                     WHERE app_id = (SELECT MIN(app_id) FROM apps)",
+        let app_id = repo
+            .database()
+            .with_conn(|conn| {
+                let app_id: i64 = conn.query_row(
+                    "SELECT app_id FROM game_documents ORDER BY app_id LIMIT 1",
                     [],
+                    |row| row.get(0),
                 )?;
-                Ok(())
+                conn.execute(
+                    "UPDATE apps SET canonical_name = canonical_name || ' updatedcatalogtoken'
+                     WHERE app_id = $1",
+                    params![app_id],
+                )?;
+                Ok(app_id as u32)
             })
             .unwrap();
-
-        let started = std::time::Instant::now();
         let changed = repo.sync_retrieval_from_catalog(500, 0, true).unwrap();
-
         assert!(changed.documents_written > 0);
-        assert!(started.elapsed() >= RETRIEVAL_WRITER_HANDOFF);
+        assert!(
+            repo.search_game_fts("updatedcatalogtoken", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.app_id == app_id)
+        );
+        assert_eq!(
+            repo.sync_retrieval_from_catalog(500, 0, true)
+                .unwrap()
+                .documents_written,
+            0
+        );
     }
 
     #[test]
@@ -1592,7 +1584,7 @@ mod tests {
                         "INSERT INTO apps (
                              app_id, app_type, canonical_name, release_state,
                              created_at_ms, updated_at_ms
-                         ) VALUES (?1, 'game', ?2, 'released', 1, 1)",
+                         ) VALUES ($1, 'game', $2, 'released', 1, 1)",
                         params![app_id, format!("Recall game {offset}")],
                     )?;
                 }
@@ -1724,8 +1716,8 @@ mod tests {
                          app_id, feature_name, value_json, source_type, source_ref,
                          confidence, observed_at_ms, is_active
                      ) VALUES
-                         (?1, 'catalog_taxonomy', ?2, 'test', 'test', 1, 10, 1),
-                         (?3, 'catalog_tags', 'not-json', 'test', 'test', 1, 10, 1)",
+                         ($1, 'catalog_taxonomy', $2, 'test', 'test', 1, 10, 1),
+                         ($3, 'catalog_tags', 'not-json', 'test', 'test', 1, 10, 1)",
                     params![
                         tagged_app_id as i64,
                         r#"{"categories":["Co-op"],"genres":["Action Roguelike"],"developers":["Test Studio"],"publishers":["Test Publisher"]}"#,
@@ -1756,8 +1748,8 @@ mod tests {
                          app_id, app_type, canonical_name, release_state,
                          created_at_ms, updated_at_ms
                      ) VALUES
-                         (?1, 'game', 'Old Vector Target', 'released', 1, 1),
-                         (?2, 'game', 'Recent Vector Fillers', 'released', 1, 1)",
+                         ($1, 'game', 'Old Vector Target', 'released', 1, 1),
+                         ($2, 'game', 'Recent Vector Fillers', 'released', 1, 1)",
                     params![target_app_id, filler_app_id],
                 )?;
                 tx.execute(
@@ -1765,7 +1757,7 @@ mod tests {
                          document_id, app_id, doc_type, language, title, body,
                          content_hash, visibility, updated_at_ms
                      ) VALUES (
-                         'bulk-target', ?1, 'identity', 'en', 'target', '',
+                         'bulk-target', $1, 'identity', 'en', 'target', '',
                          'bulk-target-hash', 'public', 1
                      )",
                     params![target_app_id],
@@ -1775,7 +1767,7 @@ mod tests {
                          document_id, provider, model, dimensions, vector_blob,
                          is_l2_normalized, content_hash, created_at_ms
                      ) VALUES (
-                         'bulk-target', 'bulk-provider', 'bulk-model', 2, ?1,
+                         'bulk-target', 'bulk-provider', 'bulk-model', 2, $1,
                          1, 'bulk-target-hash', 1
                      )",
                     params![target_blob],
@@ -1787,8 +1779,8 @@ mod tests {
                              document_id, app_id, doc_type, language, title, body,
                              content_hash, visibility, updated_at_ms
                          ) VALUES (
-                             ?1, ?2, 'identity', 'en', 'filler', '',
-                             'bulk-filler-hash', 'public', ?3
+                             $1, $2, 'identity', 'en', 'filler', '',
+                             'bulk-filler-hash', 'public', $3
                          )",
                         params![document_id, filler_app_id, index + 2],
                     )?;
@@ -1797,8 +1789,8 @@ mod tests {
                              document_id, provider, model, dimensions, vector_blob,
                              is_l2_normalized, content_hash, created_at_ms
                          ) VALUES (
-                             ?1, 'bulk-provider', 'bulk-model', 2, ?2,
-                             1, 'bulk-filler-hash', ?3
+                             $1, 'bulk-provider', 'bulk-model', 2, $2,
+                             1, 'bulk-filler-hash', $3
                          )",
                         params![document_id, filler_blob, index + 2],
                     )?;
@@ -1866,7 +1858,7 @@ mod tests {
 
         repo.database()
             .with_conn_mut(|conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let tx = conn.transaction()?;
                 prune_managed_documents_on_conn(&tx, app_id, &HashSet::new())?;
                 tx.commit()?;
                 Ok(())
@@ -1877,7 +1869,7 @@ mod tests {
             repo.database()
                 .with_conn(|conn| {
                     conn.query_row(
-                        "SELECT COUNT(*) FROM game_documents WHERE document_id = ?1",
+                        "SELECT COUNT(*) FROM game_documents WHERE document_id = $1",
                         params![document_id],
                         |row| row.get::<_, i64>(0),
                     )

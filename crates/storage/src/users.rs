@@ -1,5 +1,5 @@
+use crate::pg::{Connection, OptionalExtension, params, types::Type};
 use mpgs_domain::{RecommendationConfig, UserPreferences};
-use rusqlite::{Connection, OptionalExtension, params, types::Type};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StorageError, StorageResult};
@@ -39,7 +39,7 @@ pub fn create_anonymous_session(
         "INSERT INTO anonymous_users (
             user_id, created_at_ms, last_active_at_ms, access_token_hash, refresh_token_hash,
             access_expires_at_ms, refresh_expires_at_ms
-         ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)",
+         ) VALUES ($1, $2, $2, $3, $4, $5, $6)",
         params![
             user_id,
             now_ms,
@@ -76,7 +76,7 @@ pub fn refresh_anonymous_session(
     let user_id: String = conn
         .query_row(
             "SELECT user_id FROM anonymous_users
-             WHERE refresh_token_hash = ?1 AND refresh_expires_at_ms > ?2",
+             WHERE refresh_token_hash = $1 AND refresh_expires_at_ms > $2",
             params![old_hash, now_ms],
             |row| row.get(0),
         )
@@ -90,10 +90,10 @@ pub fn refresh_anonymous_session(
     let tx = conn.transaction()?;
     let changed = tx.execute(
         "UPDATE anonymous_users
-         SET access_token_hash = ?1, refresh_token_hash = ?2,
-             access_expires_at_ms = ?3, refresh_expires_at_ms = ?4,
-             last_active_at_ms = ?5
-         WHERE user_id = ?6 AND refresh_token_hash = ?7 AND refresh_expires_at_ms > ?5",
+         SET access_token_hash = $1, refresh_token_hash = $2,
+             access_expires_at_ms = $3, refresh_expires_at_ms = $4,
+             last_active_at_ms = $5
+         WHERE user_id = $6 AND refresh_token_hash = $7 AND refresh_expires_at_ms > $5",
         params![
             token_hash(&access_token),
             token_hash(&new_refresh_token),
@@ -127,15 +127,15 @@ pub fn resolve_user_id(
     let user_id: String = conn
         .query_row(
             "SELECT user_id FROM anonymous_users
-             WHERE access_token_hash = ?1 AND access_expires_at_ms > ?2",
+             WHERE access_token_hash = $1 AND access_expires_at_ms > $2",
             params![hash, now_ms],
             |row| row.get(0),
         )
         .optional()?
         .ok_or_else(|| StorageError::not_found("session"))?;
     conn.execute(
-        "UPDATE anonymous_users SET last_active_at_ms = ?1
-         WHERE user_id = ?2 AND last_active_at_ms <= ?3",
+        "UPDATE anonymous_users SET last_active_at_ms = $1
+         WHERE user_id = $2 AND last_active_at_ms <= $3",
         params![now_ms, user_id, now_ms.saturating_sub(5 * 60 * 1000)],
     )?;
     Ok(user_id)
@@ -147,7 +147,7 @@ pub fn get_preferences(conn: &Connection, user_id: &str) -> StorageResult<UserPr
                 session_minutes_min, session_minutes_max,
                 budget_currency, budget_max_each_minor, platforms_json, self_hosting_willingness,
                 languages_json, excluded_modes_json
-         FROM user_preferences WHERE user_id = ?1",
+         FROM user_preferences WHERE user_id = $1",
         params![user_id],
         |row| {
             let platforms_json: String = row.get(8)?;
@@ -163,20 +163,20 @@ pub fn get_preferences(conn: &Connection, user_id: &str) -> StorageResult<UserPr
                 budget_currency: row.get(6)?,
                 budget_max_each_minor: row.get(7)?,
                 platforms: serde_json::from_str(&platforms_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(error))
+                    crate::pg::Error::FromSqlConversionFailure(8, Type::Text, Box::new(error))
                 })?,
                 self_hosting_willingness: row.get(9)?,
                 languages: serde_json::from_str(&languages_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
+                    crate::pg::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
                 })?,
                 excluded_modes: serde_json::from_str(&excluded_json).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(11, Type::Text, Box::new(error))
+                    crate::pg::Error::FromSqlConversionFailure(11, Type::Text, Box::new(error))
                 })?,
             })
         },
     )
     .map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => StorageError::not_found("preferences"),
+        crate::pg::Error::QueryReturnedNoRows => StorageError::not_found("preferences"),
         other => other.into(),
     })
 }
@@ -199,7 +199,9 @@ pub fn put_preferences(
 
     let mut next = prefs.clone();
     next.version = current.version + 1;
-    upsert_preferences(conn, user_id, &next, now_ms)?;
+    if upsert_preferences(conn, user_id, &next, now_ms)? != 1 {
+        return Err(StorageError::conflict("preference version conflict"));
+    }
     Ok(next)
 }
 
@@ -208,14 +210,14 @@ fn upsert_preferences(
     user_id: &str,
     prefs: &UserPreferences,
     now_ms: i64,
-) -> StorageResult<()> {
+) -> StorageResult<usize> {
     conn.execute(
         "INSERT INTO user_preferences (
             user_id, version, preference_confidence, party_size, coop_competitive,
             session_minutes_min, session_minutes_max,
             budget_currency, budget_max_each_minor, platforms_json, self_hosting_willingness,
             languages_json, excluded_modes_json, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
          ON CONFLICT(user_id) DO UPDATE SET
             version = excluded.version,
             preference_confidence = excluded.preference_confidence,
@@ -229,7 +231,8 @@ fn upsert_preferences(
             self_hosting_willingness = excluded.self_hosting_willingness,
             languages_json = excluded.languages_json,
             excluded_modes_json = excluded.excluded_modes_json,
-            updated_at_ms = excluded.updated_at_ms",
+            updated_at_ms = excluded.updated_at_ms
+         WHERE user_preferences.version = excluded.version - 1",
         params![
             user_id,
             prefs.version,
@@ -246,8 +249,8 @@ fn upsert_preferences(
             serde_json::to_string(&prefs.excluded_modes)?,
             now_ms
         ],
-    )?;
-    Ok(())
+    )
+    .map_err(Into::into)
 }
 
 fn random_hex<const N: usize>() -> StorageResult<String> {
@@ -275,7 +278,7 @@ pub fn ensure_algorithm_config(conn: &Connection, now_ms: i64) -> StorageResult<
     let config_json = serde_json::to_string(&RecommendationConfig::default())?;
     conn.execute(
         "INSERT INTO algorithm_configs (version, schema_version, config_json, status, created_by, created_at_ms)
-         VALUES ('rules-0.3.0', 1, ?1, 'active', 'system', ?2)",
+         VALUES ('rules-0.3.0', 1, $1, 'active', 'system', $2)",
         params![config_json, now_ms],
     )?;
     Ok(())
@@ -290,7 +293,7 @@ pub fn active_algorithm_config(conn: &Connection) -> StorageResult<ActiveAlgorit
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| match error {
-            rusqlite::Error::QueryReturnedNoRows => {
+            crate::pg::Error::QueryReturnedNoRows => {
                 StorageError::migration("active algorithm config is missing")
             }
             other => other.into(),
@@ -321,6 +324,8 @@ pub fn active_algorithm_config(conn: &Connection) -> StorageResult<ActiveAlgorit
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
     use crate::db::Database;
 
@@ -329,6 +334,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.with_conn_mut(|conn| {
             crate::migrate::migrate_to_latest(conn, 0)?;
+            conn.execute("DELETE FROM algorithm_configs", [])?;
             let mut value = serde_json::to_value(RecommendationConfig::default())?;
             let object = value.as_object_mut().expect("config object");
             object.remove("play_intent_weight");
@@ -336,7 +342,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO algorithm_configs (
                     version, schema_version, config_json, status, created_by, created_at_ms
-                 ) VALUES ('rules-0.1.0', 1, ?1, 'active', 'test', 0)",
+                 ) VALUES ('rules-0.1.0', 1, $1, 'active', 'test', 0)",
                 params![serde_json::to_string(&value)?],
             )?;
 
@@ -347,5 +353,51 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn preference_versions_prevent_lost_updates_across_database_handles() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let user = db
+            .with_conn_mut(|conn| create_anonymous_session(conn, 0))
+            .unwrap();
+        let preferences = db
+            .with_conn(|conn| get_preferences(conn, &user.user_id))
+            .unwrap();
+        let handles = [db.reconnect().unwrap(), db.reconnect().unwrap()];
+        let barrier = Arc::new(Barrier::new(handles.len()));
+        let threads: Vec<_> = handles
+            .into_iter()
+            .enumerate()
+            .map(|(index, handle)| {
+                let user_id = user.user_id.clone();
+                let mut preferences = preferences.clone();
+                preferences.party_size = 3 + index as u8;
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle.with_conn(|conn| put_preferences(conn, &user_id, &preferences, 1))
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(StorageError::Conflict { .. })))
+                .count(),
+            1
+        );
+        let winner = results.into_iter().find_map(Result::ok).unwrap();
+        let stored = db
+            .with_conn(|conn| get_preferences(conn, &user.user_id))
+            .unwrap();
+        assert_eq!(stored.version, preferences.version + 1);
+        assert_eq!(stored, winner);
     }
 }

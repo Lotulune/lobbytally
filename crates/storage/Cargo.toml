@@ -11,11 +11,18 @@ argon2 = { workspace = true }
 getrandom = { workspace = true }
 mpgs-domain = { path = "../domain" }
 mpgs-steam-source = { path = "../steam-source" }
-rusqlite = { workspace = true }
+bytes = { workspace = true }
+native-tls = { workspace = true }
+postgres = { workspace = true }
+postgres-native-tls = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_postgres = { workspace = true }
+rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

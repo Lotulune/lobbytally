@@ -1,11 +1,11 @@
 //! Deterministic catalog seed for local demos and M3 ranking tests.
 
-use rusqlite::Connection;
+use crate::pg::Connection;
 
 use crate::catalog::{set_profile_bool_field, set_profile_text_field, upsert_app};
 use crate::error::StorageResult;
+use crate::pg::params;
 use crate::util::wilson_lower_bound;
-use rusqlite::params;
 
 struct SeedGame {
     app_id: u32,
@@ -263,7 +263,7 @@ pub fn seed_demo_catalog(conn: &Connection, now_ms: i64) -> StorageResult<usize>
         if let Some(capsule_url) = seed_capsule_url(game.app_id) {
             conn.execute(
                 "INSERT INTO app_media (app_id, capsule_url, source, updated_at_ms)
-                 VALUES (?1, ?2, 'demo_seed', ?3)
+                 VALUES ($1, $2, 'demo_seed', $3)
                  ON CONFLICT(app_id) DO UPDATE SET
                     capsule_url = excluded.capsule_url,
                     source = excluded.source,
@@ -301,19 +301,30 @@ pub fn seed_demo_catalog(conn: &Connection, now_ms: i64) -> StorageResult<usize>
         )?;
         conn.execute(
             "UPDATE multiplayer_profiles
-             SET recommended_min_players = ?1, recommended_max_players = ?2,
-                 profile_confidence = 0.85, computed_at_ms = ?3
-             WHERE app_id = ?4",
+             SET recommended_min_players = $1, recommended_max_players = $2,
+                 profile_confidence = 0.85, computed_at_ms = $3
+             WHERE app_id = $4",
             params![game.rec_min, game.rec_max, now_ms, game.app_id],
         )?;
         if game.reviews > 0 {
             let wilson = wilson_lower_bound(game.positive, game.reviews);
             conn.execute(
-                "INSERT OR REPLACE INTO review_snapshots (
+                "INSERT INTO review_snapshots (
                     app_id, region_scope, language_scope, captured_at_ms,
                     total_positive, total_negative, total_reviews, review_score, review_score_desc,
                     wilson_lower, filter_offtopic_activity, parameter_hash, content_hash, source
-                 ) VALUES (?1, 'all', 'all', ?2, ?3, ?4, ?5, 8, 'Very Positive', ?6, 1, 'seed', 'seed', 'seed')",
+                 ) VALUES ($1, 'all', 'all', $2, $3, $4, $5, 8, 'Very Positive', $6, 1, 'seed', 'seed', 'seed')
+                 ON CONFLICT(app_id, region_scope, language_scope, captured_at_ms) DO UPDATE SET
+                     total_positive = excluded.total_positive,
+                     total_negative = excluded.total_negative,
+                     total_reviews = excluded.total_reviews,
+                     review_score = excluded.review_score,
+                     review_score_desc = excluded.review_score_desc,
+                     wilson_lower = excluded.wilson_lower,
+                     filter_offtopic_activity = excluded.filter_offtopic_activity,
+                     parameter_hash = excluded.parameter_hash,
+                     content_hash = excluded.content_hash,
+                     source = excluded.source",
                 params![
                     game.app_id,
                     now_ms,
@@ -326,10 +337,17 @@ pub fn seed_demo_catalog(conn: &Connection, now_ms: i64) -> StorageResult<usize>
         }
         if game.ccu > 0 {
             conn.execute(
-                "INSERT OR REPLACE INTO player_snapshots (
+                "INSERT INTO player_snapshots (
                     app_id, captured_at_ms, player_count, result_code, missing_reason,
                     content_hash, source, offline_players_excluded
-                 ) VALUES (?1, ?2, ?3, 1, NULL, 'seed', 'seed', 1)",
+                 ) VALUES ($1, $2, $3, 1, NULL, 'seed', 'seed', 1)
+                 ON CONFLICT(app_id, captured_at_ms) DO UPDATE SET
+                     player_count = excluded.player_count,
+                     result_code = excluded.result_code,
+                     missing_reason = excluded.missing_reason,
+                     content_hash = excluded.content_hash,
+                     source = excluded.source,
+                     offline_players_excluded = excluded.offline_players_excluded",
                 params![game.app_id, now_ms, game.ccu],
             )?;
         }

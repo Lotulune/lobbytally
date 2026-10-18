@@ -60,10 +60,10 @@ describe("calendar helpers", () => {
     expect(appTypeLabel("game")).toBe("正式游戏");
   });
 
-  it("labels weekdays and countdowns in UTC days", () => {
+  it("labels weekdays and countdowns in local calendar days", () => {
     expect(weekdayLabel("2026-08-14")).toBe("周五");
     expect(weekdayLabel("bad")).toBeNull();
-    const now = Date.UTC(2026, 7, 13, 15, 30); // 2026-08-13
+    const now = new Date(2026, 7, 13, 15, 30).getTime(); // local 2026-08-13
     expect(countdownLabel("2026-08-13", now)).toBe("今天");
     expect(countdownLabel("2026-08-14", now)).toBe("明天");
     expect(countdownLabel("2026-08-20", now)).toBe("7 天后");
@@ -71,8 +71,14 @@ describe("calendar helpers", () => {
     expect(countdownLabel("2026-08-01", now)).toBe("12 天前");
   });
 
+  it("uses the viewer date when local midnight differs from UTC", () => {
+    const afterMidnightInShanghai = Date.parse("2026-08-12T16:30:00Z");
+    expect(countdownLabel("2026-08-13", afterMidnightInShanghai, -480)).toBe("今天");
+    expect(countdownLabel("2026-08-14", afterMidnightInShanghai, -480)).toBe("明天");
+  });
+
   it("renders the date cell faithfully to source precision", () => {
-    const now = Date.UTC(2026, 7, 13);
+    const now = new Date(2026, 7, 13, 12).getTime();
     const when = (date: string | null, precision: string | null) =>
       calendarWhen({ release_date: date, release_date_precision: precision }, now);
 

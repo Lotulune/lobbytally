@@ -1,9 +1,13 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const packageDir = path.resolve(fileURLToPath(new URL(".", import.meta.url)));
 const repoRoot = path.resolve(packageDir, "..");
@@ -29,6 +33,10 @@ const serverBinary = configuredPath(
   "MPGS_E2E_SERVER",
   `target/debug/mpgs-server${executableSuffix}`,
 );
+const dbtoolBinary = configuredPath(
+  "MPGS_E2E_DBTOOL",
+  `target/debug/mpgs-dbtool${executableSuffix}`,
+);
 const tauriDriverBinary = process.env.TAURI_DRIVER_BINARY
   ? path.resolve(process.env.TAURI_DRIVER_BINARY)
   : path.join(
@@ -42,6 +50,8 @@ let serverLogFd;
 let driverProcess;
 let driverLogFd;
 let runtimeDir;
+let fixtureDatabase;
+let fixtureCreated = false;
 
 function requireFile(file, label) {
   if (!existsSync(file)) {
@@ -62,12 +72,52 @@ async function requirePortAvailable(host, port) {
   });
 }
 
-function stopProcess(child) {
-  if (!child || child.exitCode !== null || child.killed) return;
+async function stopProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve, reject) => {
+    const finished = (error) => {
+      clearTimeout(timer);
+      clearTimeout(timeout);
+      child.off("exit", onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onExit = () => finished();
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch (error) {
+        finished(error?.code === "ESRCH" ? undefined : error);
+      }
+    }, 5_000);
+    const timeout = setTimeout(() => finished(new Error("test process did not exit")), 10_000);
+    child.once("exit", onExit);
+    try {
+      child.kill("SIGTERM");
+    } catch (error) {
+      finished(error?.code === "ESRCH" ? undefined : error);
+    }
+  });
+}
+
+async function fixtureCommand(action) {
+  await execFileAsync(dbtoolBinary, ["e2e-fixture", action, fixtureDatabase], {
+    cwd: repoRoot,
+    env: process.env,
+    windowsHide: true,
+    timeout: 60_000,
+    maxBuffer: 512 * 1024,
+  });
+}
+
+async function cleanupFixture() {
   try {
-    child.kill("SIGTERM");
-  } catch (error) {
-    if (error?.code !== "ESRCH") throw error;
+    await stopProcess(serverProcess);
+  } finally {
+    if (fixtureCreated) {
+      await fixtureCommand("drop");
+      fixtureCreated = false;
+    }
   }
 }
 
@@ -187,7 +237,19 @@ export const config = {
   onPrepare: async () => {
     requireFile(application, "Tauri application");
     requireFile(serverBinary, "mpgs-server");
+    requireFile(dbtoolBinary, "mpgs-dbtool");
     requireFile(tauriDriverBinary, "tauri-driver");
+    if (!process.env.MPGS_TEST_DATABASE_URL) {
+      throw new Error("MPGS_TEST_DATABASE_URL must point to local PostgreSQL with database creation permission");
+    }
+    let fixtureUrl;
+    try {
+      fixtureUrl = new URL(process.env.MPGS_TEST_DATABASE_URL);
+    } catch {
+      throw new Error("MPGS_TEST_DATABASE_URL must be a PostgreSQL URL");
+    }
+    fixtureDatabase = `mpgs_e2e_${randomBytes(16).toString("hex")}`;
+    fixtureUrl.pathname = `/${fixtureDatabase}`;
     await requirePortAvailable(seedServerHost, seedServerPort);
     mkdirSync(runtimeRoot, { recursive: true });
     mkdirSync(artifactDir, { recursive: true });
@@ -195,31 +257,48 @@ export const config = {
     const desktopDataDir = path.join(runtimeDir, "desktop-data");
     configureIsolatedDesktopData(desktopDataDir);
 
-    serverLogFd = openSync(path.join(artifactDir, "mpgs-server.log"), "w");
-    serverProcess = spawn(serverBinary, [], {
-      cwd: repoRoot,
-      env: {
-        ...process.env,
-        MPGS_DATABASE_PATH: path.join(runtimeDir, "server.sqlite3"),
-        MPGS_SEED_DEMO: "true",
-        MPGS_RATE_LIMIT_ENABLED: "false",
-        MPGS_BIND_ADDR: `${seedServerUrlHost}:${seedServerPort}`,
-      },
-      stdio: ["ignore", serverLogFd, serverLogFd],
-      windowsHide: true,
-    });
-    writeFileSync(
-      runtimeFile,
-      JSON.stringify({
-        runtimeDir,
-        desktopDataDir,
-        serverPid: serverProcess.pid,
-        serverHealthUrl: `${seedServerOrigin}/health/live`,
-        serverStopped: false,
-      }),
-      "utf8",
-    );
-    await waitForProcessHttp(serverProcess, `${seedServerOrigin}/health/ready`, 20_000);
+    try {
+      await fixtureCommand("create");
+      fixtureCreated = true;
+      serverLogFd = openSync(path.join(artifactDir, "mpgs-server.log"), "w");
+      serverProcess = spawn(serverBinary, [], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          MPGS_DATABASE_URL: fixtureUrl.toString(),
+          MPGS_CRON_SECRET: randomBytes(32).toString("hex"),
+          // Avatar uploads are outside this catalog/accounts/offline suite.
+          MPGS_SUPABASE_URL: "https://storage.invalid",
+          MPGS_SUPABASE_SERVICE_ROLE_KEY: "local-e2e-storage-unused",
+          MPGS_AI_PROVIDER: "disabled",
+          MPGS_AI_EMBED_PROVIDER: "hash",
+          MPGS_RATE_LIMIT_ENABLED: "false",
+          MPGS_BIND_ADDR: `${seedServerUrlHost}:${seedServerPort}`,
+        },
+        stdio: ["ignore", serverLogFd, serverLogFd],
+        windowsHide: true,
+      });
+      writeFileSync(
+        runtimeFile,
+        JSON.stringify({
+          runtimeDir,
+          desktopDataDir,
+          serverPid: serverProcess.pid,
+          serverHealthUrl: `${seedServerOrigin}/health/live`,
+          serverStopped: false,
+          fixtureDatabase,
+        }),
+        "utf8",
+      );
+      await waitForProcessHttp(serverProcess, `${seedServerOrigin}/health/ready`, 20_000);
+    } catch (error) {
+      try {
+        await cleanupFixture();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "E2E startup and fixture cleanup failed");
+      }
+      throw error;
+    }
   },
 
   beforeSession: async (_wdioConfig, capabilities) => {
@@ -252,14 +331,14 @@ export const config = {
     await globalThis.browser.saveScreenshot(path.join(artifactDir, filename));
   },
 
-  afterSession: () => {
-    stopProcess(driverProcess);
+  afterSession: async () => {
+    await stopProcess(driverProcess);
     if (driverLogFd !== undefined) closeSync(driverLogFd);
     driverLogFd = undefined;
   },
 
-  onComplete: (exitCode) => {
-    stopProcess(serverProcess);
+  onComplete: async (exitCode) => {
+    await cleanupFixture();
     if (serverLogFd !== undefined) closeSync(serverLogFd);
     serverLogFd = undefined;
     if (exitCode === 0 && runtimeDir) {

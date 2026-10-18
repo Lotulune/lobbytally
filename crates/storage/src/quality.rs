@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use crate::pg::{Connection, params};
 
 use crate::error::StorageResult;
 
@@ -23,7 +23,7 @@ pub fn run_quality_checks(conn: &Connection, now_ms: i64) -> StorageResult<Vec<Q
         conn.execute(
             "INSERT INTO data_quality_findings (
                 check_name, severity, app_id, entity_key, message, detected_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             ) VALUES ($1, $2, $3, $4, $5, $6)",
             params![
                 finding.check_name,
                 finding.severity,
@@ -103,7 +103,7 @@ fn check_released_future_dates(
          WHERE release_state = 'released'
            AND release_date IS NOT NULL
            AND length(release_date) = 10
-           AND release_date > ?1",
+           AND release_date > $1",
     )?;
     let rows = stmt.query_map(params![today], |row| {
         Ok((row.get::<_, i64>(0)? as u32, row.get::<_, String>(1)?))

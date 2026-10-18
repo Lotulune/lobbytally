@@ -2,9 +2,10 @@
 
 mod ai_limits;
 mod api;
+mod avatars;
 mod cors;
 mod rate_limit;
-mod scheduler;
+mod runtime;
 
 use std::{env, error::Error, io, net::SocketAddr};
 
@@ -35,10 +36,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     init_tracing();
     let state = build_state().await?;
-    scheduler::spawn(state.repo.clone());
-    let address: SocketAddr = env::var("MPGS_BIND_ADDR")
-        .unwrap_or_else(|_| DEFAULT_BIND_ADDR.to_owned())
-        .parse()?;
+    let address = bind_address()?;
     let listener = TcpListener::bind(address).await?;
     info!(%address, storage = state.repo.is_some(), "mpgs server listening");
     axum::serve(
@@ -63,51 +61,28 @@ fn build_info() -> Value {
 
 async fn build_state() -> Result<AppState, Box<dyn Error>> {
     let admin_token = env::var("MPGS_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
-    let demo_seed = demo_seed_enabled()?;
-    let repo = match env::var("MPGS_DATABASE_PATH") {
-        Ok(path) if !path.is_empty() => {
-            let db = Database::open(&path)?;
-            let repo = Repository::new(db);
-            let version = repo.migrate()?;
-            repo.ensure_runtime_defaults()?;
-            if demo_seed {
-                let seeded = repo.seed_demo_if_empty()?;
-                info!(seeded, "demo catalog seed enabled");
-            }
-            // Full integrity/FK scans remain explicit `mpgs-dbtool integrity`
-            // operations. They are O(database size) and must not delay every
-            // process restart before the listener is bound.
-            repo.readiness_check()?;
-            info!(%path, version, "database ready");
-            Some(repo)
-        }
-        _ if cfg!(debug_assertions) => {
-            // Development can use a transient database, but sample content is
-            // never implicit: it requires MPGS_SEED_DEMO=true and is visible in
-            // service metadata. Release binaries reject this branch below.
-            let db = Database::open_in_memory()?;
-            let repo = Repository::new(db);
-            repo.migrate()?;
-            repo.ensure_runtime_defaults()?;
-            if demo_seed {
-                let seeded = repo.seed_demo_if_empty()?;
-                info!(seeded, "development demo catalog seed enabled");
-                repo.readiness_check()?;
-            } else {
-                info!(
-                    "using empty development database; set MPGS_DATABASE_PATH or MPGS_SEED_DEMO=true"
-                );
-            }
-            Some(repo)
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "MPGS_DATABASE_PATH is required by release builds; set MPGS_SEED_DEMO=true only for an explicit demo environment",
-            )
-            .into());
-        }
-    };
+    let database_url = required_env("MPGS_DATABASE_URL")?;
+    let cron_secret = required_env("MPGS_CRON_SECRET")?;
+    if cron_secret.len() < 32 || cron_secret.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "MPGS_CRON_SECRET must contain at least 32 non-whitespace bytes",
+        )
+        .into());
+    }
+    let avatar_storage = avatars::AvatarStorage::from_env()?;
+    let web_dir = env::var("MPGS_WEB_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    // Apply the schema once using dbtool before deployment. Cold starts only
+    // establish the pool and check schema readiness, including an empty catalog.
+    let repo = tokio::task::spawn_blocking(move || {
+        let repo = Repository::new(Database::open(&database_url)?);
+        repo.readiness_check()?;
+        Ok::<_, mpgs_storage::StorageError>(repo)
+    })
+    .await??;
     let ai = gateway_from_env()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let task_router = task_router_from_env()
@@ -124,26 +99,17 @@ async fn build_state() -> Result<AppState, Box<dyn Error>> {
         available = task_router.is_available(),
         "AI task router ready"
     );
-    if task_router.is_available() {
-        match task_router.refresh_model_registry().await {
-            Ok(count) => info!(
-                models = count,
-                "AI model registry refreshed from /v1/models"
-            ),
-            Err(error) => tracing::warn!(
-                error = %error,
-                "AI model registry refresh skipped; routes stay optimistically open"
-            ),
-        }
-    }
     info!(
         provider = embedding.name(),
         available = embedding.is_available(),
         "embedding provider ready"
     );
     Ok(AppState {
-        repo,
+        repo: Some(repo),
         admin_token,
+        avatar_storage,
+        cron_secret: Some(cron_secret),
+        web_dir,
         rate_limits: RateLimitConfig::from_env()?,
         cors: CorsConfig::from_env()?,
         account_ai_limits: AccountAiLimiter::from_env()?,
@@ -153,18 +119,22 @@ async fn build_state() -> Result<AppState, Box<dyn Error>> {
     })
 }
 
-fn demo_seed_enabled() -> Result<bool, io::Error> {
-    let Ok(value) = env::var("MPGS_SEED_DEMO") else {
-        return Ok(false);
+fn required_env(name: &str) -> Result<String, io::Error> {
+    env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is required")))
+}
+
+fn bind_address() -> Result<SocketAddr, Box<dyn Error>> {
+    let value = if let Ok(address) = env::var("MPGS_BIND_ADDR") {
+        address
+    } else if let Ok(port) = env::var("PORT") {
+        format!("0.0.0.0:{port}")
+    } else {
+        DEFAULT_BIND_ADDR.to_owned()
     };
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Ok(true),
-        "0" | "false" | "no" | "" => Ok(false),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "MPGS_SEED_DEMO must be true/false or 1/0",
-        )),
-    }
+    Ok(value.parse()?)
 }
 
 fn init_tracing() {
@@ -229,17 +199,24 @@ mod tests {
         repo.migrate().unwrap();
         repo.ensure_runtime_defaults().unwrap();
         repo.seed_demo_if_empty().unwrap();
-        let app = build_router(AppState {
+        let app = router_for_repo(&repo, rate_limits);
+        (repo, app)
+    }
+
+    fn router_for_repo(repo: &Repository, rate_limits: RateLimitConfig) -> axum::Router {
+        build_router(AppState {
             repo: Some(repo.clone()),
             admin_token: Some("secret".into()),
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits,
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
             ai: mpgs_ai::AiGateway::disabled(),
             task_router: test_task_router(),
             embedding: test_embedding(),
-        });
-        (repo, app)
+        })
     }
 
     fn test_app() -> axum::Router {
@@ -250,6 +227,9 @@ mod tests {
         build_router(AppState {
             repo: None,
             admin_token: None,
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits: RateLimitConfig::default(),
             cors: CorsConfig::default(),
             account_ai_limits: AccountAiLimiter::default(),
@@ -806,7 +786,7 @@ mod tests {
         repo.database()
             .with_conn_mut(|conn| {
                 conn.execute(
-                    "UPDATE apps SET updated_at_ms = ?1 WHERE app_id = 548430",
+                    "UPDATE apps SET updated_at_ms = $1 WHERE app_id = 548430",
                     [feed_snapshot + 1],
                 )?;
                 Ok(())
@@ -1550,7 +1530,7 @@ mod tests {
         // AI is disabled in test_app → deterministic path remains usable.
         assert!(matches!(
             json["ai_status"].as_str(),
-            Some("fallback" | "disabled" | "pending")
+            Some("fallback" | "disabled")
         ));
 
         let analysis_id = json["analysis_id"].as_str().unwrap();
@@ -1612,6 +1592,9 @@ mod tests {
         assert_eq!(poll_json["analysis_id"], analysis_id);
         assert_eq!(poll_json["task_type"], "rank_explain");
         assert!(poll_json["base_result"].is_object());
+        assert!(poll_json["result"].is_object());
+        assert!(poll_json["completed_at_ms"].is_number());
+        assert_ne!(poll_json["ai_status"], "pending");
         let _ = repo;
     }
 
@@ -1773,6 +1756,9 @@ mod tests {
         let probe = build_router(AppState {
             repo: Some(repo.clone()),
             admin_token: Some("secret".into()),
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits: RateLimitConfig {
                 enabled: false,
                 ..RateLimitConfig::default()
@@ -1840,6 +1826,9 @@ mod tests {
         let app = build_router(AppState {
             repo: Some(repo.clone()),
             admin_token: Some("secret".into()),
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits: RateLimitConfig {
                 enabled: false,
                 ..RateLimitConfig::default()
@@ -1884,6 +1873,9 @@ mod tests {
         let cached = build_router(AppState {
             repo: Some(repo.clone()),
             admin_token: Some("secret".into()),
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits: RateLimitConfig {
                 enabled: false,
                 ..RateLimitConfig::default()
@@ -1916,6 +1908,9 @@ mod tests {
         let meta = build_router(AppState {
             repo: None,
             admin_token: None,
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits: RateLimitConfig {
                 enabled: false,
                 ..RateLimitConfig::default()
@@ -1963,6 +1958,9 @@ mod tests {
         let app = build_router(AppState {
             repo: Some(repo),
             admin_token: Some("secret".into()),
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits: RateLimitConfig {
                 enabled: false,
                 ..RateLimitConfig::default()
@@ -2034,7 +2032,7 @@ mod tests {
                     "INSERT INTO apps (
                          app_id, app_type, canonical_name, release_state, release_date,
                          release_date_precision, created_at_ms, updated_at_ms
-                     ) VALUES (9999999, 'game', 'outside-window', 'coming_soon', ?1, 'day', 1, 1)",
+                     ) VALUES (9999999, 'game', 'outside-window', 'coming_soon', $1, 'day', 1, 1)",
                     [&outside_default_window],
                 )?;
                 conn.execute(
@@ -2286,6 +2284,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_rate_limit_is_shared_between_server_instances() {
+        let config = RateLimitConfig {
+            read_per_minute: 1,
+            ..RateLimitConfig::default()
+        };
+        let (repo, first) = test_repo_and_app(config.clone());
+        let second = router_for_repo(&repo, config);
+        let request = || {
+            Request::builder()
+                .uri("/v1/meta")
+                .header("x-device-id", "shared-limit-test")
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            first.oneshot(request()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            second.oneshot(request()).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn initialized_empty_catalog_is_ready_before_first_collection() {
+        let repo = Repository::new(Database::open_in_memory().unwrap());
+        repo.migrate().unwrap();
+        repo.ensure_runtime_defaults().unwrap();
+        let app = router_for_repo(
+            &repo,
+            RateLimitConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let ready = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+        let feed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/feeds/recent_release")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(feed.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(feed.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn active_algorithm_config_and_all_preference_inputs_drive_feed() {
         let (repo, app) = test_repo_and_app(RateLimitConfig::default());
         // Classic is residual of non-popular legacy games; classic_min_* no longer
@@ -2294,10 +2357,10 @@ mod tests {
             .with_conn(|conn| {
                 conn.execute(
                     "UPDATE algorithm_configs
-                     SET config_json = json_set(
-                         json_set(config_json, '$.popular_min_ccu', 500000000),
-                         '$.popular_high_ccu', 500000000
-                     )
+                     SET config_json = jsonb_set(
+                         jsonb_set(config_json::jsonb, '{popular_min_ccu}', '500000000'),
+                         '{popular_high_ccu}', '500000000'
+                     )::text
                      WHERE status = 'active'",
                     [],
                 )?;
@@ -2328,10 +2391,10 @@ mod tests {
             .with_conn(|conn| {
                 conn.execute(
                     "UPDATE algorithm_configs
-                     SET config_json = json_set(
-                         json_set(config_json, '$.popular_min_ccu', 500),
-                         '$.popular_high_ccu', 100000
-                     )
+                     SET config_json = jsonb_set(
+                         jsonb_set(config_json::jsonb, '{popular_min_ccu}', '500'),
+                         '{popular_high_ccu}', '100000'
+                     )::text
                      WHERE status = 'active'",
                     [],
                 )?;
@@ -2343,7 +2406,6 @@ mod tests {
                      )
                      SELECT app_id, '[\"windows\"]', '[\"english\"]', 120, 240, 0, 2000
                      FROM apps
-                     WHERE 1
                      ON CONFLICT(app_id) DO UPDATE SET
                          platforms_json = excluded.platforms_json,
                          languages_json = excluded.languages_json,
@@ -2559,9 +2621,8 @@ mod tests {
                 conn.execute(
                     "UPDATE algorithm_configs
                      SET version = 'rules-0.1.0',
-                         config_json = json_remove(
-                             config_json, '$.play_intent_weight', '$.play_intent_saturation'
-                         )
+                         config_json = (config_json::jsonb
+                             - 'play_intent_weight' - 'play_intent_saturation')::text
                      WHERE status = 'active'",
                     [],
                 )?;
@@ -2593,7 +2654,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn m6_fault_sqlite_lock_wait_does_not_block_the_async_runtime() {
+    async fn m6_fault_database_lock_wait_does_not_block_the_async_runtime() {
         use std::sync::{Arc, Barrier};
         use std::time::Duration;
 
@@ -2604,10 +2665,12 @@ mod tests {
         let holder = std::thread::spawn(move || {
             locked_repo
                 .database()
-                .with_conn(|_| {
+                .with_conn_mut(|conn| {
+                    let transaction = conn.transaction()?;
+                    transaction.execute_batch("LOCK TABLE apps IN ACCESS EXCLUSIVE MODE")?;
                     worker_barrier.wait();
                     std::thread::sleep(Duration::from_millis(250));
-                    Ok(())
+                    transaction.commit().map_err(Into::into)
                 })
                 .unwrap();
         });
@@ -2632,7 +2695,7 @@ mod tests {
             ),
         )
         .await
-        .expect("health request must not wait for SQLite")
+        .expect("health request must not wait for PostgreSQL")
         .unwrap();
         assert_eq!(live.status(), StatusCode::OK);
         assert_eq!(
@@ -2689,6 +2752,9 @@ mod tests {
         let app = build_router(AppState {
             repo: Some(repo),
             admin_token: Some("secret".into()),
+            avatar_storage: crate::avatars::AvatarStorage::memory(),
+            cron_secret: None,
+            web_dir: None,
             rate_limits: RateLimitConfig {
                 enabled: false,
                 ..RateLimitConfig::default()

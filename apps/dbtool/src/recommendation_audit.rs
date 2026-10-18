@@ -1,7 +1,6 @@
 //! Deterministic, read-only recommendation quality audit.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
 
 use mpgs_domain::{FeedSection, ModeFamily, RecommendationConfig, UserPreferences};
 use mpgs_recommender::{
@@ -9,7 +8,7 @@ use mpgs_recommender::{
     rank_feed_configured_with_constraints_and_tie_seed,
 };
 use mpgs_storage::query::{GameCandidateRow, list_candidates, section_matches};
-use rusqlite::{Connection, OpenFlags};
+use mpgs_storage::{Database, pg::Connection};
 use serde::Serialize;
 
 const DEFAULT_TOP: usize = 20;
@@ -28,7 +27,7 @@ const MAX_UNRESOLVED_EVIDENCE_ID_SAMPLES: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AuditOptions {
-    db_path: PathBuf,
+    database_url: Option<String>,
     as_of: String,
     user_id: Option<String>,
     top: usize,
@@ -205,11 +204,13 @@ pub(crate) fn run_command(args: impl Iterator<Item = String>) -> Result<(), Stri
     Ok(())
 }
 
-fn parse_options(mut args: impl Iterator<Item = String>) -> Result<AuditOptions, String> {
-    let db_path = args
-        .next()
-        .map(PathBuf::from)
-        .ok_or_else(|| audit_usage().to_owned())?;
+fn parse_options(args: impl Iterator<Item = String>) -> Result<AuditOptions, String> {
+    let mut args = args.peekable();
+    let database_url = if args.peek().is_some_and(|arg| !arg.starts_with("--")) {
+        args.next()
+    } else {
+        None
+    };
     let mut as_of = None;
     let mut user_id = None;
     let mut top = DEFAULT_TOP;
@@ -245,7 +246,10 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<AuditOptions,
             }
             "--json" => json = true,
             "--strict" => strict = true,
-            _ => return Err(format!("unknown recommendation-audit option: {arg}")),
+            _ if arg.starts_with("--") => {
+                return Err(format!("unknown recommendation-audit option: {arg}"));
+            }
+            _ => return Err(format!("unexpected positional argument; {}", audit_usage())),
         }
     }
 
@@ -254,7 +258,7 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<AuditOptions,
         return Err("--as-of must be a valid YYYY-MM-DD calendar date".into());
     }
     Ok(AuditOptions {
-        db_path,
+        database_url,
         as_of,
         user_id,
         top,
@@ -264,28 +268,52 @@ fn parse_options(mut args: impl Iterator<Item = String>) -> Result<AuditOptions,
 }
 
 fn audit_database(options: &AuditOptions) -> Result<RecommendationAudit, String> {
-    if !options.db_path.is_file() {
-        return Err(format!(
-            "database does not exist or is not a file: {}",
-            options.db_path.display()
-        ));
-    }
-    let conn = open_read_only(&options.db_path)?;
-    let active = mpgs_storage::users::active_algorithm_config(&conn).map_err(err)?;
+    let database_url = crate::required_database_url(options.database_url.clone())?;
+    let db = Database::open(database_url).map_err(err)?;
+    audit_with_database(&db, options)
+}
+
+fn audit_with_database(
+    db: &Database,
+    options: &AuditOptions,
+) -> Result<RecommendationAudit, String> {
+    db.with_conn(|conn| {
+        // Keep preferences, evidence, and all feed sections in the same snapshot.
+        // PostgreSQL rejects writes for the entire audit transaction.
+        let transaction = conn.read_transaction()?;
+        let result = audit_snapshot(&transaction, options);
+        transaction.rollback()?;
+        Ok(result)
+    })
+    .map_err(err)?
+}
+
+fn audit_snapshot(
+    conn: &Connection,
+    options: &AuditOptions,
+) -> Result<RecommendationAudit, String> {
+    let database = conn
+        .query_row(
+            "SELECT current_database() || '.' || current_schema()",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(err)?;
+    let active = mpgs_storage::users::active_algorithm_config(conn).map_err(err)?;
     let cutoff = cutoff_day(&options.as_of, &active.config)?;
-    let (prefs, preference_source, feedback) = load_context(&conn, options.user_id.as_deref())?;
+    let (prefs, preference_source, feedback) = load_context(conn, options.user_id.as_deref())?;
     let feedback_by_app: HashMap<u32, &str> = feedback
         .iter()
         .map(|item| (item.app_id, item.feedback_type.as_str()))
         .collect();
-    let play_intent = mpgs_storage::play_intent::all_counts(&conn).map_err(err)?;
-    let resolvable_evidence_ids = load_resolvable_evidence_ids(&conn)?;
+    let play_intent = mpgs_storage::play_intent::all_counts(conn).map_err(err)?;
+    let resolvable_evidence_ids = load_resolvable_evidence_ids(conn)?;
     let tie_seed = recommendation_tie_seed(options.user_id.as_deref(), &options.as_of);
 
     let mut sections = Vec::with_capacity(FeedSection::ALL.len());
     for section in FeedSection::ALL {
         sections.push(audit_section(
-            &conn,
+            conn,
             section,
             &cutoff,
             &options.as_of,
@@ -303,8 +331,8 @@ fn audit_database(options: &AuditOptions) -> Result<RecommendationAudit, String>
     let quality_gates = summarize_quality_gates(&sections);
 
     Ok(RecommendationAudit {
-        database: options.db_path.display().to_string(),
-        database_mode: "read_only/query_only",
+        database,
+        database_mode: "read_only/repeatable_read",
         as_of: options.as_of.clone(),
         cutoff,
         algorithm_version: ALGORITHM_VERSION.to_owned(),
@@ -319,22 +347,6 @@ fn audit_database(options: &AuditOptions) -> Result<RecommendationAudit, String>
             "not_applicable gates are excluded from strict pass/fail counts and must not be interpreted as quality passes",
         ],
     })
-}
-
-fn open_read_only(path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(err)?;
-    conn.pragma_update(None, "query_only", "ON").map_err(err)?;
-    let query_only: i64 = conn
-        .query_row("PRAGMA query_only", [], |row| row.get(0))
-        .map_err(err)?;
-    if query_only != 1 {
-        return Err("failed to enforce SQLite query_only mode".into());
-    }
-    Ok(conn)
 }
 
 fn load_resolvable_evidence_ids(conn: &Connection) -> Result<HashSet<String>, String> {
@@ -1384,7 +1396,7 @@ fn format_score(score: Option<f64>) -> String {
 }
 
 fn audit_usage() -> &'static str {
-    "recommendation-audit <db-path> --as-of YYYY-MM-DD [--user-id ID] [--top N] [--json] [--strict]"
+    "recommendation-audit [database-url|env] --as-of YYYY-MM-DD [--user-id ID] [--top N] [--json] [--strict] (defaults to MPGS_DATABASE_URL, then DATABASE_URL)"
 }
 
 fn recommendation_tie_seed(user_id: Option<&str>, utc_day: &str) -> u64 {
@@ -1469,14 +1481,11 @@ mod tests {
 
     #[test]
     fn options_require_a_valid_explicit_as_of_day() {
-        assert!(parse_options(["data.db".into()].into_iter()).is_err());
-        assert!(
-            parse_options(["data.db".into(), "--as-of".into(), "2026-02-29".into()].into_iter())
-                .is_err()
-        );
+        assert!(parse_options(["postgresql://localhost/test".into()].into_iter()).is_err());
+        assert!(parse_options(["--as-of".into(), "2026-02-29".into()].into_iter()).is_err());
         let parsed = parse_options(
             [
-                "data.db".into(),
+                "postgresql://localhost/test".into(),
                 "--as-of".into(),
                 "2026-08-01".into(),
                 "--top".into(),
@@ -1487,10 +1496,63 @@ mod tests {
             .into_iter(),
         )
         .unwrap();
+        assert_eq!(
+            parsed.database_url.as_deref(),
+            Some("postgresql://localhost/test")
+        );
         assert_eq!(parsed.as_of, "2026-08-01");
         assert_eq!(parsed.top, 12);
         assert!(parsed.json);
         assert!(parsed.strict);
+    }
+
+    #[test]
+    fn database_url_can_be_omitted_or_requested_with_env() {
+        let options = parse_options(["--as-of".into(), "2026-08-01".into()].into_iter()).unwrap();
+        assert!(options.database_url.is_none());
+        let options =
+            parse_options(["env".into(), "--as-of".into(), "2026-08-01".into()].into_iter())
+                .unwrap();
+        assert_eq!(options.database_url.as_deref(), Some("env"));
+    }
+
+    #[test]
+    fn extra_database_arguments_are_rejected_without_echoing_credentials() {
+        let secret_url = "postgresql://user:secret-password@localhost/test";
+        let error = parse_options(
+            [
+                "postgresql://localhost/test".into(),
+                "--as-of".into(),
+                "2026-08-01".into(),
+                secret_url.into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(error.contains("unexpected positional argument"));
+        assert!(!error.contains("secret-password"));
+    }
+
+    #[test]
+    fn postgres_audit_reads_an_isolated_snapshot_and_reports_database_identity() {
+        let db = Database::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let options = parse_options(["--as-of".into(), "2026-08-01".into()].into_iter()).unwrap();
+        let audit = audit_with_database(&db, &options).unwrap();
+        let identity = db
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT current_database() || '.' || current_schema()",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(audit.database, identity);
+        assert!(!audit.database.contains("://"));
+        assert_eq!(audit.database_mode, "read_only/repeatable_read");
+        assert_eq!(audit.sections.len(), FeedSection::ALL.len());
+        assert_eq!(audit, audit_with_database(&db, &options).unwrap());
     }
 
     #[test]
